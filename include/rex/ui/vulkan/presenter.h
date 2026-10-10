@@ -58,6 +58,14 @@ class VulkanUIDrawContext final : public UIDrawContext {
   VkFormat render_pass_format_;
 };
 
+// From the latest swapchain: whether its surface offers scRGB, and whether
+// it is in use (present_hdr).
+struct HdrOutputState {
+  bool offered = false;
+  bool active = false;
+};
+HdrOutputState GetHdrOutputState();
+
 class VulkanPresenter final : public Presenter {
  public:
   // Maximum number of different guest output image versions still potentially
@@ -346,6 +354,22 @@ class VulkanPresenter final : public Presenter {
       VkSemaphore present_semaphore;
     };
 
+    // present_hdr: the swapchain is scRGB, and everything above paints into an
+    // SDR stand-in per swapchain image as it would into an SDR swapchain; one
+    // last pass decodes its sRGB and scales it to the paper white.
+    struct HdrImage {
+      VkImage image = VK_NULL_HANDLE;
+      VkDeviceMemory memory = VK_NULL_HANDLE;
+      // Sampled by the last pass, which decodes the sRGB.
+      VkImageView srgb_view = VK_NULL_HANDLE;
+      VkImageView swapchain_view = VK_NULL_HANDLE;
+      VkFramebuffer swapchain_framebuffer = VK_NULL_HANDLE;
+      VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    };
+    static constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    static constexpr VkFormat kHdrStandInFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    static constexpr VkFormat kHdrStandInSrgbFormat = VK_FORMAT_B8G8R8A8_SRGB;
+
     explicit PaintContext(const VulkanDevice* const vulkan_device)
         : vulkan_device(vulkan_device), submission_tracker(vulkan_device) {}
     PaintContext(const PaintContext& paint_context) = delete;
@@ -359,7 +383,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& hdr_out, bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -414,6 +438,12 @@ class VulkanPresenter final : public Presenter {
     VkRenderPass swapchain_render_pass = VK_NULL_HANDLE;
     VkFormat swapchain_render_pass_format = VK_FORMAT_UNDEFINED;
     bool swapchain_render_pass_clear_load_op = false;
+    // Whether swapchain_render_pass ends in an HDR stand-in to be sampled.
+    bool swapchain_render_pass_hdr = false;
+    // The last pass into the scRGB swapchain, and its pipeline.
+    VkRenderPass hdr_render_pass = VK_NULL_HANDLE;
+    VkPipeline hdr_pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool hdr_descriptor_pool = VK_NULL_HANDLE;
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
     uint32_t present_queue_family = UINT32_MAX;
@@ -425,6 +455,9 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    bool swapchain_hdr = false;
+    // Per swapchain image when swapchain_hdr.
+    std::vector<HdrImage> hdr_images;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -441,8 +474,12 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  // hdr_scale: the color is multiplied by the blend constants, which the
+  // HDR pass sets to the paper white.
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
-                                                          VkRenderPass render_pass);
+                                                          VkRenderPass render_pass,
+                                                          bool hdr_scale = false);
+  bool CreateHdrSwapchainImages(VkFormat swapchain_format);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,

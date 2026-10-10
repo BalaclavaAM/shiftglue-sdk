@@ -109,6 +109,7 @@ class VulkanInstance {
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
     bool ext_EXT_debug_utils = false;                          // #129
     bool ext_KHR_portability_enumeration = false;              // #395
+    bool ext_EXT_swapchain_colorspace = false;                 // #105
   };
 
   const Extensions& extensions() const { return extensions_; }
