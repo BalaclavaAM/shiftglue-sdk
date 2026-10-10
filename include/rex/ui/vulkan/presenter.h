@@ -443,6 +443,9 @@ class VulkanPresenter final : public Presenter {
     // The last pass into the scRGB swapchain, and its pipeline.
     VkRenderPass hdr_render_pass = VK_NULL_HANDLE;
     VkPipeline hdr_pipeline = VK_NULL_HANDLE;
+    // Replaces the alpha of the painted guest output with the guest output's
+    // HUD coverage, in swapchain_render_pass (always kHdrStandInFormat).
+    VkPipeline hdr_ui_mask_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool hdr_descriptor_pool = VK_NULL_HANDLE;
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
@@ -474,11 +477,14 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
-  // hdr_scale: the color is multiplied by the blend constants, which the
-  // HDR pass sets to the paper white.
-  [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
-                                                          VkRenderPass render_pass,
-                                                          bool hdr_scale = false);
+  // fragment_shader replaces the effect's own, with the effect's layout.
+  [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
+      GuestOutputPaintEffect effect, VkRenderPass render_pass,
+      VkShaderModule fragment_shader = VK_NULL_HANDLE,
+      VkColorComponentFlags color_write_mask = VK_COLOR_COMPONENT_R_BIT |
+                                               VK_COLOR_COMPONENT_G_BIT |
+                                               VK_COLOR_COMPONENT_B_BIT |
+                                               VK_COLOR_COMPONENT_A_BIT);
   bool CreateHdrSwapchainImages(VkFormat swapchain_format);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -501,6 +507,8 @@ class VulkanPresenter final : public Presenter {
   std::array<VkPipelineLayout, kGuestOutputPaintPipelineLayoutCount>
       guest_output_paint_pipeline_layouts_ = {};
   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
+  VkShaderModule hdr_output_fs_ = VK_NULL_HANDLE;
+  VkShaderModule hdr_ui_mask_fs_ = VK_NULL_HANDLE;
   std::array<VkShaderModule, size_t(GuestOutputPaintEffect::kCount)> guest_output_paint_fs_ = {};
   // Not compatible with the swapchain render pass even if the format is the
   // same due to different dependencies (this is shader read > color

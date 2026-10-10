@@ -734,6 +734,8 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/apply_gamma_table_ps.h"
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
+// glslangValidator -V, from ../shaders/hdr_hud_mask.cs.glsl.
+#include "../shaders/vulkan_spirv/hdr_hud_mask_cs.h"
 }  // namespace shaders
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
@@ -2815,6 +2817,13 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_hud_mask_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_hud_mask_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_hud_mask_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_hud_mask_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -3259,6 +3268,80 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+bool VulkanCommandProcessor::EnsureSwapHudMask() {
+  if (swap_hud_mask_pipeline_ != VK_NULL_HANDLE) return true;
+  if (swap_hud_mask_failed_) return false;
+  swap_hud_mask_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &swap_hud_mask_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask descriptor set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 2};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &swap_hud_mask_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &swap_hud_mask_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask pipeline layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_hud_mask_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
+  set_layouts.fill(swap_hud_mask_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = swap_hud_mask_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_hud_mask_descriptor_sets_.data()) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to allocate the HDR HUD mask descriptor sets");
+    return false;
+  }
+  swap_hud_mask_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, swap_hud_mask_pipeline_layout_, shaders::hdr_hud_mask_cs,
+      sizeof(shaders::hdr_hud_mask_cs));
+  if (swap_hud_mask_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("Failed to create the HDR HUD mask pipeline");
+    return false;
+  }
+  swap_hud_mask_failed_ = false;
+  return true;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   DrawCostFrame();
@@ -3449,11 +3532,22 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // present_hdr: the scene before the HUD, for the HUD's coverage. Without
+  // one (menus), the guest output stays opaque, all of it HUD.
+  VkImageView hud_snapshot_view = VK_NULL_HANDLE;
+  if (fh1_native_executor_) {
+    const bool hdr_active = ui::vulkan::GetHdrOutputState().active;
+    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active);
+    hud_snapshot_view =
+        fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
+    if (!hdr_active) hud_snapshot_view = VK_NULL_HANDLE;
+  }
+
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
-       frontbuffer_format, swap_texture_view, swap_post_effect,
-       swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
+       hud_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -3790,6 +3884,42 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          }
+
+          if (hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
+            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            VkDescriptorSet hud_mask_set = swap_hud_mask_descriptor_sets_[swap_frame_index];
+            VkDescriptorImageInfo hud_mask_image_infos[3] = {
+                {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
+            };
+            VkWriteDescriptorSet hud_mask_writes[3] = {};
+            for (uint32_t i = 0; i < 3; ++i) {
+              hud_mask_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              hud_mask_writes[i].dstSet = hud_mask_set;
+              hud_mask_writes[i].dstBinding = i;
+              hud_mask_writes[i].descriptorCount = 1;
+              hud_mask_writes[i].descriptorType =
+                  i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              hud_mask_writes[i].pImageInfo = &hud_mask_image_infos[i];
+            }
+            dfn.vkUpdateDescriptorSets(device, 3, hud_mask_writes, 0, nullptr);
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                &hud_mask_set, 0, nullptr);
+            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
+            deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(hud_mask_size), hud_mask_size);
+            BindExternalComputePipeline(swap_hud_mask_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
           }
 
@@ -5415,6 +5545,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.vertex_shader = vertex_shader;
     fh1_draw.pixel_shader = pixel_shader;
     fh1_draw.state_epoch = state_epoch_;
+    fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");

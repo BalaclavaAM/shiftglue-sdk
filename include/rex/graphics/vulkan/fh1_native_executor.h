@@ -113,6 +113,14 @@ class Fh1NativeExecutor {
   // Copies one-off resolve read-backs into guest memory, waiting for the GPU.
   void FlushResolveReadbacks();
   void OnSwap(uint64_t frame);
+  // present_hdr: before PrepareTargets, notes the scene's 2_10_10_10 target
+  // and, at the first HUD draw over it (through its 2_10_10_10_AS_10_10_10_10
+  // view), copies it, so the swap can tell the HUD from the scene.
+  void SetHudSnapshotEnabled(bool enabled) { hud_snapshot_enabled_ = enabled; }
+  void MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw);
+  // After OnSwap: the swapped frame's snapshot, made readable from compute
+  // shaders, if it covers width x height; null otherwise.
+  VkImageView TakeHudSnapshot(uint32_t width, uint32_t height);
   void LogStats(uint64_t frame);
   // Native surfaces alive and the device memory their images take (LS-0.4).
   size_t surface_count() const { return surfaces_.size(); }
@@ -377,6 +385,15 @@ class Fh1NativeExecutor {
   uint32_t untile_height_ = 0;
   std::unordered_map<uint32_t, uint32_t> untile_bands_;
   bool initialized_ = false;
+  // present_hdr's snapshot of the scene before the HUD: the scene target's
+  // base this frame, whether this frame's copy was made, whether the frame
+  // swapped next has one, and the copy (image, view, format, size, layout).
+  bool hud_snapshot_enabled_ = false;
+  uint32_t hud_scene_base_ = UINT32_MAX;
+  bool hud_snapshot_taken_ = false;
+  bool hud_snapshot_ready_ = false;
+  Surface hud_snapshot_;
+  void DestroyHudSnapshot();
 
   // Descriptor set layouts (set 0): source images (bindings 16 and 17) with
   // the storage buffer (binding 32) for compute, the source images for

@@ -1135,6 +1135,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
+  // present_hdr: the HUD's coverage into the guest output's alpha
+  // (hdr_hud_mask.cs.glsl), created on first use.
+  bool EnsureSwapHudMask();
+  bool swap_hud_mask_failed_ = false;
+  VkDescriptorSetLayout swap_hud_mask_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_hud_mask_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;

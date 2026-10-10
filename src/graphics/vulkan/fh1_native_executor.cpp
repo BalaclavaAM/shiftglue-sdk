@@ -534,6 +534,7 @@ void Fh1NativeExecutor::Shutdown() {
   StopSpecializeThread();
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
+  DestroyHudSnapshot();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
   specialized_transfer_pipelines_ = 0;
@@ -803,6 +804,11 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
                      (untile_height_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT
                                      : 0);
+  // The front buffer's format: present_hdr's HUD snapshot copies it.
+  if (!key.is_depth && surface.samples == 1 &&
+      key.format == uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10)) {
+    image_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  }
   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, image_info,
@@ -3061,11 +3067,127 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 }
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
+  hud_snapshot_ready_ = hud_snapshot_taken_;
+  hud_snapshot_taken_ = false;
+  hud_scene_base_ = UINT32_MAX;
   if (!initialized_) return;
   UpdateCoarseShading();
   GpuDrain();
   frame_ = frame;
   if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
+}
+
+void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
+  if (!hud_snapshot_enabled_ || !initialized_ || draw.memexport || !draw.rasterization_done ||
+      !(draw.normalized_color_mask & 0xF)) {
+    return;
+  }
+  const auto color_info =
+      register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+  if (color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+    // FH1 composites the scene into the front buffer last in this format.
+    hud_scene_base_ = color_info.color_base;
+    return;
+  }
+  if (color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 ||
+      hud_snapshot_taken_ || color_info.color_base != hud_scene_base_) {
+    return;
+  }
+  hud_snapshot_taken_ = true;
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  // The HUD's view shares the scene's surface.
+  Surface* surface = FindSurface(MakeColorKey(color_info.color_base,
+                                              Fh1PitchTiles(surface_info.surface_pitch, msaa),
+                                              msaa, color_info.color_format)
+                                     .Pack());
+  if (!surface || surface->samples != 1) {
+    hud_snapshot_taken_ = false;
+    return;
+  }
+  const uint32_t width = surface->width * scale_;
+  const uint32_t height = surface->height * scale_;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  command_processor_.EndRenderPass();
+  if (hud_snapshot_.image != VK_NULL_HANDLE &&
+      (hud_snapshot_.width != width || hud_snapshot_.height != height ||
+       hud_snapshot_.format != surface->format)) {
+    // Earlier frames may still read it; only on a resolution change.
+    command_processor_.Fh1AwaitAllQueueOperations();
+    DestroyHudSnapshot();
+  }
+  if (hud_snapshot_.image == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = surface->format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_snapshot_.image, hud_snapshot_.memory)) {
+      Skip("hud_snapshot_create");
+      return;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = hud_snapshot_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = surface->format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_snapshot_.view) != VK_SUCCESS) {
+      DestroyHudSnapshot();
+      Skip("hud_snapshot_create");
+      return;
+    }
+    hud_snapshot_.key = surface->key;
+    hud_snapshot_.format = surface->format;
+    hud_snapshot_.width = width;
+    hud_snapshot_.height = height;
+  }
+  Transition(*surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  Transition(hud_snapshot_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  VkImageCopy region = {};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.extent = {width, height, 1};
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      surface->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_snapshot_.image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+  Count("hud_snapshot");
+}
+
+VkImageView Fh1NativeExecutor::TakeHudSnapshot(uint32_t width, uint32_t height) {
+  const bool ready = hud_snapshot_ready_;
+  hud_snapshot_ready_ = false;
+  if (!ready || hud_snapshot_.view == VK_NULL_HANDLE || hud_snapshot_.width < width ||
+      hud_snapshot_.height < height) {
+    return VK_NULL_HANDLE;
+  }
+  TransitionForSampling(hud_snapshot_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  return hud_snapshot_.view;
+}
+
+void Fh1NativeExecutor::DestroyHudSnapshot() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (hud_snapshot_.view) dfn.vkDestroyImageView(device, hud_snapshot_.view, nullptr);
+  if (hud_snapshot_.image) dfn.vkDestroyImage(device, hud_snapshot_.image, nullptr);
+  if (hud_snapshot_.memory) dfn.vkFreeMemory(device, hud_snapshot_.memory, nullptr);
+  hud_snapshot_ = Surface();
+  hud_snapshot_ready_ = false;
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
