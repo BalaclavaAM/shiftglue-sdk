@@ -667,6 +667,32 @@ void UnregisterChangeCallbacks(std::string_view name) {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv) {
+  // CLI11 rejects an empty "--name=" value with a parse error that drops
+  // every other argument, yet an empty string is a meaningful value (an
+  // empty android_gpu_driver selects the system driver). Apply those here
+  // and hand CLI11 the rest.
+  std::vector<char*> args;
+  for (int i = 0; i < argc; i++) {
+    std::string_view view(argv[i]);
+    if (i > 0 && view.starts_with("--") && view.size() > 3 && view.back() == '=' &&
+        view.find('=') == view.size() - 1) {
+      const std::string name(view.substr(2, view.size() - 3));
+      auto& entries = GetRegistryStorage();
+      auto entry = std::find_if(entries.begin(), entries.end(),
+                                [&](const auto& e) { return e.name == name; });
+      if (entry == entries.end()) {
+        std::lock_guard lock(GetRegistryMutex());
+        GetPendingValuesStorage()[name].cmdline = std::string();
+      } else if (entry->type != FlagType::Boolean) {
+        ApplyFromSource(*entry, "", Source::kCommandLine);
+      }
+      continue;
+    }
+    args.push_back(argv[i]);
+  }
+  argc = int(args.size());
+  argv = args.data();
+
   CLI::App app{"", ""};
   app.allow_extras();
 
