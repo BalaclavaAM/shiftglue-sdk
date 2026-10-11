@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <string_view>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -342,6 +343,101 @@ void emit_println(std::string& out, fmt::format_string<Args...> fmt, Args&&... a
 template <class... Args>
 void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... args) {
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
+}
+
+// With cr_as_local, a function keeps the CR fields it uses in locals, which the
+// compiler can hold in host registers: as ctx members they are bytes that every
+// guest store may alias. ctx stays the state everything outside the function
+// sees: the locals are loaded from ctx on entry (before the resume switch, so
+// an interior re-entry starts from ctx too), written back before every line
+// that can leave the function or hand ctx to other code (calls, returns, tail
+// calls, longjmp, the setjmp context copy, hooks given ctx), and reloaded after
+// the ones that come back (and at the start of the SEH catch block, where ctx
+// holds the state the exception left).
+//
+// Calls, returns and tail calls follow the PowerPC ABI: cr2-cr4 are
+// non-volatile, so a callee preserves them and never reads cr0, cr1 or
+// cr5-cr7 on entry, and a caller never reads those after a call. Those lines
+// write back only the non-volatile fields (`spill_nv`) and reload nothing:
+// ctx.cr2-cr4 come back unchanged, and the volatile fields are dead. Hooks,
+// the setjmp copy, longjmp and exceptions keep the full synchronization.
+std::string SyncLocalCrRegisters(const std::string& body, const std::string& spill,
+                                 const std::string& spill_nv, const std::string& reload) {
+  auto contains = [](std::string_view line, std::string_view what) {
+    return line.find(what) != std::string_view::npos;
+  };
+  std::string out;
+  out.reserve(body.size() + body.size() / 4);
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos)
+      end = body.size();
+    std::string_view line(body.data() + pos, end - pos);
+    pos = end + 1;
+
+    size_t first = line.find_first_not_of('\t');
+    std::string_view code =
+        first == std::string_view::npos ? std::string_view{} : line.substr(first);
+    auto emit = [&out](std::string_view text) {
+      out.append(text);
+      out += '\n';
+    };
+
+    if (code.empty() || code.starts_with("//")) {
+      emit(line);
+      continue;
+    }
+    // A hook that takes ctx and decides a branch: `if (Hook(ctx, base)) {`.
+    if (code.starts_with("if (") && code.ends_with(") {") && contains(code, "ctx, base")) {
+      std::string_view condition = code.substr(4, code.size() - 4 - 3);
+      out += spill;
+      out += '\n';
+      out.append(line.substr(0, first));
+      out += "if ([&] { const bool rex_hook_result = (";
+      out.append(condition);
+      out += ");";
+      out += reload;
+      out += " return rex_hook_result; }()) {\n";
+      continue;
+    }
+    if (contains(code, "env = ctx;") && !contains(code, "ctx = env;")) {
+      out += spill;
+      out += '\n';
+      emit(line);
+      continue;
+    }
+    if (contains(code, "ctx = env;")) {
+      emit(line);
+      out += reload;
+      out += '\n';
+      continue;
+    }
+    if (contains(code, "SEH_CATCH_ALL")) {
+      emit(line);
+      out += reload;
+      out += '\n';
+      continue;
+    }
+    if (contains(code, "ppc_longjmp") || contains(code, "SEH_RETHROW")) {
+      out += spill;
+      out += '\n';
+      emit(line);
+      continue;
+    }
+    const bool leaves = contains(code, "return") || contains(code, "REX_TAIL_CALL");
+    const bool calls = contains(code, "ctx, base") || contains(code, "REX_CALL_INDIRECT_FUNC");
+    if (leaves || calls) {
+      if (!spill_nv.empty()) {
+        out += spill_nv;
+        out += '\n';
+      }
+      emit(line);
+      continue;
+    }
+    emit(line);
+  }
+  return out;
 }
 
 }  // namespace
@@ -714,6 +810,29 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "}}\n");
   }
 
+  // CR fields kept in locals are synchronized with ctx at every boundary.
+  bool anyCrLocal = false;
+  for (size_t i = 0; i < 8; i++)
+    anyCrLocal |= localVariables.cr[i];
+  if (anyCrLocal) {
+    std::string spill = "\t";
+    std::string spill_nv;
+    std::string reload = "\t";
+    for (size_t i = 0; i < 8; i++) {
+      if (!localVariables.cr[i])
+        continue;
+      spill += fmt::format("ctx.cr{0} = cr{0}; ", i);
+      reload += fmt::format("cr{0} = ctx.cr{0}; ", i);
+      if (i >= 2 && i <= 4) {
+        spill_nv += fmt::format("ctx.cr{0} = cr{0}; ", i);
+      }
+    }
+    if (!spill_nv.empty()) {
+      spill_nv = "\t" + spill_nv;
+    }
+    body = SyncLocalCrRegisters(body, spill, spill_nv, reload);
+  }
+
   // --- Emit local variable declarations, then body ---
   if (localVariables.ctr)
     emit_println(out, "\tPPCRegister ctr{{}};");
@@ -724,7 +843,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   for (size_t i = 0; i < 8; i++) {
     if (localVariables.cr[i])
-      emit_println(out, "\tPPCCRRegister cr{}{{}};", i);
+      emit_println(out, "\tPPCCRRegister cr{0} = ctx.cr{0};", i);
   }
 
   for (size_t i = 0; i < 32; i++) {
