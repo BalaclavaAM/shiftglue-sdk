@@ -245,6 +245,8 @@ class VulkanPresenter final : public Presenter {
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
 #endif
+    // present_hdr's last pass (HdrOutputConstants).
+    kGuestOutputPaintPipelineLayoutIndexHdr,
 
     kGuestOutputPaintPipelineLayoutCount,
   };
@@ -477,14 +479,16 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
-  // fragment_shader replaces the effect's own, with the effect's layout.
+  // fragment_shader replaces the effect's own, with the effect's layout
+  // unless layout is given.
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
       GuestOutputPaintEffect effect, VkRenderPass render_pass,
       VkShaderModule fragment_shader = VK_NULL_HANDLE,
       VkColorComponentFlags color_write_mask = VK_COLOR_COMPONENT_R_BIT |
                                                VK_COLOR_COMPONENT_G_BIT |
                                                VK_COLOR_COMPONENT_B_BIT |
-                                               VK_COLOR_COMPONENT_A_BIT);
+                                               VK_COLOR_COMPONENT_A_BIT,
+      VkPipelineLayout layout = VK_NULL_HANDLE);
   bool CreateHdrSwapchainImages(VkFormat swapchain_format);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
