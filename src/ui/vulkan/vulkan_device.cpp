@@ -36,7 +36,7 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
                     "spills) for every graphics pipeline, where the driver reports them "
                     "through VK_KHR_pipeline_executable_properties")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(vulkan_fragment_shading_rate, REX_PLATFORM_ANDROID, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_fragment_shading_rate, REX_PLATFORM_LINUX, "UI/Vulkan",
                     "Enable VK_KHR_fragment_shading_rate where the device has it, so chosen "
                     "passes may be shaded once per 2x2 pixels (fh1_coarse_shading)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

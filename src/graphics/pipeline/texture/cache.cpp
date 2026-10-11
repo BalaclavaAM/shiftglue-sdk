@@ -1611,7 +1611,7 @@ REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated, true, "GPU",
                     "Resolves also write outdated textures directly when they cover all of "
                     "them, instead of the textures reloading")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated_partial, REX_PLATFORM_ANDROID, "GPU",
+REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated_partial, REX_PLATFORM_LINUX, "GPU",
                     "Resolves from texel 0, 0 also write outdated textures they cover only in "
                     "part, which keep their older texels elsewhere instead of reloading what "
                     "other writes left in that memory (FH1's shadow cascades, resolved into "
