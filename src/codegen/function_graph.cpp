@@ -15,8 +15,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -343,6 +346,158 @@ void emit_println(std::string& out, fmt::format_string<Args...> fmt, Args&&... a
 template <class... Args>
 void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... args) {
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
+}
+
+// The builders track the MXCSR/FPCR flush mode only along straight-line code:
+// every label resets it to unknown, so the first floating-point instruction
+// after any label emits a conditional toggle (a load, a compare and a branch,
+// and in a loop that alternates scalar and vector work a mode write too).
+// This pass computes the mode at every label as the meet of the paths into it
+// (fall-through and every goto, iterated to a fixed point for loops) and drops
+// each conditional toggle whose incoming mode is already the one it sets.
+// Entry, labels the resume dispatch can enter, calls (the callee may leave
+// either mode) and anything the pass does not recognize count as unknown, so
+// a toggle is removed only where every path provably sets that mode first.
+std::string PropagateFlushMode(const std::string& body) {
+  enum State : uint8_t { kTop, kFpu, kVmx, kUnknown };
+  auto meet = [](State a, State b) {
+    if (a == kTop)
+      return b;
+    if (b == kTop || a == b)
+      return a;
+    return kUnknown;
+  };
+
+  std::vector<std::string_view> lines;
+  for (size_t pos = 0; pos < body.size();) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos)
+      end = body.size();
+    lines.emplace_back(body.data() + pos, end - pos);
+    pos = end + 1;
+  }
+
+  auto contains = [](std::string_view line, std::string_view what) {
+    return line.find(what) != std::string_view::npos;
+  };
+  // The label a line references with `loc_`, or empty.
+  auto label_ref = [](std::string_view line) -> std::string_view {
+    size_t at = line.find("loc_");
+    if (at == std::string_view::npos)
+      return {};
+    size_t end = at + 4;
+    while (end < line.size() && std::isxdigit(static_cast<unsigned char>(line[end])))
+      end++;
+    return line.substr(at, end - at);
+  };
+
+  enum class Kind : uint8_t { kOther, kLabel, kGoto, kJump, kReturn, kBarrier, kToggle, kSet };
+  struct Line {
+    Kind kind = Kind::kOther;
+    State target = kTop;  // for toggles
+    std::string_view label;
+  };
+  std::vector<Line> info(lines.size());
+  std::unordered_map<std::string_view, State> label_in;
+  for (size_t i = 0; i < lines.size(); i++) {
+    std::string_view line = lines[i];
+    Line& li = info[i];
+    if (line.starts_with("loc_") && line.ends_with(":")) {
+      li.kind = Kind::kLabel;
+      li.label = line.substr(0, line.size() - 1);
+      label_in.emplace(li.label, kTop);
+      continue;
+    }
+    std::string_view code = line.substr(std::min(line.find_first_not_of('\t'), line.size()));
+    if (code.starts_with("//"))
+      continue;
+    // Only top-level toggles are tracked: one nested in a block may not run,
+    // so it falls through to the barrier case below.
+    const bool top_level = code.data() == line.data() + 1;
+    if (top_level &&
+        (code == "ctx.fpscr.enableFlushMode();" || code == "ctx.fpscr.disableFlushMode();")) {
+      li.kind = Kind::kToggle;
+      li.target = code.starts_with("ctx.fpscr.enable") ? kVmx : kFpu;
+      continue;
+    }
+    if (top_level && (code == "ctx.fpscr.enableFlushModeUnconditional();" ||
+                      code == "ctx.fpscr.disableFlushModeUnconditional();")) {
+      li.kind = Kind::kSet;
+      li.target = code.starts_with("ctx.fpscr.enable") ? kVmx : kFpu;
+      continue;
+    }
+    if (contains(code, "loc_")) {
+      li.label = label_ref(code);
+      // A dispatch case enters with whatever mode the caller left.
+      li.kind = contains(code, "case ") ? Kind::kJump : Kind::kGoto;
+      if (li.kind == Kind::kGoto && !code.starts_with("goto ") && !code.starts_with("if ("))
+        li.kind = Kind::kJump;
+      continue;
+    }
+    if (line == "\treturn;") {
+      li.kind = Kind::kReturn;
+      continue;
+    }
+    if (contains(code, "(ctx, base") || contains(code, "REX_CALL") ||
+        contains(code, "REX_TAIL_CALL") || contains(code, "ctx = ")|| contains(code, "SEH") || contains(code, "jmp") ||
+        contains(code, "fpscr")) {
+      li.kind = Kind::kBarrier;
+    }
+  }
+
+  std::vector<State> toggle_in(lines.size(), kTop);
+  for (bool changed = true; changed;) {
+    changed = false;
+    State state = kUnknown;  // function entry
+    for (size_t i = 0; i < lines.size(); i++) {
+      const Line& li = info[i];
+      switch (li.kind) {
+        case Kind::kLabel:
+          state = meet(state, label_in[li.label]);
+          break;
+        case Kind::kGoto:
+        case Kind::kJump: {
+          State edge = li.kind == Kind::kJump ? kUnknown : state;
+          State& in = label_in[li.label];
+          State next = meet(in, edge);
+          if (next != in) {
+            in = next;
+            changed = true;
+          }
+          // Only a top-level unconditional goto ends the fall-through.
+          if (lines[i].starts_with("\tgoto "))
+            state = kTop;
+          break;
+        }
+        case Kind::kReturn:
+          state = kTop;
+          break;
+        case Kind::kBarrier:
+          state = kUnknown;
+          break;
+        case Kind::kToggle:
+          toggle_in[i] = state;
+          state = li.target;
+          break;
+        case Kind::kSet:
+          state = li.target;
+          break;
+        case Kind::kOther:
+          break;
+      }
+    }
+  }
+
+  std::string out;
+  out.reserve(body.size());
+  for (size_t i = 0; i < lines.size(); i++) {
+    if (info[i].kind == Kind::kToggle && toggle_in[i] == info[i].target)
+      continue;
+    out.append(lines[i]);
+    if (i + 1 < lines.size() || (!body.empty() && body.back() == '\n'))
+      out += '\n';
+  }
+  return out;
 }
 
 // With cr_as_local, a function keeps the CR fields it uses in locals, which the
@@ -809,6 +964,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   } else {
     emit_println(body, "}}\n");
   }
+
+  body = PropagateFlushMode(body);
 
   // CR fields kept in locals are synchronized with ctx at every boundary.
   bool anyCrLocal = false;
