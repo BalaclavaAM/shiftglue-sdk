@@ -93,6 +93,18 @@
 #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
+// Accesses based on the stack pointer (r1). Guest stacks are allocated in the
+// stack range at 0x70000000, never in the 0xE0000000 physical view, so these
+// skip the physical-heap offset select.
+#define REX_STACK_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x)))
+#define REX_STACK_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x)) = (y))
+#define REX_STACK_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x)) = __builtin_bswap16(y))
+#define REX_STACK_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x)) = __builtin_bswap32(y))
+#define REX_STACK_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x)) = __builtin_bswap64(y))
+
 #define REX_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================

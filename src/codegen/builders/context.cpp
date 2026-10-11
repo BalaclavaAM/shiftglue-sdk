@@ -553,6 +553,10 @@ void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_t
       snprintf(mm_macro, sizeof(mm_macro), "REX_MM_LOAD_%s", load_macro + 9);
       macro = mm_macro;
     }
+  } else if (insn.operands[2] == 1 && strncmp(load_macro, "REX_LOAD_", 9) == 0) {
+    // r1 is the stack pointer: guest stacks are never in the physical view.
+    snprintf(mm_macro, sizeof(mm_macro), "REX_STACK_LOAD_%s", load_macro + 9);
+    macro = mm_macro;
   }
 
   print("\t{}.{} = {}(", r(insn.operands[0]), dest_type, macro);
@@ -593,6 +597,10 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
       snprintf(mm_macro, sizeof(mm_macro), "REX_MM_STORE_%s", store_macro + 10);
       macro = mm_macro;
     }
+  } else if (insn.operands[2] == 1 && strncmp(store_macro, "REX_STORE_", 10) == 0) {
+    // r1 is the stack pointer: guest stacks are never in the physical view.
+    snprintf(mm_macro, sizeof(mm_macro), "REX_STACK_STORE_%s", store_macro + 10);
+    macro = mm_macro;
   }
 
   print("\t{}(", macro);

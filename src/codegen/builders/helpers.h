@@ -221,8 +221,14 @@ inline void emitStoreWithUpdate(BuilderContext& ctx, const char* store_macro, co
   // EA = displacement + rA
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  // MEM[EA] = rS
-  ctx.println("\t{}({}, {}.{});", store_macro, ctx.ea(), ctx.r(ctx.insn.operands[0]), field);
+  // MEM[EA] = rS. Based on r1 (the frame push), the address is on the guest
+  // stack, which is never in the physical view.
+  if (ctx.insn.operands[2] == 1 && strncmp(store_macro, "REX_STORE_", 10) == 0) {
+    ctx.println("\tREX_STACK_STORE_{}({}, {}.{});", store_macro + 10, ctx.ea(),
+                ctx.r(ctx.insn.operands[0]), field);
+  } else {
+    ctx.println("\t{}({}, {}.{});", store_macro, ctx.ea(), ctx.r(ctx.insn.operands[0]), field);
+  }
   // rA = EA (update)
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
 }
