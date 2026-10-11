@@ -1791,11 +1791,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       native_textures_->MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
       // One-off captures the CPU reads also need the guest layout: resolved
       // again unscaled into the guest memory mirror, from each guest pixel's
-      // first host pixel, and read back.
-      if (written_address &&
-          command_processor_.Fh1ReadbackResolveMode() == ReadbackResolveMode::kDisabled &&
-          IsOneOffResolve(resolve_info.copy_dest_extent_start,
-                          resolve_info.copy_dest_extent_length)) {
+      // first host pixel, and read back. So are small resolves, without the
+      // readback, as in the Vulkan executor (#444).
+      constexpr uint32_t kUnscaledCopyMaxLength = 4096;
+      const bool unscaled_copy =
+          written_address &&
+          command_processor_.Fh1ReadbackResolveMode() == ReadbackResolveMode::kDisabled;
+      const bool one_off = unscaled_copy && IsOneOffResolve(resolve_info.copy_dest_extent_start,
+                                                            resolve_info.copy_dest_extent_length);
+      if (one_off ||
+          (unscaled_copy && resolve_info.copy_dest_extent_length <= kUnscaledCopyMaxLength)) {
         native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
                                      resolve_info.copy_dest_extent_length);
         bool unscaled_complete = true;
@@ -1811,7 +1816,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
               ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
                               plan.dest_base, plan.dest_pitch, 0, true);
         }
-        if (unscaled_complete) {
+        if (unscaled_complete && one_off) {
           QueueResolveReadback(resolve_info.copy_dest_extent_start,
                                resolve_info.copy_dest_extent_length);
         }

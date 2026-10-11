@@ -2942,8 +2942,15 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
-    // pixel's first host pixel, and read back.
-    if (scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length)) {
+    // pixel's first host pixel, and read back. So are small resolves, without
+    // the readback: the 32x32 scene luminance the auto exposure samples is
+    // also read at guest size, and stale there it pins the exposure at its
+    // daytime limit, overexposing the screen until about noon (#444).
+    constexpr uint32_t kUnscaledCopyMaxLength = 4096;
+    const bool one_off =
+        scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+    if (scale_ > 1 && written_address &&
+        (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
                           std::make_pair(extent_start, extent_length));
@@ -2961,7 +2968,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
             uint32_t(plan.dest_base - offset), plan.dest_pitch, config_.memory->buffer(), offset,
             range, true);
       }
-      if (unscaled_complete) QueueResolveReadback(extent_start, extent_length);
+      if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
