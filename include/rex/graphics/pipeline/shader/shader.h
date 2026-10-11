@@ -815,6 +815,16 @@ class Shader {
       return true;
     }
 
+    // Replaces a valid translation's bytecode with an equivalent one that
+    // keeps its interface (a hand-optimized shader).
+    bool ReplaceTranslatedBinary(std::span<const uint8_t> binary) {
+      if (!is_translated_ || !is_valid_ || binary.empty()) {
+        return false;
+      }
+      translated_binary_.assign(binary.begin(), binary.end());
+      return true;
+    }
+
     void RejectPrecompiledMiss() {
       translated_binary_.clear();
       errors_.clear();

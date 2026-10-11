@@ -28,12 +28,14 @@ add_executable(unit_tests
     codegen/output_stamp_test.cpp
     filesystem/cache_mount_test.cpp
     graphics/native_guest_output_test.cpp
+    graphics/vulkan_shader_overrides_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
 )
 
 target_include_directories(unit_tests PRIVATE

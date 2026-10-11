@@ -445,6 +445,11 @@ class VulkanPipelineCache {
   Fh1ShaderPack::Config Fh1ShaderPackConfig() const;
   std::atomic<uint64_t> fh1_shader_pack_hits_{0};
   std::atomic<uint64_t> fh1_shader_pack_misses_{0};
+  // vulkan_shader_overrides: swaps a valid translation's bytecode for its
+  // hand-edited form (or a vulkan_shader_override_dir file), keeping the
+  // original for captures.
+  void ApplyShaderOverride(VulkanShader::VulkanTranslation& translation);
+  std::atomic<uint32_t> shader_override_hits_{0};
   void ObserveTranslation(const VulkanShader& shader,
                           const VulkanShader::VulkanTranslation& translation);
 

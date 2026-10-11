@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <vector>
 
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/xenos.h>
@@ -29,8 +30,14 @@ class VulkanShader : public SpirvShader {
     VkShaderModule GetOrCreateShaderModule();
     VkShaderModule shader_module() const { return shader_module_; }
 
+    // The translator's bytecode when a hand-optimized override replaced it
+    // (for shader pack captures), otherwise empty.
+    std::vector<uint8_t>& replaced_binary() { return replaced_binary_; }
+    const std::vector<uint8_t>& replaced_binary() const { return replaced_binary_; }
+
    private:
     VkShaderModule shader_module_ = VK_NULL_HANDLE;
+    std::vector<uint8_t> replaced_binary_;
   };
 
   explicit VulkanShader(const ui::vulkan::VulkanDevice* vulkan_device,

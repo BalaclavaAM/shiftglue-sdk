@@ -46,6 +46,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/shader_overrides.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -92,6 +93,17 @@ REXCVAR_DEFINE_BOOL(vulkan_async_shader_translation, true, "GPU/Vulkan",
                     "for the first time on a worker and skip its draws until it is ready, "
                     "instead of stopping the GPU commands thread for it (hundreds of "
                     "milliseconds when a new scene first appears on a phone)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_shader_overrides, true, "GPU/Vulkan",
+                    "Apply the hand edits of the hottest guest shaders (#413) when the "
+                    "translation matches the one each was measured on (guest hash, "
+                    "modification and translated SPIR-V hash); any other translation is used "
+                    "as is")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_override_dir, "", "GPU/Vulkan",
+                      "Directory of shader_<guest hash>_<modification>_<translated SPIR-V "
+                      "hash>.spv replacements, checked before the built-in ones (for writing "
+                      "new overrides)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
@@ -1794,8 +1806,11 @@ void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
                           : system::GraphicsShaderStage::kPixel;
   observation.guest_hash = shader.ucode_data_hash();
   observation.specialization_mask = translation.modification();
-  observation.bytecode = translation.translated_binary().data();
-  observation.bytecode_size = translation.translated_binary().size();
+  const std::vector<uint8_t>& bytecode = translation.replaced_binary().empty()
+                                             ? translation.translated_binary()
+                                             : translation.replaced_binary();
+  observation.bytecode = bytecode.data();
+  observation.bytecode_size = bytecode.size();
   observation.translator_version = config.translator_version;
   observation.backend = uint32_t(config.backend);
   observation.device_features = config.device_features;
@@ -1889,7 +1904,86 @@ bool VulkanPipelineCache::TranslateShaderBinary(SpirvShaderTranslator& translato
   if (!REXCVAR_GET(dump_shaders).empty()) {
     translation.Dump(REXCVAR_GET(dump_shaders), "spirv");
   }
+  ApplyShaderOverride(translation);
   return translation.GetOrCreateShaderModule() != VK_NULL_HANDLE;
+}
+
+void VulkanPipelineCache::ApplyShaderOverride(VulkanShader::VulkanTranslation& translation) {
+  if (!REXCVAR_GET(vulkan_shader_overrides) || !translation.is_valid()) {
+    return;
+  }
+  const Shader& shader = translation.shader();
+  const std::vector<uint8_t>& translated = translation.translated_binary();
+  const uint64_t translated_hash = XXH3_64bits(translated.data(), translated.size());
+  std::vector<uint8_t> replacement;
+  std::string source;
+  const std::string& dir = REXCVAR_GET(vulkan_shader_override_dir);
+  if (!dir.empty()) {
+    const std::filesystem::path path =
+        rex::to_path(dir) / fmt::format("shader_{:016X}_{:016X}_{:016X}.spv",
+                                        shader.ucode_data_hash(), translation.modification(),
+                                        translated_hash);
+    if (FILE* file = filesystem::OpenFile(path, "rb")) {
+      std::fseek(file, 0, SEEK_END);
+      const long size = std::ftell(file);
+      std::fseek(file, 0, SEEK_SET);
+      if (size > 0) {
+        replacement.resize(size_t(size));
+        if (std::fread(replacement.data(), 1, replacement.size(), file) != replacement.size()) {
+          replacement.clear();
+        }
+      }
+      std::fclose(file);
+      source = rex::path_to_utf8(path);
+    }
+  }
+  if (replacement.empty()) {
+    for (const VulkanShaderOverride& entry : GetBuiltInVulkanShaderOverrides()) {
+      if (entry.type != shader.type() || entry.ucode_data_hash != shader.ucode_data_hash() ||
+          entry.modification != translation.modification()) {
+        continue;
+      }
+      if (entry.translated_hash != translated_hash) {
+        // The translator or the host configuration changed since the override
+        // was written: keep the translation.
+        REXGPU_INFO("Vulkan shader override {} skipped: {:016X}/{:016X} now translates to "
+                    "{:016X}, not {:016X}",
+                    entry.name, shader.ucode_data_hash(), translation.modification(),
+                    translated_hash, entry.translated_hash);
+        continue;
+      }
+      std::vector<uint32_t> words(translated.size() / sizeof(uint32_t));
+      std::memcpy(words.data(), translated.data(), words.size() * sizeof(uint32_t));
+      if (!ApplyVulkanShaderEdits(words, entry.edits)) {
+        REXGPU_WARN("Vulkan shader override {} does not apply to {:016X}/{:016X}", entry.name,
+                    shader.ucode_data_hash(), translation.modification());
+        break;
+      }
+      replacement.resize(words.size() * sizeof(uint32_t));
+      std::memcpy(replacement.data(), words.data(), replacement.size());
+      source = entry.name;
+      break;
+    }
+  }
+  if (replacement.empty()) {
+    return;
+  }
+  uint32_t magic = 0;
+  if (replacement.size() >= 20 && !(replacement.size() & 3)) {
+    std::memcpy(&magic, replacement.data(), sizeof(magic));
+  }
+  if (magic != 0x07230203u) {
+    REXGPU_WARN("Vulkan shader override {} is not SPIR-V; keeping the translation", source);
+    return;
+  }
+  std::vector<uint8_t> original = translated;
+  if (!translation.ReplaceTranslatedBinary(replacement)) {
+    return;
+  }
+  translation.replaced_binary() = std::move(original);
+  const uint32_t hits = shader_override_hits_.fetch_add(1, std::memory_order_relaxed) + 1;
+  REXGPU_INFO("Vulkan shader override {} for {:016X}/{:016X} ({} so far)", source,
+              shader.ucode_data_hash(), translation.modification(), hits);
 }
 
 void VulkanPipelineCache::FinishShaderTranslation(VulkanShader::VulkanTranslation& translation,

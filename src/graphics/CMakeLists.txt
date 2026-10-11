@@ -62,6 +62,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
+    vulkan/shader_overrides.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
 )
