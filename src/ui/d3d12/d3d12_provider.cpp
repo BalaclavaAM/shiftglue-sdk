@@ -250,10 +250,30 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. Without a forced one, the high-performance GPU
+  // first: EnumAdapters1 lists a laptop's integrated GPU first.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    Microsoft::WRL::ComPtr<IDXGIFactory6> dxgi_factory6;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))) {
+      for (uint32_t i = 0; dxgi_factory6->EnumAdapterByGpuPreference(
+                               i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)) ==
+                           S_OK;
+           ++i) {
+        DXGI_ADAPTER_DESC1 adapter_desc;
+        if (SUCCEEDED(adapter->GetDesc1(&adapter_desc)) &&
+            !(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                               _uuidof(ID3D12Device), nullptr))) {
+          break;
+        }
+        adapter->Release();
+        adapter = nullptr;
+      }
+    }
+  }
+  while (adapter == nullptr && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
