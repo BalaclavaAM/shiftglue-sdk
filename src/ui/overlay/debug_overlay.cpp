@@ -12,6 +12,7 @@
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/version.h>
 #include <imgui.h>
+#include <mutex>
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
 #include <rex/chrono/clock.h>
 #include <rex/perf/counter.h>
@@ -19,6 +20,21 @@
 #endif
 
 namespace rex::ui {
+
+namespace {
+std::mutex build_label_mutex;
+std::string build_label;
+}  // namespace
+
+void SetBuildLabel(std::string label) {
+  std::lock_guard lock(build_label_mutex);
+  build_label = std::move(label);
+}
+
+std::string GetBuildLabel() {
+  std::lock_guard lock(build_label_mutex);
+  return build_label.empty() ? std::string(REXGLUE_BUILD_STAMP) : build_label;
+}
 
 DebugOverlayDialog::DebugOverlayDialog(ImGuiDrawer* imgui_drawer, FrameStatsProvider stats_provider)
     : ImGuiDialog(imgui_drawer), stats_provider_(std::move(stats_provider)) {}
@@ -127,7 +143,8 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 
   // Build stamp watermark -- centered near bottom of screen
-  auto text_size = ImGui::CalcTextSize(REXGLUE_BUILD_STAMP);
+  const std::string label = GetBuildLabel();
+  auto text_size = ImGui::CalcTextSize(label.c_str());
   float padding = ImGui::GetStyle().WindowPadding.x * 2.0f;
   float bottom_offset = io.DisplaySize.y * 0.03f;
   ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - text_size.x - padding) * 0.5f,
@@ -138,7 +155,7 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextUnformatted(REXGLUE_BUILD_STAMP);
+    ImGui::TextUnformatted(label.c_str());
   }
   ImGui::End();
   ImGui::PopStyleColor();

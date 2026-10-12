@@ -14,8 +14,15 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace rex::ui {
+
+// The build line the F3 overlay's watermark and the window title show. A host
+// sets it before setup (for example in OnPreSetup) to name its own release
+// and commits; empty restores the SDK's stamp.
+void SetBuildLabel(std::string label);
+std::string GetBuildLabel();
 
 struct FrameStats {
   double frame_time_ms = 0;

@@ -405,9 +405,11 @@ bool ReXApp::SetupPresentation() {
     return false;
   }
 
-  // Set window title with SDK build stamp
-  std::string title = std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
-  window_->SetTitle(title);
+  // The host's build label when it set one, else the SDK's stamp.
+  std::string label = rex::ui::GetBuildLabel();
+  window_->SetTitle(label == REXGLUE_BUILD_STAMP
+                        ? std::string(GetName()) + " " + REXGLUE_BUILD_TITLE
+                        : label);
 
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
