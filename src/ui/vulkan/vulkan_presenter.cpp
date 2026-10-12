@@ -171,7 +171,7 @@ struct HdrOutputConstants {
   float compare_x;
   uint32_t pattern;
   float pattern_value;
-  uint32_t output_pq;
+  uint32_t output_flags;
   float size[2];
 };
 static_assert(sizeof(HdrOutputConstants) == 48);
@@ -181,6 +181,17 @@ std::atomic<bool> hdr_output_pq = false;
 // HDR10 through a 10-bit swapchain whose window buffers are marked BT.2020
 // PQ by hand (Android before 14 offers no HDR10 color space to Vulkan).
 std::atomic<bool> hdr_output_pq_dataspace = false;
+// The HDR swapchain is pre-rotated by this (hdr_output.ps.glsl kRotation*):
+// on a display whose panel is mounted rotated (the Odin 2 Portal's is
+// portrait), the compositor's own rotation only takes 8-bit buffers and
+// tone-maps HDR10 down to SDR before it, which washed the image out.
+std::atomic<uint32_t> hdr_output_rotation = 0;
+
+VkExtent2D HdrSwapchainImageExtent(VkExtent2D extent) {
+  return hdr_output_rotation.load(std::memory_order_relaxed)
+             ? VkExtent2D{extent.height, extent.width}
+             : extent;
+}
 
 }  // namespace
 
@@ -1629,6 +1640,29 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       (surface_capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
           : VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR;
+  uint32_t rotation = 0;
+#if REX_PLATFORM_ANDROID
+  // HDR10 only reaches the panel unrotated: take the display's transform and
+  // rotate in the last pass, which alone writes the HDR swapchain. The rest
+  // of the presenter keeps the unrotated extent (image_extent_out).
+  if (hdr_out && hdr_pq &&
+      (surface_capabilities.supportedTransforms & surface_capabilities.currentTransform)) {
+    const VkExtent2D rotated = {image_extent.height, image_extent.width};
+    const bool fits = rotated.width <= max_framebuffer_extent.width &&
+                      rotated.height <= max_framebuffer_extent.height;
+    if (fits && surface_capabilities.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) {
+      rotation = 1;
+    } else if (fits &&
+               surface_capabilities.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+      rotation = 2;
+    }
+    if (rotation) {
+      swapchain_create_info.preTransform = surface_capabilities.currentTransform;
+      swapchain_create_info.imageExtent = rotated;
+    }
+  }
+#endif
+  hdr_output_rotation.store(rotation, std::memory_order_relaxed);
   // Prefer opaque to avoid blending in the window system, or let that be
   // specified via the window system if it can't be forced. As a last resort,
   // just pick any - guest output will write alpha of 1 anyway.
@@ -1685,14 +1719,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}",
+      "{}, presentation mode {}, transform {} (display {})",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode));
+      uint32_t(swapchain_create_info.presentMode), uint32_t(swapchain_create_info.preTransform),
+      uint32_t(surface_capabilities.currentTransform));
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
-  image_extent_out = swapchain_create_info.imageExtent;
+  image_extent_out = image_extent;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
                 swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
   return swapchain;
@@ -2484,14 +2519,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     hdr_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     hdr_render_pass_begin_info.renderPass = paint_context_.hdr_render_pass;
     hdr_render_pass_begin_info.framebuffer = hdr_image.swapchain_framebuffer;
-    hdr_render_pass_begin_info.renderArea.extent = paint_context_.swapchain_extent;
+    const VkExtent2D hdr_extent = HdrSwapchainImageExtent(paint_context_.swapchain_extent);
+    hdr_render_pass_begin_info.renderArea.extent = hdr_extent;
     dfn.vkCmdBeginRenderPass(draw_command_buffer, &hdr_render_pass_begin_info,
                              VK_SUBPASS_CONTENTS_INLINE);
     VkViewport hdr_viewport = {};
-    hdr_viewport.width = float(paint_context_.swapchain_extent.width);
-    hdr_viewport.height = float(paint_context_.swapchain_extent.height);
+    hdr_viewport.width = float(hdr_extent.width);
+    hdr_viewport.height = float(hdr_extent.height);
     hdr_viewport.maxDepth = 1.0f;
-    VkRect2D hdr_scissor = {{0, 0}, paint_context_.swapchain_extent};
+    VkRect2D hdr_scissor = {{0, 0}, hdr_extent};
     dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &hdr_viewport);
     dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &hdr_scissor);
     dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2526,7 +2562,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         REXCVAR_GET(present_hdr_compare) ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
     hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
     hdr_constants.pattern_value = float(peak_nits / 80.0);
-    hdr_constants.output_pq = hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0;
+    hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
+                                 (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
     hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
     dfn.vkCmdPushConstants(draw_command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -3142,8 +3179,10 @@ bool VulkanPresenter::CreateHdrSwapchainImages(VkFormat swapchain_format) {
     framebuffer_create_info.renderPass = context.hdr_render_pass;
     framebuffer_create_info.attachmentCount = 1;
     framebuffer_create_info.pAttachments = &hdr_image.swapchain_view;
-    framebuffer_create_info.width = context.swapchain_extent.width;
-    framebuffer_create_info.height = context.swapchain_extent.height;
+    // The swapchain's own size, rotated from the stand-in's when pre-rotated.
+    const VkExtent2D swapchain_image_extent = HdrSwapchainImageExtent(context.swapchain_extent);
+    framebuffer_create_info.width = swapchain_image_extent.width;
+    framebuffer_create_info.height = swapchain_image_extent.height;
     framebuffer_create_info.layers = 1;
     if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
                                 &hdr_image.swapchain_framebuffer) != VK_SUCCESS) {

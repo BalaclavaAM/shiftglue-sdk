@@ -27,9 +27,18 @@ layout(push_constant) uniform HdrOutputConstants {
   // A calibration pattern under the UI (kPattern*), and its value.
   uint pattern;
   float pattern_value;  // kPatternPeak: the tested peak, nits / 80.
-  uint output_pq;  // Non-zero: an HDR10 swapchain, written as BT.2020 PQ.
-  vec2 size;  // The swapchain's size, for the patterns.
+  // Bit 0: an HDR10 swapchain, written as BT.2020 PQ. Bits 1-2: the
+  // swapchain is pre-rotated for the display (kRotation*), so its pixels map
+  // to rotated stand-in pixels.
+  uint output_flags;
+  vec2 size;  // The stand-in's (unrotated) size.  // The swapchain's size, for the patterns.
 } constants;
+
+const uint kOutputPq = 1u;
+const uint kRotationShift = 1u;
+const uint kRotationNone = 0u;
+const uint kRotation90 = 1u;
+const uint kRotation270 = 2u;
 
 const uint kPatternNone = 0u;
 const uint kPatternBlack = 1u;
@@ -44,7 +53,7 @@ float max3(vec3 v) { return max(v.r, max(v.g, v.b)); }
 
 // scRGB (linear BT.709, 1.0 at 80 nits) as the swapchain stores it.
 vec4 Output(vec3 scrgb) {
-  if (constants.output_pq == 0u) {
+  if ((constants.output_flags & kOutputPq) == 0u) {
     return vec4(scrgb, 1.0);
   }
   const mat3 kBt709ToBt2020 = mat3(0.6274040, 0.0690970, 0.0163916,
@@ -126,14 +135,29 @@ vec3 Pattern(vec2 pixel) {
   return vec3(0.0);
 }
 
+// The stand-in pixel a swapchain pixel shows.
+ivec2 StandInPixel(ivec2 pixel) {
+  ivec2 size = ivec2(constants.size);
+  uint rotation = (constants.output_flags >> kRotationShift) & 3u;
+  if (rotation == kRotation90) {
+    return ivec2(pixel.y, size.y - 1 - pixel.x);
+  }
+  if (rotation == kRotation270) {
+    return ivec2(size.x - 1 - pixel.y, pixel.x);
+  }
+  return pixel;
+}
+
 void main() {
-  vec4 sdr = texelFetch(stand_in, ivec2(gl_FragCoord.xy), 0);
+  ivec2 pixel = StandInPixel(ivec2(gl_FragCoord.xy));
+  vec2 frag = vec2(pixel) + 0.5;
+  vec4 sdr = texelFetch(stand_in, pixel, 0);
   float ui = clamp(sdr.a, 0.0, 1.0);
   vec3 linear = sdr.rgb;
-  if (constants.compare_x >= 0.0 && gl_FragCoord.x < constants.compare_x) {
+  if (constants.compare_x >= 0.0 && frag.x < constants.compare_x) {
     // The SDR reference half.
     vec3 reference = linear * constants.paper_white_scale;
-    if (gl_FragCoord.x > constants.compare_x - 3.0) {
+    if (frag.x > constants.compare_x - 3.0) {
       reference = vec3(constants.paper_white_scale);
     }
     output_color = Output(reference);
@@ -151,7 +175,7 @@ void main() {
   vec3 color = linear * (constants.paper_white_scale * boost);
   if (constants.pattern != kPatternNone) {
     // The pattern replaces the image; the menu stays on top of it.
-    color = mix(Pattern(gl_FragCoord.xy), linear * constants.paper_white_scale, ui);
+    color = mix(Pattern(frag), linear * constants.paper_white_scale, ui);
   }
   output_color = Output(color);
 }
