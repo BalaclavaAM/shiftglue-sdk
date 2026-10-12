@@ -242,6 +242,8 @@ class VulkanDevice {
     // Have optional features not implied by these being true.
     bool ext_KHR_present_id = false;    // #295
     bool ext_KHR_present_wait = false;  // #249
+    // The mastering levels of an HDR10 swapchain.
+    bool ext_EXT_hdr_metadata = false;  // #106
     // Only with vulkan_pipeline_statistics.
     bool ext_KHR_pipeline_executable_properties = false;  // #270
     // Has optional features not implied by this being true.
@@ -273,6 +275,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
     // VK_KHR_present_wait (#249)
 #include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+    // VK_EXT_hdr_metadata (#106)
+#include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
     // VK_KHR_fragment_shading_rate (#227)
 #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED

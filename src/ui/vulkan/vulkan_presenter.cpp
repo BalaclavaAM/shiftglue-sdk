@@ -971,6 +971,42 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
+  if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed) &&
+      vulkan_device_->extensions().ext_EXT_hdr_metadata) {
+    // Mastered for the display itself, so that it shows the levels as they
+    // are, clipping at its own peak, rather than tone-mapping them from an
+    // assumed 1000-10000 nit master (which flattened the whole image on the
+    // Odin 2 Portal and kept the peak calibration square visible).
+    float max_nits = float(REXCVAR_GET(present_hdr_peak_nits));
+    float max_average_nits = max_nits;
+    float min_nits = 0.0f;
+#if REX_PLATFORM_ANDROID
+    if (GetAndroidDisplayHdr().max_nits > 0.0f) {
+      max_nits = GetAndroidDisplayHdr().max_nits;
+      max_average_nits = GetAndroidDisplayHdr().max_average_nits > 0.0f
+                             ? GetAndroidDisplayHdr().max_average_nits
+                             : max_nits;
+      min_nits = GetAndroidDisplayHdr().min_nits;
+    }
+#endif
+    VkHdrMetadataEXT metadata = {};
+    metadata.sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT;
+    // BT.2020 primaries, D65 white.
+    metadata.displayPrimaryRed = {0.708f, 0.292f};
+    metadata.displayPrimaryGreen = {0.170f, 0.797f};
+    metadata.displayPrimaryBlue = {0.131f, 0.046f};
+    metadata.whitePoint = {0.3127f, 0.3290f};
+    metadata.maxLuminance = max_nits;
+    metadata.minLuminance = min_nits;
+    metadata.maxContentLightLevel = max_nits;
+    metadata.maxFrameAverageLightLevel = max_average_nits;
+    vulkan_device_->functions().vkSetHdrMetadataEXT(device, 1, &paint_context_.swapchain,
+                                                    &metadata);
+    REXLOG_INFO("VulkanPresenter: HDR10 metadata: peak {} nits, frame average {} nits, black {} nits",
+                max_nits, max_average_nits, min_nits);
+  } else if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed)) {
+    REXLOG_WARN("VulkanPresenter: HDR10 without metadata (no VK_EXT_hdr_metadata)");
+  }
 #if REX_PLATFORM_ANDROID
   if (paint_context_.swapchain_hdr && hdr_output_pq_dataspace.load(std::memory_order_relaxed) &&
       paint_context_.android_window) {
@@ -2473,13 +2509,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                            sizeof(hdr_rect_constants), &hdr_rect_constants);
     HdrOutputConstants hdr_constants = {};
     const double paper_white_nits = REXCVAR_GET(present_hdr_paper_white_nits);
-    double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
-#if REX_PLATFORM_ANDROID
-    // Android reports the panel's peak: highlights past it would only clip.
-    if (GetAndroidDisplayHdr().max_nits > 0.0f) {
-      peak_nits = std::min(peak_nits, double(GetAndroidDisplayHdr().max_nits));
-    }
-#endif
+    const double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
     hdr_constants.paper_white_scale = float(paper_white_nits / 80.0);
     // SDR white in the scene goes this far from the paper white to the peak.
     hdr_constants.highlight_scale = float(

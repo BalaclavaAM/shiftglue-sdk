@@ -429,6 +429,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_id)
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_wait)
     }
+    // #106, for HDR10 output (present_hdr).
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -1121,6 +1123,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_present_wait) {
 #include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+  }
+  if (device->extensions_.ext_EXT_hdr_metadata) {
+#include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
   }
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
 #include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
