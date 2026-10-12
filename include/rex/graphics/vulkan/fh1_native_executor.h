@@ -117,6 +117,10 @@ class Fh1NativeExecutor {
   // and, at the first HUD draw over it (through its 2_10_10_10_AS_10_10_10_10
   // view), copies it, so the swap can tell the HUD from the scene.
   void SetHudSnapshotEnabled(bool enabled) { hud_snapshot_enabled_ = enabled; }
+  // Whether the draw MaybeSnapshotBeforeHud last saw is the HUD: drawn into
+  // the front buffer's 2_10_10_10_AS_10_10_10_10 view after the scene was
+  // composited there this frame (menus over a game world included).
+  bool IsHudDraw() const { return hud_draw_; }
   void MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw);
   // After OnSwap: the swapped frame's snapshot, made readable from compute
   // shaders, if it covers width x height; null otherwise.
@@ -390,6 +394,7 @@ class Fh1NativeExecutor {
   // swapped next has one, and the copy (image, view, format, size, layout).
   bool hud_snapshot_enabled_ = false;
   uint32_t hud_scene_base_ = UINT32_MAX;
+  bool hud_draw_ = false;
   bool hud_snapshot_taken_ = false;
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;

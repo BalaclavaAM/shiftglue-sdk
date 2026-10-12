@@ -161,6 +161,16 @@ REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
     .range(1.0, 4.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #endif
+REXCVAR_DEFINE_DOUBLE(fh1_hud_scale, 1.0, "GPU",
+                      "Vulkan: scale of FH1's HUD around the screen centre, over a game world "
+                      "(menus without one keep their size)")
+    .range(0.5, 1.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(fh1_hud_safe_zone, 0.0, "GPU",
+                      "Vulkan: margin kept clear of FH1's HUD on each side, as a share of the "
+                      "screen (for TVs that crop the picture)")
+    .range(0.0, 0.2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_async_submission, true, "GPU/Vulkan",
                     "Replay and submit each ended submission's command stream on a worker "
                     "thread, overlapping the driver's recording with the next submission")
@@ -5791,6 +5801,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
   const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  // The HUD scale and safe zone shrink or grow the HUD around the centre,
+  // only for HUD draws over this frame's scene (fh1_native_executor).
+  const double hud_scale =
+      fh1_native_executor_ && fh1_native_executor_->IsHudDraw()
+          ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
+          : 1.0;
   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
   ViewportMemo& viewport_memo = viewport_memos_[StateMemoSlot(
       memo_state, uint64_t(uintptr_t(pixel_shader)),
@@ -5799,7 +5815,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       viewport_memo.depth_control == normalized_depth_control.value &&
       viewport_memo.color_mask == normalized_color_mask &&
       viewport_memo.resolution_scale == viewport_resolution_scale &&
-      viewport_memo.hud_squeeze == hud_squeeze) {
+      viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale) {
     viewport_info = viewport_memo.info;
   } else {
     draw_util::GetHostViewportInfo(
@@ -5816,12 +5832,19 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
       viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
     }
+    if (hud_scale != 1.0) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        viewport_info.ndc_scale[i] = float(viewport_info.ndc_scale[i] * hud_scale);
+        viewport_info.ndc_offset[i] = float(viewport_info.ndc_offset[i] * hud_scale);
+      }
+    }
     viewport_memo.state_epoch = memo_state;
     viewport_memo.pixel_shader = pixel_shader;
     viewport_memo.depth_control = normalized_depth_control.value;
     viewport_memo.color_mask = normalized_color_mask;
     viewport_memo.resolution_scale = viewport_resolution_scale;
     viewport_memo.hud_squeeze = hud_squeeze;
+    viewport_memo.hud_scale = hud_scale;
     viewport_memo.info = viewport_info;
   }
 

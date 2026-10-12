@@ -3085,7 +3085,8 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
 }
 
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
-  if (!hud_snapshot_enabled_ || !initialized_ || draw.memexport || !draw.rasterization_done ||
+  hud_draw_ = false;
+  if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
     return;
   }
@@ -3097,9 +3098,11 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     return;
   }
   if (color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 ||
-      hud_snapshot_taken_ || color_info.color_base != hud_scene_base_) {
+      color_info.color_base != hud_scene_base_) {
     return;
   }
+  hud_draw_ = true;
+  if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
   hud_snapshot_taken_ = true;
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);

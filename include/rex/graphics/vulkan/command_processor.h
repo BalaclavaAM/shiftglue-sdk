@@ -1400,6 +1400,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t color_mask = 0;
     uint32_t resolution_scale = 0;
     double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
     draw_util::ViewportInfo info;
   };
   std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
