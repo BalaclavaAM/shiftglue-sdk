@@ -121,6 +121,9 @@ class Fh1NativeExecutor {
   // the front buffer's 2_10_10_10_AS_10_10_10_10 view after the scene was
   // composited there this frame (menus over a game world included).
   bool IsHudDraw() const { return hud_draw_; }
+  // Whether render target 0 is that HUD view now, before
+  // MaybeSnapshotBeforeHud sees the draw (for its samplers).
+  bool IsHudTarget() const;
   void MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw);
   // After OnSwap: the swapped frame's snapshot, made readable from compute
   // shaders, if it covers width x height; null otherwise.

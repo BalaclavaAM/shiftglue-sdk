@@ -3084,6 +3084,14 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
 }
 
+bool Fh1NativeExecutor::IsHudTarget() const {
+  if (!initialized_) return false;
+  const auto color_info =
+      register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+  return color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
+         color_info.color_base == hud_scene_base_;
+}
+
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   hud_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||

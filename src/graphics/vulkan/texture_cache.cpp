@@ -1091,7 +1091,7 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
 }
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
-    const VulkanShader::SamplerBinding& binding) const {
+    const VulkanShader::SamplerBinding& binding, int32_t anisotropic_override) const {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
@@ -1160,7 +1160,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
                                                  &mip_min_level, &mip_max_level);
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  parameters.no_lod_bias = anisotropic_override == kNoSceneFiltering;
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
@@ -1299,7 +1299,9 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   {
     const float max_bias = command_processor_.GetVulkanDevice()->properties().maxSamplerLodBias;
     sampler_create_info.mipLodBias =
-        std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
+        parameters.no_lod_bias
+            ? 0.0f
+            : std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
   }
   if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
     sampler_create_info.anisotropyEnable = VK_TRUE;

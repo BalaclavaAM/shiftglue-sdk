@@ -43,6 +43,8 @@ class VulkanTextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Outside the scene (kNoSceneFiltering): no player LOD bias.
+      uint32_t no_lod_bias : 1;             // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
       // can be used to limit fetching to mip_min_level.
     };
@@ -123,7 +125,11 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetActiveBindingBindlessIndexSlow(uint32_t fetch_constant_index,
                                              xenos::FetchOpDimension dimension, bool is_signed);
 
-  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
+  // anisotropic_override is the player's (the cvar), or kNoSceneFiltering
+  // for draws outside the scene: the title's own anisotropy, no LOD bias.
+  static constexpr int32_t kNoSceneFiltering = INT32_MIN;
+  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding,
+                                         int32_t anisotropic_override) const;
 
   // Must be called for every used sampler at least once in a single submission,
   // and a submission must be open for this to be callable.

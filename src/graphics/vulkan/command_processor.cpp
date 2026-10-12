@@ -5458,7 +5458,20 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       if (!i) {
         shader_samplers.reserve(shader_sampler_bindings.size());
-        const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+        // #528: the player's anisotropy and LOD bias are for the scene's
+        // textures. Depth-only passes (the sun's shadow maps, the depth
+        // pre-pass) and the HUD keep the title's filtering; post passes
+        // read render targets without mips, which never get either.
+        const bool scene_filtering =
+            !fh1_native_executor_ ||
+            (normalized_color_mask && !fh1_native_executor_->IsHudTarget());
+        const int32_t anisotropic_override =
+            scene_filtering ? REXCVAR_GET(anisotropic_override)
+                            : VulkanTextureCache::kNoSceneFiltering;
+        if (!scene_filtering && j && !shader_sampler_bindings.empty()) {
+          fh1_native_executor_->CountEvent(normalized_color_mask ? "title_filtering_hud_draws"
+                                                                 : "title_filtering_depth_draws");
+        }
         const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
         const bool fetch_key = REXCVAR_GET(gpu_sampler_fetch_key);
         const bool fetch_key_verify = fetch_key && REXCVAR_GET(gpu_sampler_fetch_key_verify);
@@ -5502,12 +5515,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
               cached.parameters = memo.parameters;
               if (draw_cost_.enabled) ++sampler_census_.memo_hits;
               if (fetch_key_verify &&
-                  texture_cache_->GetSamplerParameters(shader_sampler_binding).value !=
+                  texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override).value !=
                       cached.parameters.value) {
                 ++sampler_census_.verified_different;
               }
             } else {
-              cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
+              cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override);
               memo.fetch = cached.fetch;
               memo.binding = binding;
               memo.anisotropic_override = anisotropic_override;
@@ -5522,7 +5535,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           } else {
             if (draw_cost_.enabled) ++sampler_census_.slot_hits;
             if (fetch_key_verify &&
-                texture_cache_->GetSamplerParameters(shader_sampler_binding).value !=
+                texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override).value !=
                     cached.parameters.value) {
               ++sampler_census_.verified_different;
             }
