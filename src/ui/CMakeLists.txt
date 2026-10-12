@@ -157,7 +157,8 @@ endif()
 
 # Platform-specific dependencies
 if(ANDROID)
-    target_link_libraries(rexui PUBLIC android)
+    # nativewindow: ANativeWindow_setBuffersDataSpace (HDR10 output).
+    target_link_libraries(rexui PUBLIC android nativewindow)
     target_link_libraries(rexui PRIVATE adrenotools)
     # Loaded from the native library folder at run time, not linked.
     add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)

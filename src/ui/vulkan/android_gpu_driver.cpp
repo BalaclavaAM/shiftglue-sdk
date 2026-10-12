@@ -250,6 +250,65 @@ bool CallAndroidActivityMethod(const char* method) {
   return called;
 }
 
+const AndroidDisplayHdr& GetAndroidDisplayHdr() {
+  static const AndroidDisplayHdr hdr = [] {
+    AndroidDisplayHdr result;
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity) return result;
+    // activity.getDisplay().getHdrCapabilities() (API 30).
+    jclass activity_class = env->GetObjectClass(activity);
+    jmethodID get_display = env->GetMethodID(activity_class, "getDisplay", "()Landroid/view/Display;");
+    jobject display = get_display ? env->CallObjectMethod(activity, get_display) : nullptr;
+    jobject caps = nullptr;
+    if (display && !env->ExceptionCheck()) {
+      jclass display_class = env->GetObjectClass(display);
+      jmethodID get_caps = env->GetMethodID(display_class, "getHdrCapabilities",
+                                            "()Landroid/view/Display$HdrCapabilities;");
+      caps = get_caps ? env->CallObjectMethod(display, get_caps) : nullptr;
+      env->DeleteLocalRef(display_class);
+    }
+    if (caps && !env->ExceptionCheck()) {
+      jclass caps_class = env->GetObjectClass(caps);
+      jmethodID get_types = env->GetMethodID(caps_class, "getSupportedHdrTypes", "()[I");
+      auto types = get_types ? static_cast<jintArray>(env->CallObjectMethod(caps, get_types))
+                             : nullptr;
+      if (types && !env->ExceptionCheck()) {
+        const jsize count = env->GetArrayLength(types);
+        jint* values = env->GetIntArrayElements(types, nullptr);
+        for (jsize i = 0; values && i < count; ++i) {
+          // Display.HdrCapabilities.HDR_TYPE_HDR10.
+          result.hdr10 |= values[i] == 2;
+        }
+        if (values) env->ReleaseIntArrayElements(types, values, JNI_ABORT);
+        env->DeleteLocalRef(types);
+      }
+      const auto get_float = [&](const char* name) {
+        jmethodID id = env->GetMethodID(caps_class, name, "()F");
+        float value = id ? env->CallFloatMethod(caps, id) : 0.0f;
+        if (env->ExceptionCheck()) {
+          env->ExceptionClear();
+          value = 0.0f;
+        }
+        return value;
+      };
+      result.max_nits = get_float("getDesiredMaxLuminance");
+      result.max_average_nits = get_float("getDesiredMaxAverageLuminance");
+      result.min_nits = get_float("getDesiredMinLuminance");
+      env->DeleteLocalRef(caps_class);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (caps) env->DeleteLocalRef(caps);
+    env->DeleteLocalRef(activity_class);
+    env->DeleteLocalRef(activity);
+    REXLOG_INFO("Android display HDR: HDR10 {}, peak {} nits, average {} nits, black {} nits",
+                result.hdr10 ? "yes" : "no", result.max_nits, result.max_average_nits,
+                result.min_nits);
+    return result;
+  }();
+  return hdr;
+}
+
 void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
   std::string name = REXCVAR_GET(android_gpu_driver);
   if (name == "auto") {

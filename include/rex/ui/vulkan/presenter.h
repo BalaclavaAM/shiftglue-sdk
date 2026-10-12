@@ -369,6 +369,8 @@ class VulkanPresenter final : public Presenter {
       VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     };
     static constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // HDR10 where the surface offers no float format with it (Android).
+    static constexpr VkFormat kHdrPqFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     static constexpr VkFormat kHdrStandInFormat = VK_FORMAT_B8G8R8A8_UNORM;
     static constexpr VkFormat kHdrStandInSrgbFormat = VK_FORMAT_B8G8R8A8_SRGB;
 
@@ -442,8 +444,10 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_render_pass_clear_load_op = false;
     // Whether swapchain_render_pass ends in an HDR stand-in to be sampled.
     bool swapchain_render_pass_hdr = false;
-    // The last pass into the scRGB swapchain, and its pipeline.
+    // The last pass into the HDR swapchain, and its pipeline, for a swapchain
+    // of hdr_render_pass_format.
     VkRenderPass hdr_render_pass = VK_NULL_HANDLE;
+    VkFormat hdr_render_pass_format = VK_FORMAT_UNDEFINED;
     VkPipeline hdr_pipeline = VK_NULL_HANDLE;
     // Replaces the alpha of the painted guest output with the guest output's
     // HUD coverage, in swapchain_render_pass (always kHdrStandInFormat).
@@ -451,6 +455,8 @@ class VulkanPresenter final : public Presenter {
     VkDescriptorPool hdr_descriptor_pool = VK_NULL_HANDLE;
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
+    // The ANativeWindow of vulkan_surface on Android, for its data space.
+    void* android_window = nullptr;
     uint32_t present_queue_family = UINT32_MAX;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     // vulkan_present_wait: the last present ID given on `swapchain`, 0 for

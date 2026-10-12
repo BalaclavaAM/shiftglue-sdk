@@ -34,7 +34,10 @@
 #endif
 
 #if REX_PLATFORM_ANDROID
+#include <android/data_space.h>
+#include <android/native_window.h>
 #include <rex/ui/surface_android.h>
+#include <rex/ui/vulkan/android_gpu_driver.h>
 #endif
 #if REX_PLATFORM_GNU_LINUX
 #include <rex/ui/surface_gnulinux.h>
@@ -50,7 +53,8 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
 REXCVAR_DEFINE_BOOL(present_hdr, false, "UI/Presenter",
-                    "Present to an HDR (scRGB) swapchain where the display offers one, with "
+                    "Present to an HDR swapchain (scRGB, HDR10 on Android) where the display "
+                    "offers one, with "
                     "the SDR image at present_hdr_paper_white_nits; switching recreates the "
                     "swapchain")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -167,10 +171,16 @@ struct HdrOutputConstants {
   float compare_x;
   uint32_t pattern;
   float pattern_value;
-  float pad0;
+  uint32_t output_pq;
   float size[2];
 };
 static_assert(sizeof(HdrOutputConstants) == 48);
+
+// The active HDR swapchain is HDR10 (BT.2020 PQ), not scRGB.
+std::atomic<bool> hdr_output_pq = false;
+// HDR10 through a 10-bit swapchain whose window buffers are marked BT.2020
+// PQ by hand (Android before 14 offers no HDR10 color space to Vulkan).
+std::atomic<bool> hdr_output_pq_dataspace = false;
 
 }  // namespace
 
@@ -876,6 +886,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.window = android_native_window_surface.window();
         vulkan_surface_create_result = ifn.vkCreateAndroidSurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        paint_context_.android_window = android_native_window_surface.window();
       } break;
 #endif
 #if REX_PLATFORM_GNU_LINUX
@@ -960,6 +971,17 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
+#if REX_PLATFORM_ANDROID
+  if (paint_context_.swapchain_hdr && hdr_output_pq_dataspace.load(std::memory_order_relaxed) &&
+      paint_context_.android_window) {
+    // After the swapchain set its own data space from the color space.
+    const int32_t result = ANativeWindow_setBuffersDataSpace(
+        static_cast<ANativeWindow*>(paint_context_.android_window), ADATASPACE_BT2020_PQ);
+    if (result != 0) {
+      REXLOG_WARN("VulkanPresenter: Failed to mark the window HDR10 ({})", result);
+    }
+  }
+#endif
   // Update the render pass to the new format. With an HDR swapchain, it draws
   // into the SDR stand-ins, and the last pass samples them.
   const bool hdr = paint_context_.swapchain_hdr;
@@ -1415,34 +1437,91 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       image_format = surface_formats.front();
     }
   }
-  // scRGB where asked and offered: linear BT.709 with 1.0 at 80 nits, which
-  // Windows composes as is. The SDR image is painted into a stand-in and
-  // converted by the last pass.
+  // Where asked and offered, an HDR swapchain. The SDR image is painted into
+  // a stand-in and converted by the last pass.
+  // - Windows: scRGB, linear BT.709 with 1.0 at 80 nits, which it composes as
+  //   is.
+  // - Android: HDR10 (BT.2020 PQ, absolute nits). Android takes scRGB 1.0 as
+  //   SDR white and, without a requested headroom (and before Android 14 at
+  //   all), clips there: the paper white pushed the whole image into that
+  //   clip (#500). A PQ layer puts the display in its HDR mode instead.
+  {
+    static std::atomic<bool> logged_formats = false;
+    if (!logged_formats.exchange(true)) {
+      std::string formats;
+      for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+        formats += fmt::format(" {}/{}", uint32_t(surface_format.format),
+                               uint32_t(surface_format.colorSpace));
+      }
+      REXLOG_INFO("VulkanPresenter: surface formats (format/color space):{}", formats);
+    }
+  }
   bool hdr_offered = false;
+  bool hdr_pq = false;
+  bool hdr_pq_dataspace = false;
   if (vulkan_device->vulkan_instance()->extensions().ext_EXT_swapchain_colorspace) {
+    const VkSurfaceFormatKHR* hdr_format = nullptr;
     for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+#if REX_PLATFORM_ANDROID
+      // The float format first: it keeps the stand-in's precision.
+      if (surface_format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+          (surface_format.format == kHdrFormat ||
+           (surface_format.format == kHdrPqFormat && !hdr_format))) {
+        hdr_format = &surface_format;
+        hdr_pq = true;
+      }
+#else
       if (surface_format.format == kHdrFormat &&
           surface_format.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
-        hdr_offered = true;
-        if (REXCVAR_GET(present_hdr)) {
-          image_format = surface_format;
-          hdr_out = true;
-        }
+        hdr_format = &surface_format;
         break;
+      }
+#endif
+    }
+#if REX_PLATFORM_ANDROID
+    // Android 13 lists no HDR10 color space even for an HDR10 display; the
+    // window still composes BT.2020 PQ buffers, as video players use.
+    if (!hdr_format && GetAndroidDisplayHdr().hdr10) {
+      for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
+        if (surface_format.format == kHdrPqFormat &&
+            surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+          hdr_format = &surface_format;
+          hdr_pq = true;
+          hdr_pq_dataspace = true;
+          break;
+        }
+      }
+    }
+#endif
+    if (hdr_format) {
+      hdr_offered = true;
+      if (REXCVAR_GET(present_hdr)) {
+        image_format = *hdr_format;
+        hdr_out = true;
       }
     }
   }
   hdr_output_offered.store(hdr_offered, std::memory_order_relaxed);
   hdr_output_active.store(hdr_out, std::memory_order_relaxed);
+  hdr_output_pq.store(hdr_out && hdr_pq, std::memory_order_relaxed);
+  hdr_output_pq_dataspace.store(hdr_out && hdr_pq_dataspace, std::memory_order_relaxed);
   {
-    // 0 not logged, 1 SDR, 2 not offered, 3 scRGB.
+    // 0 not logged, 1 SDR, 2 not offered, 3 scRGB, 4 and 5 HDR10.
     static std::atomic<int> logged_hdr_choice = 0;
-    const int choice = !REXCVAR_GET(present_hdr) ? 1 : hdr_out ? 3 : 2;
+    const int choice = !REXCVAR_GET(present_hdr) ? 1
+                       : !hdr_out               ? 2
+                       : !hdr_pq                ? 3
+                       : image_format.format == kHdrFormat ? 4
+                                                           : 5;
     const int previous = logged_hdr_choice.exchange(choice);
     // Off from the start is not worth a line.
     if (previous != choice && (choice != 1 || previous != 0)) {
       REXLOG_INFO("VulkanPresenter: HDR presentation {}",
-                  choice == 3   ? "uses an scRGB swapchain"
+                  choice == 5   ? (hdr_pq_dataspace
+                                       ? "uses a 10-bit swapchain marked HDR10"
+                                       : "uses an HDR10 swapchain (10-bit)")
+                  : choice == 4 ? "uses an HDR10 swapchain (16-bit float)"
+                  : choice == 3 ? "uses an scRGB swapchain"
                   : choice == 2 ? "is not offered by the surface"
                                 : "is off");
     }
@@ -2394,7 +2473,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                            sizeof(hdr_rect_constants), &hdr_rect_constants);
     HdrOutputConstants hdr_constants = {};
     const double paper_white_nits = REXCVAR_GET(present_hdr_paper_white_nits);
-    const double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
+    double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
+#if REX_PLATFORM_ANDROID
+    // Android reports the panel's peak: highlights past it would only clip.
+    if (GetAndroidDisplayHdr().max_nits > 0.0f) {
+      peak_nits = std::min(peak_nits, double(GetAndroidDisplayHdr().max_nits));
+    }
+#endif
     hdr_constants.paper_white_scale = float(paper_white_nits / 80.0);
     // SDR white in the scene goes this far from the paper white to the peak.
     hdr_constants.highlight_scale = float(
@@ -2411,6 +2496,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         REXCVAR_GET(present_hdr_compare) ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
     hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
     hdr_constants.pattern_value = float(peak_nits / 80.0);
+    hdr_constants.output_pq = hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0;
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
     hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
     dfn.vkCmdPushConstants(draw_command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -2862,9 +2948,16 @@ bool VulkanPresenter::CreateHdrSwapchainImages(VkFormat swapchain_format) {
   const VkDevice device = vulkan_device_->device();
   PaintContext& context = paint_context_;
 
-  // The last pass and its pipeline outlive connections: the swapchain format
-  // is always kHdrFormat.
-  assert_true(swapchain_format == PaintContext::kHdrFormat);
+  // The last pass and its pipeline outlive connections with the same
+  // swapchain format.
+  assert_true(swapchain_format == PaintContext::kHdrFormat ||
+              swapchain_format == PaintContext::kHdrPqFormat);
+  if (context.hdr_render_pass != VK_NULL_HANDLE &&
+      context.hdr_render_pass_format != swapchain_format) {
+    context.submission_tracker.AwaitAllSubmissionsCompletion();
+    util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, context.hdr_pipeline);
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device, context.hdr_render_pass);
+  }
   if (context.hdr_render_pass == VK_NULL_HANDLE) {
     VkAttachmentDescription attachment = {};
     attachment.format = swapchain_format;
@@ -2910,6 +3003,7 @@ bool VulkanPresenter::CreateHdrSwapchainImages(VkFormat swapchain_format) {
       REXLOG_ERROR("VulkanPresenter: Failed to create the HDR output render pass");
       return false;
     }
+    context.hdr_render_pass_format = swapchain_format;
   }
   auto create_shader_module = [&](const uint32_t* code, size_t size, VkShaderModule& module) {
     if (module != VK_NULL_HANDLE) {

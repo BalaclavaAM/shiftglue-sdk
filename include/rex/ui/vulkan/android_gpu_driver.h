@@ -29,6 +29,15 @@ const std::string& LoadedAndroidGpuDriver();
 // as one that opens a document picker; false when it has no such method.
 bool CallAndroidActivityMethod(const char* method);
 
+// The display's HDR capabilities (Display.getHdrCapabilities), read once.
+struct AndroidDisplayHdr {
+  bool hdr10 = false;
+  float max_nits = 0.0f;
+  float max_average_nits = 0.0f;
+  float min_nits = 0.0f;
+};
+const AndroidDisplayHdr& GetAndroidDisplayHdr();
+
 // The highest Adreno GPU clocks while the game is shown and android_gpu_turbo
 // is on; the driver's own power control otherwise.
 void SetAndroidGpuTurbo(bool shown);

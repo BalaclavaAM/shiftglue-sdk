@@ -2,7 +2,9 @@
 #extension GL_EXT_samplerless_texture_functions : require
 
 // present_hdr: the SDR stand-in (guest output and UI, sampled through its
-// sRGB view, so linear) to the scRGB swapchain, where 1.0 is 80 nits. The
+// sRGB view, so linear) to the HDR swapchain. The pass works in scRGB, where
+// 1.0 is 80 nits, and writes that as is, or encoded as HDR10 (BT.2020 and
+// the PQ curve) where the swapchain is HDR10. The
 // stand-in's alpha is how much of the pixel is UI: the HUD of the guest output
 // and the host UI stay at the paper white, and only the scene's highlights
 // are expanded towards the highlight peak.
@@ -25,7 +27,7 @@ layout(push_constant) uniform HdrOutputConstants {
   // A calibration pattern under the UI (kPattern*), and its value.
   uint pattern;
   float pattern_value;  // kPatternPeak: the tested peak, nits / 80.
-  float pad0;
+  uint output_pq;  // Non-zero: an HDR10 swapchain, written as BT.2020 PQ.
   vec2 size;  // The swapchain's size, for the patterns.
 } constants;
 
@@ -39,6 +41,24 @@ layout(set = 0, binding = 0) uniform texture2D stand_in;
 layout(location = 0) out vec4 output_color;
 
 float max3(vec3 v) { return max(v.r, max(v.g, v.b)); }
+
+// scRGB (linear BT.709, 1.0 at 80 nits) as the swapchain stores it.
+vec4 Output(vec3 scrgb) {
+  if (constants.output_pq == 0u) {
+    return vec4(scrgb, 1.0);
+  }
+  const mat3 kBt709ToBt2020 = mat3(0.6274040, 0.0690970, 0.0163916,
+                                   0.3292820, 0.9195400, 0.0880132,
+                                   0.0433136, 0.0113612, 0.8955950);
+  vec3 y = clamp(kBt709ToBt2020 * scrgb * (80.0 / 10000.0), 0.0, 1.0);
+  const float m1 = 2610.0 / 16384.0;
+  const float m2 = 2523.0 / 4096.0 * 128.0;
+  const float c1 = 3424.0 / 4096.0;
+  const float c2 = 2413.0 / 4096.0 * 32.0;
+  const float c3 = 2392.0 / 4096.0 * 32.0;
+  vec3 p = pow(y, vec3(m1));
+  return vec4(pow((c1 + c2 * p) / (1.0 + c3 * p), vec3(m2)), 1.0);
+}
 
 vec3 SrgbEncode(vec3 linear) {
   linear = clamp(linear, 0.0, 1.0);
@@ -112,10 +132,11 @@ void main() {
   vec3 linear = sdr.rgb;
   if (constants.compare_x >= 0.0 && gl_FragCoord.x < constants.compare_x) {
     // The SDR reference half.
-    output_color = vec4(linear * constants.paper_white_scale, 1.0);
+    vec3 reference = linear * constants.paper_white_scale;
     if (gl_FragCoord.x > constants.compare_x - 3.0) {
-      output_color.rgb = vec3(constants.paper_white_scale);
+      reference = vec3(constants.paper_white_scale);
     }
+    output_color = Output(reference);
     return;
   }
   if (constants.gamma > 0.0) {
@@ -132,5 +153,5 @@ void main() {
     // The pattern replaces the image; the menu stays on top of it.
     color = mix(Pattern(gl_FragCoord.xy), linear * constants.paper_white_scale, ui);
   }
-  output_color = vec4(color, 1.0);
+  output_color = Output(color);
 }
