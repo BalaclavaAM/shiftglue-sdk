@@ -18,6 +18,8 @@
 
 #include <rex/input/input_driver.h>
 
+#include <string>
+
 #include <SDL3/SDL.h>
 
 #define HID_SDL_THUMB_THRES 0x4E00
@@ -67,6 +69,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     DeviceId id;
     // Per pad rather than per guest user, so it survives reassignment.
     KeystrokeState keystroke;
+    // A racing wheel: SDL's joystick type, or listed in hid_wheel_guids.
+    bool wheel_type;
+    std::string guid;
   };
 
   // WindowListener

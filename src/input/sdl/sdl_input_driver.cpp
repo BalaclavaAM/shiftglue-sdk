@@ -20,6 +20,7 @@
 #include <rex/input/flags.h>
 #include <rex/input/sdl/joystick_mapping.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/sdl/wheel.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
@@ -230,6 +231,15 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     controller->state_changed = false;
   }
   std::memcpy(out_state, &controller->state, sizeof(*out_state));
+  if (controller->wheel_type || IsListedWheel(controller->guid)) {
+    // Shaped on read so the settings apply live; menus (keystrokes) keep the
+    // raw input.
+    const WheelShaping shaping = CurrentWheelShaping();
+    auto& pad = out_state->gamepad;
+    pad.thumb_lx = ShapeWheelSteering(static_cast<int16_t>(pad.thumb_lx), shaping);
+    pad.left_trigger = ShapeWheelPedal(pad.left_trigger, shaping);
+    pad.right_trigger = ShapeWheelPedal(pad.right_trigger, shaping);
+  }
   if (!is_active) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
@@ -478,6 +488,14 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.sdl = controller;
   state.id = AllocateDeviceId();
   state.state_changed = true;  // XInput starts with packet_number = 1
+  SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller);
+  state.wheel_type = SDL_GetJoystickType(joystick) == SDL_JOYSTICK_TYPE_WHEEL;
+  char guid_text[33] = {};
+  SDL_GUIDToString(SDL_GetJoystickGUID(joystick), guid_text, static_cast<int>(sizeof(guid_text)));
+  state.guid = guid_text;
+  if (state.wheel_type || IsListedWheel(state.guid)) {
+    REXLOG_INFO("SDL OnControllerDeviceAdded: racing wheel, steering and pedals are shaped.");
+  }
   UpdateXCapabilities(state);
   controllers_.push_back(state);
 

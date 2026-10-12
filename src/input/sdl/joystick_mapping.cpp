@@ -73,6 +73,7 @@ std::vector<JoystickInfo> ListJoysticks() {
     const char* name = SDL_GetJoystickNameForID(ids[i]);
     info.name = name ? name : "Controller";
     info.guid = GuidString(SDL_GetJoystickGUIDForID(ids[i]));
+    info.wheel_type = SDL_GetJoystickTypeForID(ids[i]) == SDL_JOYSTICK_TYPE_WHEEL;
     if (char* mapping = SDL_GetGamepadMappingForID(ids[i])) {
       info.mapping = mapping;
       SDL_free(mapping);
@@ -225,12 +226,12 @@ bool RemoveUserMapping(std::string_view guid) {
   return false;
 }
 
-bool VirtualJoystick::Attach(const char* name, int axes, int buttons, int hats) {
+bool VirtualJoystick::Attach(const char* name, int axes, int buttons, int hats, bool wheel) {
   Detach();
   initialized_ = SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
   SDL_VirtualJoystickDesc desc;
   SDL_INIT_INTERFACE(&desc);
-  desc.type = SDL_JOYSTICK_TYPE_UNKNOWN;
+  desc.type = wheel ? SDL_JOYSTICK_TYPE_WHEEL : SDL_JOYSTICK_TYPE_UNKNOWN;
   desc.naxes = uint16_t(axes);
   desc.nbuttons = uint16_t(buttons);
   desc.nhats = uint16_t(hats);

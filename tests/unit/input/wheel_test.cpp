@@ -1,0 +1,67 @@
+#include <catch2/catch_test_macros.hpp>
+
+#include <rex/cvar.h>
+#include <rex/input/sdl/wheel.h>
+
+using rex::input::sdl::ShapeWheelPedal;
+using rex::input::sdl::ShapeWheelSteering;
+using rex::input::sdl::WheelShaping;
+
+TEST_CASE("Default wheel shaping passes input through", "[input][wheel]") {
+  const WheelShaping shaping;
+  for (int value : {-32768, -20000, -1, 0, 1, 12345, 32767}) {
+    CHECK(ShapeWheelSteering(int16_t(value), shaping) == value);
+  }
+  for (int value : {0, 1, 128, 255}) {
+    CHECK(ShapeWheelPedal(uint8_t(value), shaping) == value);
+  }
+}
+
+TEST_CASE("Steering saturation reaches full lock early", "[input][wheel]") {
+  WheelShaping shaping;
+  shaping.saturation = 50;
+  CHECK(ShapeWheelSteering(16384, shaping) == 32767);
+  CHECK(ShapeWheelSteering(-16384, shaping) == -32768);
+  CHECK(ShapeWheelSteering(8192, shaping) == 16384);
+  CHECK(ShapeWheelSteering(32767, shaping) == 32767);
+}
+
+TEST_CASE("Steering deadzone skips the start of the output", "[input][wheel]") {
+  WheelShaping shaping;
+  shaping.deadzone = 25;
+  CHECK(ShapeWheelSteering(0, shaping) == 0);
+  // The first step off centre jumps past a quarter of the travel.
+  CHECK(ShapeWheelSteering(1, shaping) >= 8192);
+  CHECK(ShapeWheelSteering(-1, shaping) <= -8192);
+  CHECK(ShapeWheelSteering(32767, shaping) == 32767);
+}
+
+TEST_CASE("Steering linearity bends the curve, not the ends", "[input][wheel]") {
+  WheelShaping shaping;
+  shaping.linearity = 200;
+  CHECK(ShapeWheelSteering(16384, shaping) == 8192);
+  CHECK(ShapeWheelSteering(32767, shaping) == 32767);
+  CHECK(ShapeWheelSteering(-32768, shaping) == -32768);
+}
+
+TEST_CASE("Pedal deadzone ignores the start and keeps full travel", "[input][wheel]") {
+  WheelShaping shaping;
+  shaping.pedal_deadzone = 10;
+  CHECK(ShapeWheelPedal(20, shaping) == 0);
+  CHECK(ShapeWheelPedal(255, shaping) == 255);
+  CHECK(ShapeWheelPedal(140, shaping) > 120);
+}
+
+TEST_CASE("Wheel GUIDs are listed and removed", "[input][wheel]") {
+  rex::cvar::SetFlagByName("hid_wheel_guids", "");
+  CHECK_FALSE(rex::input::sdl::IsListedWheel("abc"));
+  rex::input::sdl::SetListedWheel("abc", true);
+  rex::input::sdl::SetListedWheel("def", true);
+  rex::input::sdl::SetListedWheel("abc", true);
+  CHECK(rex::cvar::GetFlagByName("hid_wheel_guids") == "abc,def");
+  CHECK(rex::input::sdl::IsListedWheel("def"));
+  rex::input::sdl::SetListedWheel("abc", false);
+  CHECK_FALSE(rex::input::sdl::IsListedWheel("abc"));
+  CHECK(rex::cvar::GetFlagByName("hid_wheel_guids") == "def");
+  rex::cvar::SetFlagByName("hid_wheel_guids", "");
+}

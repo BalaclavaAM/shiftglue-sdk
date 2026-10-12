@@ -28,6 +28,8 @@ struct JoystickInfo {
   std::string mapping;
   // hid_user_mappings_file has a line for it.
   bool user_mapping = false;
+  // SDL knows it as a racing wheel (its own type, not hid_wheel_guids).
+  bool wheel_type = false;
 };
 
 std::vector<JoystickInfo> ListJoysticks();
@@ -74,7 +76,7 @@ bool RemoveUserMapping(std::string_view guid);
 class VirtualJoystick {
  public:
   ~VirtualJoystick() { Detach(); }
-  bool Attach(const char* name, int axes, int buttons, int hats);
+  bool Attach(const char* name, int axes, int buttons, int hats, bool wheel = false);
   void Detach();
   uint32_t id() const { return id_; }
   void SetButton(int button, bool down);

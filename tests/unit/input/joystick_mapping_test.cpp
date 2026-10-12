@@ -113,3 +113,12 @@ TEST_CASE("A built mapping applies and the gamepad view follows it", "[input][sd
   CHECK(view.Held().empty());
   view.End();
 }
+
+TEST_CASE("A virtual wheel lists as a racing wheel", "[input][sdl]") {
+  rex::input::sdl::VirtualJoystick wheel;
+  REQUIRE(wheel.Attach("Mapping Test Wheel", 4, 12, 1, true));
+  CHECK(FindPad(wheel.id()).wheel_type);
+  VirtualPad pad;
+  REQUIRE(pad.ok());
+  CHECK_FALSE(FindPad(pad.id()).wheel_type);
+}
