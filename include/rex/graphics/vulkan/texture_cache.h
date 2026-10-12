@@ -76,6 +76,7 @@ class VulkanTextureCache final : public TextureCache {
   ~VulkanTextureCache();
 
   void BeginSubmission(uint64_t new_submission_index) override;
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
 
@@ -181,6 +182,12 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const override;
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
+  // The image of a texture with the key, scale_log2 times larger in both
+  // directions (a texture replacement) with levels mips; copy_words_out as
+  // VulkanTexture::copy_words (0 when scaled).
+  VkResult CreateTextureImageForKey(TextureKey key, uint32_t scale_log2, uint32_t levels,
+                                    VkImage& image, VmaAllocation& allocation,
+                                    uint32_t& copy_words_out);
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -274,6 +281,15 @@ class VulkanTextureCache final : public TextureCache {
     // array view does not match).
     VkImageView GetCopyView2D();
 
+    // Texture replacements of another size: draws from a new image (scaled
+    // scale_log2 times, or the guest size again with 0). The old image, its
+    // views and their bindless slots are retired until the current submission
+    // completes.
+    void SwapImage(VkImage image, VmaAllocation allocation, uint32_t copy_words,
+                   uint32_t scale_log2, uint32_t levels);
+    uint32_t replacement_scale_log2() const { return replacement_scale_log2_; }
+    uint32_t replacement_levels() const { return replacement_levels_; }
+
    private:
     union ViewKey {
       uint32_t key;
@@ -325,6 +341,8 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image_;
     VmaAllocation allocation_;
+    uint32_t replacement_scale_log2_ = 0;
+    uint32_t replacement_levels_ = 0;
     uint32_t copy_words_ = 0;
     VkImageView copy_view_ = VK_NULL_HANDLE;
     VkImageView copy_view_2d_ = VK_NULL_HANDLE;
@@ -430,6 +448,28 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t texture_pool_memory_type_ = UINT32_MAX;
 
   // Creates the image in texture_pool_ when it can, else in VMA's default pools.
+  // Texture replacements (pipeline/texture/replacement.h): uploads the
+  // replacement of a texture loaded from guest memory; true when replaced.
+  bool TryLoadTextureReplacement(VulkanTexture& texture);
+  // Back to a guest-size image, for guest data without a replacement or
+  // resolve output.
+  void UseGuestImage(VulkanTexture& texture);
+  // Rebinds a texture whose image changed.
+  void OnTextureImageSwitched(Texture& texture);
+  // Images, views and upload buffers a texture replacement stopped using,
+  // destroyed once their submission completes.
+  struct RetiredReplacementResources {
+    uint64_t submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    std::vector<VkImageView> bindless_views;
+    std::vector<VkImageView> views;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation buffer_allocation = VK_NULL_HANDLE;
+  };
+  std::vector<RetiredReplacementResources> retired_replacement_resources_;
+  void DestroyRetiredReplacementResources(uint64_t completed_submission_index);
+
   VkResult CreateTextureImage(const VkImageCreateInfo& image_create_info, VkImage& image,
                               VmaAllocation& allocation);
 

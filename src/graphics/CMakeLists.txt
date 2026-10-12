@@ -27,6 +27,7 @@ set(REXGPU_XENOS_SOURCES
     primitive_processor.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    pipeline/texture/replacement.cpp
     pipeline/shader/interpreter.cpp
 
     # Null backend (gpu_backend=null): packets without a device

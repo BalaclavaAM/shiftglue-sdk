@@ -34,6 +34,7 @@
 #include <rex/graphics/fh1_mip_contract.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 #include <rex/cvar.h>
@@ -49,21 +50,6 @@ REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
 
 namespace rex::graphics::d3d12 {
 
-REXCVAR_DEFINE_STRING(texture_dump_dir, "", "GPU/D3D12",
-                      "Write each DXT1, DXT3 and DXT5 texture the title loads as <hash>.dds "
-                      "into this folder (texture modding)");
-REXCVAR_DEFINE_STRING(texture_replacement_dirs, "", "GPU/D3D12",
-                      "Folders of <hash>.dds texture replacements, separated by ';', "
-                      "earlier folders first; read when the first texture loads");
-REXCVAR_DEFINE_INT32(texture_replacement_reload, 0, "GPU/D3D12",
-                     "Change to rescan texture_replacement_dirs and reload every texture at "
-                     "the next frame (clears the GPU caches once)");
-
-namespace {
-// Forgets the scanned replacement folders and loaded files (defined with the
-// replacement loader below).
-void ResetTextureReplacements();
-}  // namespace
 REXCVAR_DEFINE_BOOL(fh1_direct_reflection_cube_import, true, "GPU/D3D12",
                     "Import FH1 reflection cubes directly into their host texture");
 
@@ -740,13 +726,8 @@ void D3D12TextureCache::BeginFrame() {
   // A reload of texture replacements: rescan the folders and clear the
   // caches, so every texture loads again (through replacements) at the next
   // use. The first frame only records the setting.
-  const int32_t reload = REXCVAR_GET(texture_replacement_reload);
-  if (!texture_replacement_reload_seen_) {
-    texture_replacement_reload_seen_ = true;
-    texture_replacement_reload_ = reload;
-  } else if (reload != texture_replacement_reload_) {
-    texture_replacement_reload_ = reload;
-    ResetTextureReplacements();
+  if (texture_replacement::ReloadRequested()) {
+    texture_replacement::Reset();
     command_processor_.ClearCaches();
     REXGPU_INFO("Texture replacements: reloading");
   }
@@ -1714,259 +1695,26 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
 }
 
-namespace {
-
-// Texture dumps and replacements (NP-10.3), for 2D textures the host loads
-// by copying (after untiling and byte swapping): DXT1, DXT2/3, DXT4/5, DXT5A
-// (BC4), DXN (BC5) and 8_8_8_8. Each texture is named by the XXH3 hash of its
-// guest base level, and a replacement is a DDS file of the same format, the
-// same size or 2x, 4x or 8x it, with at least as many levels.
-struct BcFormat {
-  xenos::TextureFormat guest;
-  // 4 (BCn) or 1 (uncompressed) texels per block side.
-  uint32_t block_width;
-  uint32_t block_bytes;
-  // DDS pixel format four-character code; 0 writes a DX10 header.
-  uint32_t fourcc;
-  // A second code DDS writers use for the format (BC4U, BC5U), or 0.
-  uint32_t fourcc_alternative;
-  // DXGI formats a DX10 header may name, and the host resource may use.
-  DXGI_FORMAT unorm, srgb, typeless;
-};
-
-constexpr BcFormat kBcFormats[] = {
-    {xenos::TextureFormat::k_DXT1, 4, 8, 0x31545844u /* DXT1 */, 0, DXGI_FORMAT_BC1_UNORM,
-     DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC1_TYPELESS},
-    {xenos::TextureFormat::k_DXT2_3, 4, 16, 0x33545844u /* DXT3 */, 0, DXGI_FORMAT_BC2_UNORM,
-     DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC2_TYPELESS},
-    {xenos::TextureFormat::k_DXT4_5, 4, 16, 0x35545844u /* DXT5 */, 0, DXGI_FORMAT_BC3_UNORM,
-     DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC3_TYPELESS},
-    {xenos::TextureFormat::k_DXT5A, 4, 8, 0x31495441u /* ATI1 */, 0x55344342u /* BC4U */,
-     DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_TYPELESS},
-    {xenos::TextureFormat::k_DXN, 4, 16, 0x32495441u /* ATI2 */, 0x55354342u /* BC5U */,
-     DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_TYPELESS},
-    // Channels as stored (the fetch constant's swizzle picks them).
-    {xenos::TextureFormat::k_8_8_8_8, 1, 4, 0, 0, DXGI_FORMAT_R8G8B8A8_UNORM,
-     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS},
-};
-
-const BcFormat* FindBcFormat(xenos::TextureFormat format) {
-  for (const auto& entry : kBcFormats) {
-    if (entry.guest == format) return &entry;
-  }
-  return nullptr;
-}
-
-constexpr uint32_t kDdsMagic = 0x20534444u;    // "DDS "
-constexpr uint32_t kFourCcDx10 = 0x30315844u;  // "DX10"
-
-struct BcImage {
-  const BcFormat* format = nullptr;
-  uint32_t width = 0, height = 0, levels = 0;
-  std::vector<uint8_t> data;  // levels in order, blocks row by row
-};
-
-uint32_t BcBlocks(const BcFormat& format, uint32_t size, uint32_t level) {
-  return (std::max(size >> level, 1u) + format.block_width - 1) / format.block_width;
-}
-
-size_t BcLevelBytes(const BcFormat& format, uint32_t width, uint32_t height, uint32_t level) {
-  return size_t(BcBlocks(format, width, level)) * BcBlocks(format, height, level) *
-         format.block_bytes;
-}
-
-struct BcSource {
-  const BcFormat* format;
-  uint32_t width, height;
-  bool tiled, packed_mips;
-  uint32_t endianness;
-};
-
-// As texture_util::ImportBc3, for any BC format, from a texture's key and
-// guest layout.
-bool UntileBc(const BcSource& key, const texture_util::TextureGuestLayout& layout,
-              std::span<const uint8_t> base, std::span<const uint8_t> mips, uint32_t levels,
-              std::vector<uint8_t>& output) {
-  const uint32_t width = key.width, height = key.height;
-  const uint32_t block = key.format->block_bytes;
-  const uint32_t block_log2 = block == 4 ? 2 : block == 8 ? 3 : 4;
-  // Byte permutations for none, 8-in-16, 8-in-32 and 16-in-32.
-  constexpr uint32_t kMasks[] = {0, 1, 3, 2};
-  for (uint32_t mip = 0; mip < levels; ++mip) {
-    const uint32_t stored = std::min(mip, layout.packed_level);
-    const auto& level = mip ? layout.mips[stored] : layout.base;
-    const auto source = mip ? mips : base;
-    const uint32_t level_offset = mip ? layout.mip_offsets_bytes[stored] : 0;
-    uint32_t ox = 0, oy = 0, oz = 0;
-    if (key.packed_mips) {
-      texture_util::GetPackedMipOffset(width, height, 1, key.format->guest, mip, ox, oy, oz);
-    }
-    const uint32_t columns = BcBlocks(*key.format, width, mip);
-    const uint32_t rows = BcBlocks(*key.format, height, mip);
-    for (uint32_t y = 0; y < rows; ++y) {
-      for (uint32_t x = 0; x < columns; ++x) {
-        const uint64_t offset =
-            uint64_t(level_offset) +
-            (key.tiled ? uint64_t(uint32_t(texture_util::GetTiledOffset2D(
-                             int32_t(x + ox), int32_t(y + oy), level.row_pitch_bytes / block,
-                             block_log2)))
-                       : uint64_t(y + oy) * level.row_pitch_bytes + uint64_t(x + ox) * block);
-        if (offset > source.size() || source.size() - offset < block) return false;
-        for (uint32_t i = 0; i < block; ++i) {
-          output.push_back(source[size_t(offset) + (i ^ kMasks[key.endianness & 3])]);
-        }
-      }
-    }
-  }
-  return true;
-}
-
-void WriteDds(const std::filesystem::path& path, const BcImage& image) {
-  uint32_t header[32] = {};
-  header[0] = kDdsMagic;
-  header[1] = 124;
-  header[2] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000;  // caps..linear size
-  header[3] = image.height;
-  header[4] = image.width;
-  header[5] = uint32_t(BcLevelBytes(*image.format, image.width, image.height, 0));
-  header[7] = image.levels;
-  header[19] = 32;  // pixel format size
-  header[20] = 0x4;  // fourcc
-  header[21] = image.format->fourcc ? image.format->fourcc : kFourCcDx10;
-  header[27] = 0x1000 | (image.levels > 1 ? 0x400000 | 0x8 : 0);
-  // DX10 header: format, 2D, no flags, one array slice.
-  const uint32_t dx10[5] = {uint32_t(image.format->unorm), 3, 0, 1, 0};
-  std::error_code error;
-  std::filesystem::create_directories(path.parent_path(), error);
-  FILE* file = _wfopen(path.c_str(), L"wb");
-  if (!file) return;
-  fwrite(header, sizeof(header), 1, file);
-  if (!image.format->fourcc) fwrite(dx10, sizeof(dx10), 1, file);
-  fwrite(image.data.data(), 1, image.data.size(), file);
-  fclose(file);
-}
-
-std::optional<BcImage> ReadDds(const std::filesystem::path& path) {
-  FILE* file = _wfopen(path.c_str(), L"rb");
-  if (!file) return std::nullopt;
-  std::vector<uint8_t> bytes;
-  uint8_t chunk[65536];
-  for (size_t read; (read = fread(chunk, 1, sizeof(chunk), file)) != 0;) {
-    bytes.insert(bytes.end(), chunk, chunk + read);
-  }
-  fclose(file);
-  const auto word = [&](size_t index) {
-    uint32_t value = 0;
-    std::memcpy(&value, bytes.data() + index * 4, 4);
-    return value;
-  };
-  if (bytes.size() < 128 || word(0) != kDdsMagic || word(1) != 124) return std::nullopt;
-  BcImage image;
-  size_t data_offset = 128;
-  if (word(21) == kFourCcDx10) {
-    if (bytes.size() < 148) return std::nullopt;
-    for (const auto& format : kBcFormats) {
-      if (word(32) == uint32_t(format.unorm) || word(32) == uint32_t(format.srgb)) {
-        image.format = &format;
-      }
-    }
-    data_offset = 148;
-  } else if (word(20) & 0x4) {
-    for (const auto& format : kBcFormats) {
-      if (format.fourcc && (word(21) == format.fourcc ||
-                            (format.fourcc_alternative && word(21) == format.fourcc_alternative))) {
-        image.format = &format;
-      }
-    }
-  } else if ((word(20) & 0x40) && word(22) == 32 && word(23) == 0xFFu && word(24) == 0xFF00u &&
-             word(25) == 0xFF0000u) {
-    // Uncompressed 32 bits, R in the low byte (as the 8_8_8_8 dumps store it).
-    image.format = FindBcFormat(xenos::TextureFormat::k_8_8_8_8);
-  }
-  if (!image.format) return std::nullopt;
-  image.height = word(3);
-  image.width = word(4);
-  image.levels = std::max(word(7), 1u);
-  size_t needed = 0;
-  for (uint32_t level = 0; level < image.levels; ++level) {
-    needed += BcLevelBytes(*image.format, image.width, image.height, level);
-  }
-  if (!image.width || !image.height || bytes.size() - data_offset < needed) return std::nullopt;
-  image.data.assign(bytes.begin() + data_offset, bytes.begin() + data_offset + needed);
-  return image;
-}
-
-struct TextureReplacements {
-  std::mutex mutex;
-  bool scanned = false;
-  std::unordered_map<uint64_t, std::filesystem::path> files;
-  std::unordered_map<uint64_t, std::shared_ptr<const BcImage>> loaded;
-  std::unordered_set<uint64_t> dumped;
-  std::unordered_set<uint64_t> logged;
-};
-
-TextureReplacements& Replacements() {
-  static TextureReplacements replacements;
-  return replacements;
-}
-
-void ResetTextureReplacements() {
-  auto& state = Replacements();
-  std::lock_guard lock(state.mutex);
-  state.scanned = false;
-  state.files.clear();
-  state.loaded.clear();
-  state.logged.clear();
-}
-
-}  // namespace
-
 bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
   const TextureKey key = texture.key();
-  const std::string dump_dir = REXCVAR_GET(texture_dump_dir);
-  auto& state = Replacements();
-  {
-    std::lock_guard lock(state.mutex);
-    if (!state.scanned) {
-      state.scanned = true;
-      const std::string dirs = REXCVAR_GET(texture_replacement_dirs);
-      size_t start = 0;
-      while (start <= dirs.size()) {
-        const size_t end = std::min(dirs.find(';', start), dirs.size());
-        const std::filesystem::path dir = rex::to_path(dirs.substr(start, end - start));
-        std::error_code error;
-        if (end > start && std::filesystem::is_directory(dir, error)) {
-          for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
-            const auto stem = rex::path_to_utf8(entry.path().stem());
-            if (entry.path().extension() != ".dds" || stem.size() != 16) continue;
-            unsigned long long hash = 0;
-            if (std::sscanf(stem.c_str(), "%16llx", &hash) == 1) {
-              state.files.emplace(uint64_t(hash), entry.path());  // earlier folders win
-            }
-          }
-        }
-        start = end + 1;
-      }
-      if (!state.files.empty()) {
-        REXGPU_INFO("Texture replacements: {} files", state.files.size());
-      }
-    }
-    if (dump_dir.empty() && state.files.empty()) return false;
-  }
-  const BcFormat* format = FindBcFormat(key.format);
-  if (!format || key.scaled_resolve || !key.base_page || key.signed_separate ||
-      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
-      texture.force_load_3d_tiling() ||
+  const texture_replacement::Source source{key.format,
+                                           key.dimension,
+                                           key.GetWidth(),
+                                           key.GetHeight(),
+                                           key.GetDepthOrArraySize(),
+                                           key.mip_max_level,
+                                           key.base_page,
+                                           key.mip_page,
+                                           bool(key.tiled),
+                                           bool(key.packed_mips),
+                                           bool(key.scaled_resolve),
+                                           bool(key.signed_separate),
+                                           uint32_t(key.endianness),
+                                           texture.force_load_3d_tiling()};
+  if (!texture_replacement::IsEligible(source) ||
       IsDecompressionNeeded(key.format, key.GetWidth(), key.GetHeight())) {
     return false;
   }
-  const auto& layout = texture.guest_layout();
-  std::vector<uint8_t> base(layout.base.level_data_extent_bytes);
-  if (base.empty() ||
-      !shared_memory().CopyCpuRange(key.base_page << 12, {base.data(), base.size()})) {
-    return false;
-  }
-  const uint64_t hash = XXH3_64bits(base.data(), base.size());
   auto& target = static_cast<D3D12Texture&>(texture);
   // New guest data: back to the guest-size resource unless it is replaced
   // again at a higher resolution below.
@@ -1976,83 +1724,34 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
       OnTextureResourceSwitched(texture);
     }
   };
-
-  if (!dump_dir.empty()) {
-    bool dump = false;
-    {
-      std::lock_guard lock(state.mutex);
-      dump = state.dumped.insert(hash).second;
-    }
-    if (dump) {
-      std::vector<uint8_t> mips(layout.mips_total_extent_bytes);
-      const bool have_mips = key.mip_max_level && key.mip_page && !mips.empty() &&
-                             shared_memory().CopyCpuRange(key.mip_page << 12,
-                                                          {mips.data(), mips.size()});
-      BcImage image{format, key.GetWidth(), key.GetHeight(),
-                    have_mips ? key.mip_max_level + 1u : 1u};
-      const BcSource source{format, key.GetWidth(), key.GetHeight(), bool(key.tiled),
-                            bool(key.packed_mips), uint32_t(key.endianness)};
-      if (UntileBc(source, layout, base, mips, image.levels, image.data)) {
-        WriteDds(rex::to_path(dump_dir) / fmt::format("{:016X}.dds", hash), image);
-      }
-    }
-  }
-
-  std::shared_ptr<const BcImage> image;
-  {
-    std::lock_guard lock(state.mutex);
-    const auto file = state.files.find(hash);
-    if (file == state.files.end()) {
+  texture_replacement::Lookup lookup;
+  switch (texture_replacement::Find(source, texture.guest_layout(), shared_memory(), lookup)) {
+    case texture_replacement::LookupResult::kNotEligible:
+      return false;
+    case texture_replacement::LookupResult::kNone:
       use_guest_resource();
       return false;
-    }
-    auto& slot = state.loaded[hash];
-    if (!slot) {
-      auto read = ReadDds(file->second);
-      if (!read) {
-        REXGPU_WARN("Texture replacement {} is not a DDS of a supported format",
-                    rex::path_to_utf8(file->second));
-        state.files.erase(file);
-        state.loaded.erase(hash);
-        use_guest_resource();
-        return false;
-      }
-      slot = std::make_shared<const BcImage>(std::move(*read));
-    }
-    image = slot;
+    case texture_replacement::LookupResult::kFound:
+      break;
   }
-  // The replacement may be larger by a power of two (the same in both
-  // directions, up to 8x); it then keeps the guest's level count plus the
-  // levels it has below that, drawing from a resource of its own.
+  const texture_replacement::Format& format = *lookup.format;
+  const texture_replacement::Image& image = *lookup.image;
   const uint32_t guest_levels = key.mip_max_level + 1u;
-  const uint32_t width = key.GetWidth(), height = key.GetHeight();
-  uint32_t scale_log2 = 0;
-  while (scale_log2 < 3 && image->width > (width << scale_log2)) ++scale_log2;
   const D3D12_RESOURCE_DESC guest_desc = target.guest_resource()->GetDesc();
-  const bool size_valid = image->width == (width << scale_log2) &&
-                          image->height == (height << scale_log2);
-  if (image->format != format || !size_valid || image->levels < guest_levels ||
-      guest_desc.DepthOrArraySize != 1 ||
-      (guest_desc.Format != format->unorm && guest_desc.Format != format->srgb &&
-       guest_desc.Format != format->typeless)) {
-    std::lock_guard lock(state.mutex);
-    if (state.logged.insert(hash).second) {
-      REXGPU_WARN(
-          "Texture replacement {:016X}: needs {}x{} (or 2x, 4x or 8x that) with the dumped "
-          "format and at least {} levels",
-          hash, width, height, guest_levels);
-    }
+  if (guest_desc.DepthOrArraySize != 1 ||
+      (guest_desc.Format != DXGI_FORMAT(format.dxgi_unorm) &&
+       guest_desc.Format != DXGI_FORMAT(format.dxgi_srgb) &&
+       guest_desc.Format != DXGI_FORMAT(format.dxgi_typeless))) {
     use_guest_resource();
     return false;
   }
   ID3D12Resource* resource = nullptr;
-  if (scale_log2) {
+  if (lookup.scale_log2) {
     D3D12_RESOURCE_DESC replacement_desc = guest_desc;
-    const uint32_t levels = std::min(image->levels, guest_levels + scale_log2);
-    replacement_desc.Width = image->width;
-    replacement_desc.Height = image->height;
-    replacement_desc.MipLevels = UINT16(levels);
-    resource = target.UseReplacementResource(replacement_desc, levels - guest_levels);
+    replacement_desc.Width = image.width;
+    replacement_desc.Height = image.height;
+    replacement_desc.MipLevels = UINT16(lookup.levels);
+    resource = target.UseReplacementResource(replacement_desc, lookup.levels - guest_levels);
     OnTextureResourceSwitched(texture);
     if (!resource) {
       target.UseGuestResource();
@@ -2076,16 +1775,17 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
       command_processor_.GetCurrentFrame(), size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, &upload,
       &upload_offset, nullptr);
   if (!mapping) return false;
-  size_t source = 0;
+  size_t source_offset = 0;
   for (uint32_t level = 0; level < levels; ++level) {
-    const size_t pitch = size_t(BcBlocks(*format, image->width, level)) * format->block_bytes;
+    const size_t pitch =
+        size_t(texture_replacement::Blocks(format, image.width, level)) * format.block_bytes;
     for (UINT row = 0; row < row_counts[level]; ++row) {
       std::memcpy(mapping + footprints[level].Offset +
                       size_t(row) * footprints[level].Footprint.RowPitch,
-                  image->data.data() + source + size_t(row) * pitch,
+                  image.data.data() + source_offset + size_t(row) * pitch,
                   std::min<size_t>(pitch, size_t(row_bytes[level])));
     }
-    source += BcLevelBytes(*format, image->width, image->height, level);
+    source_offset += texture_replacement::LevelBytes(format, image.width, image.height, level);
   }
   target.MarkAsUsed();
   command_processor_.PushTransitionBarrier(
@@ -2103,11 +1803,7 @@ bool D3D12TextureCache::TryLoadTextureReplacement(Texture& texture) {
     to.SubresourceIndex = level;
     command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
   }
-  std::lock_guard lock(state.mutex);
-  if (state.logged.insert(hash).second) {
-    REXGPU_INFO("Texture replacement {:016X}: {}x{}, {} levels", hash, image->width,
-                image->height, levels);
-  }
+  texture_replacement::LogLoaded(lookup);
   return true;
 }
 
