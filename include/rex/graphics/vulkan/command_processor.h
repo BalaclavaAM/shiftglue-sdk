@@ -1144,6 +1144,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
+  // the HUD left alone, told apart with the pre-HUD snapshot.
+  bool EnsureSwapScenePost();
+  // Loads scene_lut_path when it changed and records the upload; false
+  // without a usable LUT (an identity one is bound then).
+  bool UpdateSceneLut();
+  void DestroySceneLut();
+  bool swap_scene_post_failed_ = false;
+  VkDescriptorSetLayout swap_scene_post_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_scene_post_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_scene_post_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_scene_post_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_scene_post_descriptor_sets_{};
+  std::string scene_lut_path_;
+  bool scene_lut_loaded_ = false;
+  bool scene_lut_real_ = false;
+  uint32_t scene_lut_size_ = 0;
+  VkImage scene_lut_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_lut_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_lut_view_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;

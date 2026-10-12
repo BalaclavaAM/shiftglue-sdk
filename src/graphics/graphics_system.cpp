@@ -39,6 +39,15 @@
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
+REXCVAR_DEFINE_BOOL(swap_post_effect_scene_only, true, "GPU",
+                    "Vulkan: apply the swap post effect to the scene only, not to the HUD drawn "
+                    "over it (no effect where the frame has no scene)");
+REXCVAR_DEFINE_STRING(scene_lut_path, "", "GPU",
+                      "Vulkan: a .cube 3D colour LUT applied to the scene, not the HUD; empty "
+                      "for none");
+REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
+                     "Vulkan: how much of the scene LUT applies, in percent")
+    .range(0, 100);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "

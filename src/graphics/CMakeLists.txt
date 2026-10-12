@@ -28,6 +28,7 @@ set(REXGPU_XENOS_SOURCES
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/texture/replacement.cpp
+    cube_lut.cpp
     pipeline/shader/interpreter.cpp
 
     # Null backend (gpu_backend=null): packets without a device
@@ -59,6 +60,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/fh1_frame_dump.cpp
     vulkan/fh1_native_executor.cpp
     vulkan/command_processor.cpp
+    vulkan/scene_post.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp

@@ -2824,6 +2824,15 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_hud_mask_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_hud_mask_set_layout_);
+  // Into the destroy queues, emptied below.
+  DestroySceneLut();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_scene_post_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_scene_post_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_scene_post_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_scene_post_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -3532,22 +3541,28 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  // present_hdr: the scene before the HUD, for the HUD's coverage. Without
-  // one (menus), the guest output stays opaque, all of it HUD.
+  // present_hdr and the scene-only post: the scene before the HUD, for the
+  // HUD's coverage. Without one (menus), the guest output stays opaque, all
+  // of it HUD, and the scene-only post does not run.
   VkImageView hud_snapshot_view = VK_NULL_HANDLE;
+  bool hdr_active = false;
+  const bool scene_fxaa =
+      swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
+  const bool scene_lut =
+      !REXCVAR_GET(scene_lut_path).empty() && REXCVAR_GET(scene_lut_strength) > 0;
   if (fh1_native_executor_) {
-    const bool hdr_active = ui::vulkan::GetHdrOutputState().active;
-    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active);
+    hdr_active = ui::vulkan::GetHdrOutputState().active;
+    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    if (!hdr_active) hud_snapshot_view = VK_NULL_HANDLE;
   }
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       hud_snapshot_view, hdr_active, scene_fxaa,
+       scene_lut](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -3564,6 +3579,21 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        const bool fxaa_requested = use_fxaa;
+        // The scene-only post (scene_post.cpp) takes the FXAA route through
+        // the FXAA source image and replaces the FXAA pass.
+        bool scene_post = false;
+        bool scene_lut_ready = false;
+        if (hud_snapshot_view != VK_NULL_HANDLE && (scene_fxaa || scene_lut) &&
+            EnsureSwapScenePost()) {
+          scene_lut_ready = UpdateSceneLut() && scene_lut;
+          scene_post = scene_lut_view_ != VK_NULL_HANDLE && (scene_fxaa || scene_lut_ready);
+        }
+        if (scene_fxaa && !scene_post) {
+          // No scene in this frame: nothing to antialias but the HUD.
+          use_fxaa = false;
+        }
+        if (scene_post) use_fxaa = true;
 
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
@@ -3829,65 +3859,120 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             swap_fxaa_source_image_submission_ = GetCurrentSubmission();
 
-            VkDescriptorSet swap_descriptor_fxaa_source =
-                swap_descriptors_fxaa_source_[swap_frame_index];
-            VkDescriptorImageInfo swap_descriptor_fxaa_source_image_info;
-            swap_descriptor_fxaa_source_image_info.sampler = swap_sampler_linear_clamp_;
-            swap_descriptor_fxaa_source_image_info.imageView = swap_fxaa_source_image_view_;
-            swap_descriptor_fxaa_source_image_info.imageLayout =
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            VkWriteDescriptorSet swap_descriptor_fxaa_source_write;
-            swap_descriptor_fxaa_source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            swap_descriptor_fxaa_source_write.pNext = nullptr;
-            swap_descriptor_fxaa_source_write.dstSet = swap_descriptor_fxaa_source;
-            swap_descriptor_fxaa_source_write.dstBinding = 0;
-            swap_descriptor_fxaa_source_write.dstArrayElement = 0;
-            swap_descriptor_fxaa_source_write.descriptorCount = 1;
-            swap_descriptor_fxaa_source_write.descriptorType =
-                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            swap_descriptor_fxaa_source_write.pImageInfo = &swap_descriptor_fxaa_source_image_info;
-            swap_descriptor_fxaa_source_write.pBufferInfo = nullptr;
-            swap_descriptor_fxaa_source_write.pTexelBufferView = nullptr;
-            dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_source_write, 0, nullptr);
+            if (scene_post) {
+              VkDescriptorSet set = swap_scene_post_descriptor_sets_[swap_frame_index];
+              VkDescriptorImageInfo infos[5] = {
+                  {swap_sampler_linear_clamp_, swap_fxaa_source_image_view_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {swap_sampler_linear_clamp_, scene_lut_view_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
+              };
+              const VkDescriptorType types[5] = {
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+              VkWriteDescriptorSet writes[5] = {};
+              for (uint32_t i = 0; i < 5; ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = set;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = types[i];
+                writes[i].pImageInfo = &infos[i];
+              }
+              dfn.vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+              deferred_command_buffer_.CmdVkBindDescriptorSets(
+                  VK_PIPELINE_BIND_POINT_COMPUTE, swap_scene_post_pipeline_layout_, 0, 1, &set, 0,
+                  nullptr);
+              struct {
+                uint32_t size[2];
+                float size_inv[2];
+                uint32_t flags;
+                float lut_strength;
+                float lut_scale;
+                float lut_offset;
+              } constants = {
+                  {guest_output_width, guest_output_height},
+                  {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)},
+                  0,
+                  float(REXCVAR_GET(scene_lut_strength)) / 100.0f,
+                  float(scene_lut_size_ - 1) / float(scene_lut_size_),
+                  0.5f / float(scene_lut_size_)};
+              if (fxaa_requested) {
+                constants.flags |= 1u;
+                if (swap_post_effect == SwapPostEffect::kFxaaExtreme) constants.flags |= 2u;
+                if (!scene_fxaa) constants.flags |= 8u;
+              }
+              if (scene_lut_ready) constants.flags |= 4u;
+              deferred_command_buffer_.CmdVkPushConstants(swap_scene_post_pipeline_layout_,
+                                                          VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                          sizeof(constants), &constants);
+              BindExternalComputePipeline(swap_scene_post_pipeline_);
+              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            } else {
+              VkDescriptorSet swap_descriptor_fxaa_source =
+                  swap_descriptors_fxaa_source_[swap_frame_index];
+              VkDescriptorImageInfo swap_descriptor_fxaa_source_image_info;
+              swap_descriptor_fxaa_source_image_info.sampler = swap_sampler_linear_clamp_;
+              swap_descriptor_fxaa_source_image_info.imageView = swap_fxaa_source_image_view_;
+              swap_descriptor_fxaa_source_image_info.imageLayout =
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              VkWriteDescriptorSet swap_descriptor_fxaa_source_write;
+              swap_descriptor_fxaa_source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              swap_descriptor_fxaa_source_write.pNext = nullptr;
+              swap_descriptor_fxaa_source_write.dstSet = swap_descriptor_fxaa_source;
+              swap_descriptor_fxaa_source_write.dstBinding = 0;
+              swap_descriptor_fxaa_source_write.dstArrayElement = 0;
+              swap_descriptor_fxaa_source_write.descriptorCount = 1;
+              swap_descriptor_fxaa_source_write.descriptorType =
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+              swap_descriptor_fxaa_source_write.pImageInfo = &swap_descriptor_fxaa_source_image_info;
+              swap_descriptor_fxaa_source_write.pBufferInfo = nullptr;
+              swap_descriptor_fxaa_source_write.pTexelBufferView = nullptr;
+              dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_source_write, 0, nullptr);
 
-            VkDescriptorSet swap_descriptor_fxaa_destination_storage =
-                swap_descriptors_fxaa_destination_storage_[swap_frame_index];
-            VkDescriptorImageInfo swap_descriptor_fxaa_destination_storage_image_info;
-            swap_descriptor_fxaa_destination_storage_image_info.sampler = VK_NULL_HANDLE;
-            swap_descriptor_fxaa_destination_storage_image_info.imageView =
-                vulkan_context.image_view();
-            swap_descriptor_fxaa_destination_storage_image_info.imageLayout =
-                VK_IMAGE_LAYOUT_GENERAL;
-            VkWriteDescriptorSet swap_descriptor_fxaa_destination_storage_write =
-                swap_descriptor_destination_storage_write;
-            swap_descriptor_fxaa_destination_storage_write.dstSet =
-                swap_descriptor_fxaa_destination_storage;
-            swap_descriptor_fxaa_destination_storage_write.pImageInfo =
-                &swap_descriptor_fxaa_destination_storage_image_info;
-            dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_destination_storage_write,
-                                       0, nullptr);
+              VkDescriptorSet swap_descriptor_fxaa_destination_storage =
+                  swap_descriptors_fxaa_destination_storage_[swap_frame_index];
+              VkDescriptorImageInfo swap_descriptor_fxaa_destination_storage_image_info;
+              swap_descriptor_fxaa_destination_storage_image_info.sampler = VK_NULL_HANDLE;
+              swap_descriptor_fxaa_destination_storage_image_info.imageView =
+                  vulkan_context.image_view();
+              swap_descriptor_fxaa_destination_storage_image_info.imageLayout =
+                  VK_IMAGE_LAYOUT_GENERAL;
+              VkWriteDescriptorSet swap_descriptor_fxaa_destination_storage_write =
+                  swap_descriptor_destination_storage_write;
+              swap_descriptor_fxaa_destination_storage_write.dstSet =
+                  swap_descriptor_fxaa_destination_storage;
+              swap_descriptor_fxaa_destination_storage_write.pImageInfo =
+                  &swap_descriptor_fxaa_destination_storage_image_info;
+              dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_destination_storage_write,
+                                         0, nullptr);
 
-            std::array<VkDescriptorSet, kSwapFxaaDescriptorSetCount> swap_fxaa_descriptor_sets{};
-            swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetSource] = swap_descriptor_fxaa_source;
-            swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetDestination] =
-                swap_descriptor_fxaa_destination_storage;
-            deferred_command_buffer_.CmdVkBindDescriptorSets(
-                VK_PIPELINE_BIND_POINT_COMPUTE, swap_fxaa_pipeline_layout_, 0,
-                uint32_t(swap_fxaa_descriptor_sets.size()), swap_fxaa_descriptor_sets.data(), 0,
-                nullptr);
-            SwapFxaaConstants swap_fxaa_constants = {
-                {guest_output_width, guest_output_height},
-                {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
-            deferred_command_buffer_.CmdVkPushConstants(
-                swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
-                                            ? swap_fxaa_extreme_pipeline_
-                                            : swap_fxaa_pipeline_);
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+              std::array<VkDescriptorSet, kSwapFxaaDescriptorSetCount> swap_fxaa_descriptor_sets{};
+              swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetSource] = swap_descriptor_fxaa_source;
+              swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetDestination] =
+                  swap_descriptor_fxaa_destination_storage;
+              deferred_command_buffer_.CmdVkBindDescriptorSets(
+                  VK_PIPELINE_BIND_POINT_COMPUTE, swap_fxaa_pipeline_layout_, 0,
+                  uint32_t(swap_fxaa_descriptor_sets.size()), swap_fxaa_descriptor_sets.data(), 0,
+                  nullptr);
+              SwapFxaaConstants swap_fxaa_constants = {
+                  {guest_output_width, guest_output_height},
+                  {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
+              deferred_command_buffer_.CmdVkPushConstants(
+                  swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                  sizeof(swap_fxaa_constants), &swap_fxaa_constants);
+              BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
+                                              ? swap_fxaa_extreme_pipeline_
+                                              : swap_fxaa_pipeline_);
+              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            }
           }
 
-          if (hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
+          if (hdr_active && hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
             PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
