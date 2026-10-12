@@ -97,13 +97,13 @@ REXCVAR_DEFINE_INT32(present_hdr_test_pattern, 0, "UI/Presenter",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
-                    "Allow immediate present mode (no vsync)");
+                    "Allow immediate present mode (tears) while vsync is off");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
                     "Allow mailbox present mode (triple buffering)");
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
-                    "Allow FIFO relaxed present mode");
+                    "Allow FIFO relaxed present mode (tears late frames) while vsync is off");
 
 REXCVAR_DEFINE_BOOL(vulkan_present_wait, false, "UI/Vulkan",
                     "Pace presentation: after each present, wait (up to 50 ms) until the "
@@ -1688,7 +1688,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // vsync belongs to the command processor (in the GPU plugin, so it is read
+  // by name) and otherwise only paces the guest GPU: with it on, the two
+  // modes that tear are left out, so the swapchain is mailbox or FIFO, as
+  // Direct3D 12 presents without its tearing flag. Unregistered counts as on.
+  const bool vsync = rex::cvar::GetFlagByName("vsync") != "false";
+  if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -1700,7 +1705,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
                  present_modes.cend()) {
     // Allowing dropping frames to reduce latency, but no tearing.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
     // Limiting the frame rate, but lets too long frames cause tearing not to
