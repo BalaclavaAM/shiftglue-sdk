@@ -171,6 +171,10 @@ REXCVAR_DEFINE_DOUBLE(fh1_hud_safe_zone, 0.0, "GPU",
                       "screen (for TVs that crop the picture)")
     .range(0.0, 0.2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_hud_scale_suspended, false, "GPU",
+                    "Vulkan: set by the host while the game shows no gameplay view (the pause "
+                    "map, menus, loading), whose screens the HUD scale must not shrink")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_async_submission, true, "GPU/Vulkan",
                     "Replay and submit each ended submission's command stream on a worker "
                     "thread, overlapping the driver's recording with the next submission")
@@ -5817,7 +5821,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // The HUD scale and safe zone shrink or grow the HUD around the centre,
   // only for HUD draws over this frame's scene (fh1_native_executor).
   const double hud_scale =
-      fh1_native_executor_ && fh1_native_executor_->IsHudDraw()
+      fh1_native_executor_ && fh1_native_executor_->IsHudDraw() &&
+              !REXCVAR_GET(fh1_hud_scale_suspended)
           ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
           : 1.0;
   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
