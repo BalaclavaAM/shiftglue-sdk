@@ -19,6 +19,10 @@
 #include <rex/platform.h>
 #include <rex/types.h>
 
+#if REX_ARCH_ARM64
+#include <arm_neon.h>
+#endif
+
 namespace rex::audio::conversion {
 
 #if REX_ARCH_AMD64
@@ -107,6 +111,85 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
 
     _mm_storeu_ps(&output[sample * 2], _mm_unpacklo_ps(left, right));
     _mm_storeu_ps(&output[(sample + 2) * 2], _mm_unpackhi_ps(left, right));
+  }
+}
+#elif REX_ARCH_ARM64
+// NEON mirrors of the SSE paths above (after xenia-edge b899a97a7e). The byte
+// swap runs in the integer domain so NaN patterns round-trip bit-exactly, the
+// adds keep the SSE association, and the clamps select like _mm_max_ps and
+// _mm_min_ps (the second operand when unordered), so the output matches x64
+// builds bit for bit.
+namespace detail {
+inline float32x4_t LoadSwapped(const float* input, size_t index) {
+  const uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(input + index));
+  return vreinterpretq_f32_u8(vrev32q_u8(raw));
+}
+inline float32x4_t MaxLikeSse(float32x4_t a, float32x4_t b) {
+  return vbslq_f32(vcgtq_f32(a, b), a, b);
+}
+inline float32x4_t MinLikeSse(float32x4_t a, float32x4_t b) {
+  return vbslq_f32(vcltq_f32(a, b), a, b);
+}
+}  // namespace detail
+
+inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
+                                                size_t ch_sample_count, const SurroundMix& mix,
+                                                float gain) {
+  assert_true(ch_sample_count % 2 == 0);
+  // Byte swap and interleave, as 32-bit integers.
+  const uint32_t* in = reinterpret_cast<const uint32_t*>(input);
+  uint32_t* out = reinterpret_cast<uint32_t*>(output);
+  for (size_t sample = 0; sample < ch_sample_count; sample++) {
+    for (size_t channel = 0; channel < 6; channel++) {
+      out[sample * 6 + channel] = rex::byte_swap(in[channel * ch_sample_count + sample]);
+    }
+  }
+  // Second pass over four-float windows with the three weight vectors the SSE
+  // path uses; six channels repeat every 12 floats, which the even sample
+  // count guarantees is the whole buffer.
+  const float c = mix.center * gain;
+  const float s = mix.surround * gain;
+  const float l = mix.lfe * gain;
+  const float w0[4] = {gain, gain, c, l};
+  const float w1[4] = {s, s, gain, gain};
+  const float w2[4] = {c, l, s, s};
+  const float32x4_t w[3] = {vld1q_f32(w0), vld1q_f32(w1), vld1q_f32(w2)};
+  const float32x4_t lo = vdupq_n_f32(-1.0f);
+  const float32x4_t hi = vdupq_n_f32(1.0f);
+  const size_t count = ch_sample_count * 6;
+  for (size_t i = 0, phase = 0; i < count; i += 4, phase = (phase + 1) % 3) {
+    const float32x4_t v = vmulq_f32(vld1q_f32(&output[i]), w[phase]);
+    vst1q_f32(&output[i], detail::MinLikeSse(detail::MaxLikeSse(v, lo), hi));
+  }
+}
+
+inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
+                                                size_t ch_sample_count, const StereoFold& fold,
+                                                float gain) {
+  assert_true(ch_sample_count % 4 == 0);
+  const float32x4_t center = vdupq_n_f32(fold.center);
+  const float32x4_t lfe = vdupq_n_f32(fold.lfe);
+  const float32x4_t surround = vdupq_n_f32(fold.surround);
+  const float32x4_t scale = vdupq_n_f32(fold.scale * gain);
+  const float32x4_t lo = vdupq_n_f32(-1.0f);
+  const float32x4_t hi = vdupq_n_f32(1.0f);
+  for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
+    const float32x4_t fl = detail::LoadSwapped(input, 0 * ch_sample_count + sample);
+    const float32x4_t fr = detail::LoadSwapped(input, 1 * ch_sample_count + sample);
+    const float32x4_t fc = detail::LoadSwapped(input, 2 * ch_sample_count + sample);
+    const float32x4_t lf = detail::LoadSwapped(input, 3 * ch_sample_count + sample);
+    const float32x4_t bl = detail::LoadSwapped(input, 4 * ch_sample_count + sample);
+    const float32x4_t br = detail::LoadSwapped(input, 5 * ch_sample_count + sample);
+    // Center and LFE land on both sides. Separate multiplies and adds, as the
+    // SSE path has them: a fused multiply-add would round differently.
+    const float32x4_t mid = vaddq_f32(vmulq_f32(fc, center), vmulq_f32(lf, lfe));
+    float32x4_t left = vmulq_f32(vaddq_f32(vaddq_f32(fl, mid), vmulq_f32(bl, surround)), scale);
+    float32x4_t right = vmulq_f32(vaddq_f32(vaddq_f32(fr, mid), vmulq_f32(br, surround)), scale);
+    left = detail::MinLikeSse(detail::MaxLikeSse(left, lo), hi);
+    right = detail::MinLikeSse(detail::MaxLikeSse(right, lo), hi);
+    const float32x4x2_t zipped = vzipq_f32(left, right);
+    vst1q_f32(&output[sample * 2], zipped.val[0]);
+    vst1q_f32(&output[(sample + 2) * 2], zipped.val[1]);
   }
 }
 #else

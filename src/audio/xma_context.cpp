@@ -10,6 +10,7 @@
 */
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include <rex/audio/xma/context.h>
@@ -22,6 +23,10 @@
 #include <rex/perf/counter.h>
 #include <rex/platform.h>
 #include <rex/stream.h>
+
+#if REX_ARCH_ARM64
+#include <arm_neon.h>
+#endif
 
 extern "C" {
 #if REX_COMPILER_MSVC
@@ -281,7 +286,14 @@ bool XmaContext::Work() {
       break;
     }
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // Don't abandon a partially consumed frame. Consume() hands over at most
+    // subframe_decode_count blocks per pass, so the pass that exhausts the
+    // input typically leaves the rest of the frame undelivered. is_enabled_ is
+    // already clear and only XMAEnableContext sets it again, so a title polling
+    // for the remainder never kicks: keep draining until the frame is out
+    // (xenia-canary 6bef1fbed1).
+    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
+        current_frame_remaining_subframes_ == 0) {
       break;
     }
   }
@@ -731,18 +743,44 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
 
 kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
   kPacketInfo packet_info = {};
+  packet_info.current_frame_offset_ = frame_offset;
 
   const uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
   BitStream stream(packet, kBitsPerPacket);
   stream.SetOffset(first_frame_offset);
 
+  // Report the first frame starting at or after frame_offset, so a loop_start
+  // that a title wrote one bit short of a frame boundary can be resolved
+  // (xenia-edge 5dd1cdbbf5).
+  bool resolved = false;
+  auto consider_frame = [&](uint32_t offset, uint32_t size) {
+    if (!resolved && offset >= frame_offset) {
+      resolved = true;
+      packet_info.current_frame_offset_ = offset;
+    }
+    if (offset != frame_offset) {
+      return;
+    }
+    packet_info.current_frame_ = packet_info.frame_count_;
+    packet_info.current_frame_size_ = size;
+  };
+
   if (frame_offset < first_frame_offset) {
     packet_info.current_frame_ = 0;
     packet_info.current_frame_size_ = first_frame_offset - frame_offset;
+    resolved = true;
   }
 
   while (true) {
     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
+      // This frame's 15-bit header runs into the next packet, so its size
+      // isn't readable yet. Count it anyway, or the caller takes the previous
+      // frame for the packet's last and skips straight past this one. Size 0
+      // sends it to the split-header path (xenia-edge adf56b76c4).
+      if (stream.BitsRemaining() > 0) {
+        consider_frame(static_cast<uint32_t>(stream.offset_bits()), 0);
+        packet_info.frame_count_++;
+      }
       break;
     }
 
@@ -751,10 +789,7 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
       break;
     }
 
-    if (stream.offset_bits() == frame_offset) {
-      packet_info.current_frame_ = packet_info.frame_count_;
-      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
-    }
+    consider_frame(static_cast<uint32_t>(stream.offset_bits()), static_cast<uint32_t>(frame_size));
 
     packet_info.frame_count_++;
 
@@ -1018,6 +1053,17 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   kPacketInfo packet_info = GetPacketInfo(packet, relative_offset);
+
+  // Titles can write loop_start one bit short of the frame boundary; resolve
+  // it to the frame that starts there (xenia-edge 5dd1cdbbf5).
+  if (loop_start_skip_pending_ && packet_info.current_frame_offset_ != relative_offset) {
+    REXAPU_DEBUG("XmaContext {}: loop_start {} is not a frame boundary in packet {}, resolving to {}",
+                 id(), relative_offset, packet_index, packet_info.current_frame_offset_);
+    relative_offset = packet_info.current_frame_offset_;
+    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + relative_offset;
+    packet_info = GetPacketInfo(packet, relative_offset);
+  }
+
   const uint32_t packet_to_skip = skip_count + 1;
   const uint32_t next_packet_index = packet_index + packet_to_skip;
 
@@ -1146,6 +1192,19 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   data->input_buffer_read_offset = next_input_offset;
 }
 
+#if REX_ARCH_ARM64
+// FCVTNS saturates (NaN -> 0, positive overflow -> INT32_MAX); x86's CVTPS2DQ
+// yields the integer indefinite value instead, which PACKSSDW turns into
+// -32768. Substitute it so both produce identical samples (xenia-edge
+// 32177527fa).
+static inline int32x4_t ConvertToInt32LikeSse(float32x4_t v) {
+  // |v| < 2^31 is false for NaN and the infinities. v == -2^31 also reports
+  // false, but its in-range conversion is INT32_MIN too, so this stays exact.
+  const uint32x4_t representable = vcaltq_f32(v, vdupq_n_f32(2147483648.0f));
+  return vbslq_s32(representable, vcvtnq_s32_f32(v), vdupq_n_s32(INT32_MIN));
+}
+#endif  // REX_ARCH_ARM64
+
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
                               uint8_t* output_buffer) {
   // Loop through every sample, convert and drop it into the output array.
@@ -1203,18 +1262,56 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
       _mm_storeu_si128(reinterpret_cast<__m128i*>(&out[i]), out_mm);
     }
   }
+#elif REX_ARCH_ARM64
+  // NEON mirror of the SSE path above (xenia-edge b899a97a7e, 32177527fa):
+  // scale, convert with cvtps_epi32 semantics (round to nearest even; NaN and
+  // out-of-range values give the integer indefinite value INT32_MIN, which
+  // the saturating pack turns into -32768), pack to int16, byte-swap to big
+  // endian. The scalar loop this replaces truncated, so Android and macOS
+  // produced different samples from x64 builds.
+  static_assert(kSamplesPerFrame % 8 == 0);
+  const auto in_channel_0 = reinterpret_cast<const float*>(samples[0]);
+  const float32x4_t scale_v = vdupq_n_f32(scale);
+  if (is_two_channel && samples[1] != nullptr) {
+    const auto in_channel_1 = reinterpret_cast<const float*>(samples[1]);
+    for (uint32_t i = 0; i < kSamplesPerFrame; i += 4) {
+      const float32x4_t in_l = vld1q_f32(&in_channel_0[i]);
+      const float32x4_t in_r = vld1q_f32(&in_channel_1[i]);
+      const int32x4_t l32 = ConvertToInt32LikeSse(vmulq_f32(in_l, scale_v));
+      const int32x4_t r32 = ConvertToInt32LikeSse(vmulq_f32(in_r, scale_v));
+      const int16x4_t l16 = vqmovn_s32(l32);
+      const int16x4_t r16 = vqmovn_s32(r32);
+      // Interleave channels, then byte swap each 16-bit sample.
+      const int16x4x2_t zipped = vzip_s16(l16, r16);
+      const int16x8_t interleaved = vcombine_s16(zipped.val[0], zipped.val[1]);
+      const uint8x16_t swapped = vrev16q_u8(vreinterpretq_u8_s16(interleaved));
+      vst1q_u8(reinterpret_cast<uint8_t*>(&out[i * 2]), swapped);
+    }
+  } else {
+    for (uint32_t i = 0; i < kSamplesPerFrame; i += 8) {
+      const float32x4_t in0 = vld1q_f32(&in_channel_0[i]);
+      const float32x4_t in1 = vld1q_f32(&in_channel_0[i + 4]);
+      const int32x4_t s0 = ConvertToInt32LikeSse(vmulq_f32(in0, scale_v));
+      const int32x4_t s1 = ConvertToInt32LikeSse(vmulq_f32(in1, scale_v));
+      const int16x8_t packed = vcombine_s16(vqmovn_s32(s0), vqmovn_s32(s1));
+      const uint8x16_t swapped = vrev16q_u8(vreinterpretq_u8_s16(packed));
+      vst1q_u8(reinterpret_cast<uint8_t*>(&out[i]), swapped);
+    }
+  }
 #else
+  // Scalar form of the SSE path: round to nearest even, saturate to int16, and
+  // give NaN and out-of-int32-range values -32768 as cvtps_epi32 plus
+  // packs_epi32 do.
   uint32_t o = 0;
   for (uint32_t i = 0; i < kSamplesPerFrame; i++) {
     for (uint32_t j = 0; j <= uint32_t(is_two_channel); j++) {
-      // Select the appropriate array based on the current channel.
       auto in = reinterpret_cast<const float*>(samples[j]);
-
-      // Raw samples sometimes aren't within [-1, 1]
-      float scaled_sample = rex::clamp_float(in[i], -1.0f, 1.0f) * scale;
-
-      // Convert the sample and output it in big endian.
-      auto sample = static_cast<int16_t>(scaled_sample);
+      const float scaled_sample = in[i] * scale;
+      int32_t converted = INT32_MIN;
+      if (std::fabs(scaled_sample) < 2147483648.0f) {
+        converted = static_cast<int32_t>(std::lrintf(scaled_sample));
+      }
+      const auto sample = static_cast<int16_t>(std::clamp<int32_t>(converted, INT16_MIN, INT16_MAX));
       out[o++] = rex::byte_swap(sample);
     }
   }
