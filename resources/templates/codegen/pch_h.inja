@@ -172,15 +172,22 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 
 // Accesses based on the stack pointer (r1). Guest stacks are allocated in the
 // stack range at 0x70000000, never in the 0xE0000000 physical view, so these
-// skip the physical-heap offset select.
-#define REX_STACK_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x)))
-#define REX_STACK_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x)))
-#define REX_STACK_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x)))
-#define REX_STACK_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x)))
-#define REX_STACK_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x)) = (y))
-#define REX_STACK_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x)) = __builtin_bswap16(y))
-#define REX_STACK_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x)) = __builtin_bswap32(y))
-#define REX_STACK_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x)) = __builtin_bswap64(y))
+// skip the physical-heap offset select. With REX_PLAIN_STACK they are also
+// not volatile: a thread's stack is its own, so the compiler may forward a
+// spilled value to its reload and drop a dead spill within the function.
+#ifdef REX_PLAIN_STACK
+#define REX_STACK_QUAL
+#else
+#define REX_STACK_QUAL volatile
+#endif
+#define REX_STACK_LOAD_U8(x) (*(REX_STACK_QUAL u8*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U16(x) __builtin_bswap16(*(REX_STACK_QUAL u16*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U32(x) __builtin_bswap32(*(REX_STACK_QUAL u32*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U64(x) __builtin_bswap64(*(REX_STACK_QUAL u64*)(base + (u32)(x)))
+#define REX_STACK_STORE_U8(x, y)  (*(REX_STACK_QUAL u8*)(base + (u32)(x)) = (y))
+#define REX_STACK_STORE_U16(x, y) (*(REX_STACK_QUAL u16*)(base + (u32)(x)) = __builtin_bswap16(y))
+#define REX_STACK_STORE_U32(x, y) (*(REX_STACK_QUAL u32*)(base + (u32)(x)) = __builtin_bswap32(y))
+#define REX_STACK_STORE_U64(x, y) (*(REX_STACK_QUAL u64*)(base + (u32)(x)) = __builtin_bswap64(y))
 
 #define REX_MEMORY_SIZE 0x100000000ull
 
