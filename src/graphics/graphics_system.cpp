@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -56,6 +57,9 @@ REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
     .range(0, 240);
+REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
+                    "Log the first guest read of each GPU register (a census of what the "
+                    "title polls, for deciding which reads need emulation)");
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -347,6 +351,14 @@ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, u
 
 uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+
+  if (REXCVAR_GET(gpu_log_register_reads)) {
+    static std::atomic<bool> seen[RegisterFile::kRegisterCount];
+    if (r < RegisterFile::kRegisterCount && !seen[r].exchange(true)) {
+      const auto* info = register_file_.GetRegisterInfo(r);
+      REXGPU_INFO("GPU: register.first_read {:04X} {}", r, info ? info->name : "?");
+    }
+  }
 
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
