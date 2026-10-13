@@ -1328,6 +1328,45 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct SamplerCensus {
     uint64_t slots = 0, slot_hits = 0, memo_hits = 0, use_sampler = 0, verified_different = 0;
   } sampler_census_;
+  // NL-3.2: the inputs of the last full sampler stage. A draw with the same
+  // shaders, the same submission and filtering, and none of the fetch
+  // constants its samplers read written since (the texture cache's in-sync
+  // bits, set by the last draw's texture request) keeps current_samplers_*.
+  struct SamplerStageInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    uint64_t submission = 0;
+    uint32_t fetch_mask = 0;
+    int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
+    bool fetch_key = false;
+    bool scene_filtering = false;
+    bool valid = false;
+  } sampler_stage_inputs_;
+  // NL-3.2: bumped whenever a draw derives its samplers or requests its
+  // textures in full, so an unchanged value means every draw since kept the
+  // same samplers and texture bindings.
+  uint64_t texture_inputs_generation_ = 0;
+  // NL-3.2: the inputs of the last UpdateBindings texture section; with the
+  // same shaders, layout, frame and texture inputs, its image infos and sets
+  // are the last ones again.
+  struct TextureSectionInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    const void* layout = nullptr;
+    uint64_t frame = 0;
+    uint64_t texture_inputs_generation = UINT64_MAX;
+    bool valid = false;
+  } texture_section_inputs_;
+  bool texture_section_skip_allowed_ = false;
+  bool texture_section_verify_ = false;
+  // Verify mode: the samplers a kept sampler stage assumed.
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> verify_samplers_[2];
+  // NL-3.2: draws whose stages found their inputs unchanged.
+  struct UnchangedCensus {
+    uint64_t draws = 0, samplers = 0, textures = 0, texture_sections = 0;
+    uint64_t mismatches = 0, texture_mismatches = 0;
+  } unchanged_census_;
   std::unique_ptr<SamplerParametersMemo[]> sampler_parameters_memos_{
       new SamplerParametersMemo[kSamplerParametersMemoCount]};
   // The last texture descriptor set written per stage (vertex, pixel) and its

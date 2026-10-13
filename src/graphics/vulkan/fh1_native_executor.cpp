@@ -2038,7 +2038,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   // The extent estimate reads vertices when clipping is off.
   const bool memo_allowed = draw.state_epoch && !draw.memexport &&
                             !register_file_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
-  PrepareMemo& memo = prepare_memo_;
+  PrepareMemo& memo =
+      prepare_memos_[draw.state_is_hash ? (draw.state_epoch >> 40) & (std::size(prepare_memos_) - 1)
+                                        : 0];
   ++prepare_calls_;
   if (memo_allowed && memo.state_epoch == draw.state_epoch &&
       memo.vertex_shader == draw.vertex_shader &&
@@ -2246,10 +2248,12 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     bound_bits_ |= 1u << i;
   }
   key_out.depth_and_color_used = bound_bits_;
+  // Every used surface was bound, so this is the bound surfaces' scope.
+  bound_rendering_id_ = rendering_id;
   if (!used_bits) Count("draw_writes_nothing");
   draw_shading_rate_ = {1, 1};
   if (!coarse_shading_.empty()) {
-    const uint64_t id = DrawRenderingId(bound_bits_);
+    const uint64_t id = rendering_id;
     auto it = shading_rate_by_rendering_.find(id);
     if (it == shading_rate_by_rendering_.end()) {
       std::string label;
@@ -2321,15 +2325,16 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
     }
   }
-  if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+  const uint64_t bound_id = bound_rendering_id_;
+  if (command_processor_.IsFh1RenderingOpen(bound_id)) {
     // The draw continues the open rendering unless pending barriers end it;
     // then it begins anew below as before.
     command_processor_.SubmitBarriers(false);
-    if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+    if (command_processor_.IsFh1RenderingOpen(bound_id)) {
       const int32_t split = REXCVAR_GET(fh1_debug_rendering_split_draws);
       if (split <= 0 || ++rendering_draws_ < uint32_t(split)) {
         attachment_barriers_skipped_ = false;
-        rendering_id_ = DrawRenderingId(bound_bits_);
+        rendering_id_ = bound_id;
         if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
         return;
       }
@@ -2368,7 +2373,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
     height = SurfaceHeight(pitch_tiles, msaa) * scale_;
   }
-  const uint64_t id = DrawRenderingId(bound_bits_);
+  const uint64_t id = bound_id;
   if (attachment_barriers_skipped_) {
     attachment_barriers_skipped_ = false;
     // Pending barriers (such as texture loads) end the rendering.

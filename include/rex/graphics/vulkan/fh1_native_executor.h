@@ -486,6 +486,8 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
+  // DrawRenderingId(bound_bits_), set by BindTargets for BeginDrawRendering.
+  uint64_t bound_rendering_id_ = 0;
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
   void UpdateCoarseShading();
   std::string coarse_shading_spec_;
@@ -524,7 +526,9 @@ class Fh1NativeExecutor {
     uint32_t used_bits = 0;
     SurfaceKey keys[5];
   };
-  PrepareMemo prepare_memo_;
+  // Slot 0 holds the last preparation; with state hashes (NL-3.2) the
+  // preparations are direct-mapped by state.
+  PrepareMemo prepare_memos_[16];
   uint64_t prepare_calls_ = 0, prepare_memo_hits_ = 0;
   void PrepareTargetsImpl(const Fh1DrawInfo& draw);
   uint32_t recent_prepare_next_ = 0;

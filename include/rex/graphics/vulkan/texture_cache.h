@@ -103,6 +103,16 @@ class VulkanTextureCache final : public TextureCache {
   bool bindless() const { return bindless_.set != VK_NULL_HANDLE; }
   // Bumped whenever texture bindings were updated (their views and slots).
   uint64_t bindings_generation() const { return bindings_generation_; }
+  // NL-3.2: let RequestTextures return at once when the requested bindings
+  // are unchanged and their textures already marked used and transitioned in
+  // this submission.
+  void set_skip_unchanged_requests(bool skip, bool verify) {
+    skip_unchanged_requests_ = skip;
+    verify_unchanged_requests_ = verify;
+  }
+  uint64_t unchanged_request_hits() const { return unchanged_request_hits_; }
+  // Verify mode: skippable requests whose textures were not all sampled.
+  uint64_t unchanged_request_mismatches() const { return unchanged_request_mismatches_; }
   VkDescriptorSetLayout bindless_descriptor_set_layout() const { return bindless_.layout; }
   VkDescriptorSet bindless_descriptor_set() const { return bindless_.set; }
   // The binding's cached slot inline; 3D as 2D, null and new views out of line.
@@ -261,9 +271,13 @@ class VulkanTextureCache final : public TextureCache {
     VkImage image() const { return image_; }
 
     // Doesn't transition (the caller must insert the barrier).
+    Usage usage() const { return usage_; }
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
       usage_ = new_usage;
+      if (old_usage != new_usage) {
+        ++static_cast<VulkanTextureCache&>(texture_cache()).usage_generation_;
+      }
       return old_usage;
     }
 
@@ -530,6 +544,17 @@ class VulkanTextureCache final : public TextureCache {
     uint64_t overflows = 0;
   } bindless_;
   uint64_t bindings_generation_ = 0;
+  // NL-3.2: the bindings whose textures RequestTextures marked as used and
+  // transitioned for sampling, valid while the submission and every
+  // texture's usage are unchanged (usage_generation_, bumped by SetUsage).
+  bool skip_unchanged_requests_ = false;
+  bool verify_unchanged_requests_ = false;
+  uint64_t unchanged_request_mismatches_ = 0;
+  uint32_t sampled_ready_mask_ = 0;
+  uint64_t sampled_ready_submission_ = UINT64_MAX;
+  uint64_t sampled_ready_usage_generation_ = UINT64_MAX;
+  uint64_t usage_generation_ = 0;
+  uint64_t unchanged_request_hits_ = 0;
   // Views given slots outside the per-binding cache (3D as 2D, null views):
   // view to (array, slot).
   std::unordered_map<VkImageView, std::pair<uint32_t, uint32_t>> bindless_view_slots_;

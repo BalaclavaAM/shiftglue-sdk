@@ -695,6 +695,41 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  // NL-3.2: nothing written, nothing outdated, and each texture already used
+  // and sampled in this submission: the full request would change nothing.
+  const bool reload_probe = REXCVAR_GET(fh1_texture_reload_probe);
+  if (skip_unchanged_requests_ && !reload_probe &&
+      !(used_texture_mask & ~(texture_bindings_in_sync() & sampled_ready_mask_)) &&
+      sampled_ready_submission_ == current_submission_index() &&
+      sampled_ready_usage_generation_ == usage_generation_ &&
+      !texture_may_have_become_outdated()) {
+    ++unchanged_request_hits_;
+    if (!verify_unchanged_requests_) {
+      return;
+    }
+    // Verify: what the skip assumes, checked, then the full request anyway.
+    uint32_t remaining = used_texture_mask;
+    uint32_t verify_index;
+    bool mismatch = false;
+    while (rex::bit_scan_forward(remaining, &verify_index)) {
+      remaining &= ~(uint32_t(1) << verify_index);
+      const TextureBinding* binding = GetValidTextureBinding(verify_index);
+      if (!binding) {
+        continue;
+      }
+      for (Texture* texture : {binding->texture, binding->texture_signed}) {
+        mismatch |= texture && static_cast<VulkanTexture*>(texture)->usage() !=
+                                   VulkanTexture::Usage::kGuestShaderSampled;
+      }
+    }
+    unchanged_request_mismatches_ += mismatch;
+  }
+  // Ready bits from earlier requests stay valid only while no usage changed
+  // outside RequestTextures: everything this request loads, it also binds and
+  // transitions back for sampling below.
+  const bool ready_still_valid = sampled_ready_submission_ == current_submission_index() &&
+                                 sampled_ready_usage_generation_ == usage_generation_;
+
   TextureCache::RequestTextures(used_texture_mask);
 
   // Transition the textures into the needed usage.
@@ -729,7 +764,7 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
-      if (REXCVAR_GET(fh1_texture_reload_probe) && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
+      if (reload_probe && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
         const TextureKey& k = binding_texture->key();
         REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
                     "dim {} tiled {} packed {} mip_page {:X} depth {} pitch {} mips {} signed {}",
@@ -769,6 +804,9 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
     }
   }
+  sampled_ready_mask_ = (ready_still_valid ? sampled_ready_mask_ : 0) | used_texture_mask;
+  sampled_ready_submission_ = current_submission_index();
+  sampled_ready_usage_generation_ = usage_generation_;
 }
 
 uint32_t VulkanTextureCache::AllocateBindlessSlot(uint32_t array) {

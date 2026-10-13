@@ -213,6 +213,14 @@ REXCVAR_DEFINE_BOOL(gpu_sampler_fetch_key_verify, false, "GPU/Vulkan",
                     "On sampler cache hits, derive the sampler parameters again and count the "
                     "slots whose cached parameters differ")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs, true, "GPU/Vulkan",
+                    "Skip a draw's sampler, texture and target stages when their inputs are "
+                    "unchanged since the last draw, by O(1) tests (NEXT_LEVEL_RESEARCH NL-3.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs_verify, false, "GPU/Vulkan",
+                    "With gpu_draw_unchanged_inputs, derive every stage in full anyway and "
+                    "count the draws whose skipped stage would have differed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
                     "Count constant buffer uploads by buffer, their bytes and repeats, logged "
                     "every 600 frames (RECORDER_REPLAY_BACKLOG RR-2.1); apart from the draw "
@@ -919,6 +927,22 @@ void VulkanCommandProcessor::DrawCostFrame() {
       REXGPU_INFO("Target preparation (PD-3.5) over 600 frames: {} preparations, memo hits "
                   "{:.1f} %",
                   calls, calls ? 100.0 * double(hits) / double(calls) : 0.0);
+    }
+    if (draw_cost_.enabled && unchanged_census_.draws && texture_cache_) {
+      UnchangedCensus& u = unchanged_census_;
+      const uint64_t texture_hits = texture_cache_->unchanged_request_hits();
+      const double draws = double(u.draws);
+      const uint64_t texture_mismatches = texture_cache_->unchanged_request_mismatches();
+      REXGPU_INFO("Unchanged inputs (NL-3.2) over 600 frames: {} draws, samplers kept {:.1f} %, "
+                  "texture requests skipped {:.1f} %, texture descriptors kept {:.1f} %; "
+                  "verified different: {} samplers or descriptors, {} texture requests",
+                  u.draws, 100.0 * double(u.samplers) / draws,
+                  100.0 * double(texture_hits - u.textures) / draws,
+                  100.0 * double(u.texture_sections) / draws, u.mismatches,
+                  texture_mismatches - u.texture_mismatches);
+      u.draws = u.samplers = u.texture_sections = u.mismatches = 0;
+      u.texture_mismatches = texture_mismatches;
+      u.textures = texture_hits;
     }
     if (bindless_indices_draws_) {
       REXGPU_INFO("Bindless indices (PD-4) over 600 frames: computed for {:.1f} % of {} draws",
@@ -5117,6 +5141,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const RegisterFile& regs = *register_file_;
   const uint64_t memo_state = StateMemoKey();
   (void)index_buffer_info;
+  const bool unchanged_inputs = REXCVAR_GET(gpu_draw_unchanged_inputs);
+  const bool unchanged_verify = unchanged_inputs && REXCVAR_GET(gpu_draw_unchanged_inputs_verify);
+  ++unchanged_census_.draws;
   if (draw_cost_.enabled && (++draw_cost_.counter & 15) == 0) {
     draw_cost_.sampling = true;
     std::fill(std::begin(draw_cost_.pending), std::end(draw_cost_.pending), 0);
@@ -5319,6 +5346,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // updates done previously must be performed again because the updates done
   // before the awaiting may be referencing objects destroyed by
   // CompletedSubmissionUpdated.
+  bool sampler_verify_pending = false;
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
@@ -5442,7 +5470,45 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
     DrawCostMark(kCostTranslation);
+    // #528: the player's anisotropy and LOD bias are for the scene's
+    // textures. Depth-only passes (the sun's shadow maps, the depth
+    // pre-pass) and the HUD keep the title's filtering; post passes
+    // read render targets without mips, which never get either.
+    const bool scene_filtering =
+        !fh1_native_executor_ || (normalized_color_mask && !fh1_native_executor_->IsHudTarget());
+    const int32_t anisotropic_override = scene_filtering ? REXCVAR_GET(anisotropic_override)
+                                                         : VulkanTextureCache::kNoSceneFiltering;
+    const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
+    const bool fetch_key = REXCVAR_GET(gpu_sampler_fetch_key);
+    const bool fetch_key_verify = fetch_key && REXCVAR_GET(gpu_sampler_fetch_key_verify);
+    if (!i) {
+      SamplerStageInputs& inputs = sampler_stage_inputs_;
+      if (unchanged_inputs && inputs.valid && inputs.vertex_shader == vertex_shader &&
+          inputs.pixel_shader == pixel_shader && inputs.submission == GetCurrentSubmission() &&
+          inputs.anisotropic_override == anisotropic_override &&
+          inputs.force_trilinear == force_trilinear && inputs.fetch_key == fetch_key &&
+          inputs.scene_filtering == scene_filtering && !fetch_key_verify &&
+          !(inputs.fetch_mask & ~texture_cache_->texture_bindings_in_sync())) {
+        // current_samplers_* still hold this draw's samplers.
+        ++unchanged_census_.samplers;
+        if (!unchanged_verify) {
+          if (!scene_filtering && pixel_shader &&
+              !pixel_shader->GetSamplerBindingsAfterTranslation().empty()) {
+            fh1_native_executor_->CountEvent(normalized_color_mask ? "title_filtering_hud_draws"
+                                                                   : "title_filtering_depth_draws");
+          }
+          break;
+        }
+        verify_samplers_[0] = current_samplers_vertex_;
+        verify_samplers_[1] = current_samplers_pixel_;
+        sampler_verify_pending = true;
+      }
+      inputs.valid = false;
+    }
+    // A verified stage found its inputs unchanged too.
+    texture_inputs_generation_ += !sampler_verify_pending;
     uint32_t samplers_overflowed_count = 0;
+    uint32_t sampler_fetch_mask = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
@@ -5462,23 +5528,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       if (!i) {
         shader_samplers.reserve(shader_sampler_bindings.size());
-        // #528: the player's anisotropy and LOD bias are for the scene's
-        // textures. Depth-only passes (the sun's shadow maps, the depth
-        // pre-pass) and the HUD keep the title's filtering; post passes
-        // read render targets without mips, which never get either.
-        const bool scene_filtering =
-            !fh1_native_executor_ ||
-            (normalized_color_mask && !fh1_native_executor_->IsHudTarget());
-        const int32_t anisotropic_override =
-            scene_filtering ? REXCVAR_GET(anisotropic_override)
-                            : VulkanTextureCache::kNoSceneFiltering;
         if (!scene_filtering && j && !shader_sampler_bindings.empty()) {
           fh1_native_executor_->CountEvent(normalized_color_mask ? "title_filtering_hud_draws"
                                                                  : "title_filtering_depth_draws");
         }
-        const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
-        const bool fetch_key = REXCVAR_GET(gpu_sampler_fetch_key);
-        const bool fetch_key_verify = fetch_key && REXCVAR_GET(gpu_sampler_fetch_key_verify);
         for (size_t k = 0; k < shader_sampler_bindings.size(); ++k) {
           const VulkanShader::SamplerBinding& shader_sampler_binding = shader_sampler_bindings[k];
           SamplerCacheEntry& cached = sampler_cache[k];
@@ -5492,6 +5545,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             fetch = fetch_key_words;
           }
           if (draw_cost_.enabled) ++sampler_census_.slots;
+          sampler_fetch_mask |= UINT32_C(1) << (shader_sampler_binding.fetch_constant & 31);
           const uint32_t binding = shader_sampler_binding.fetch_constant |
                                    (uint32_t(shader_sampler_binding.mag_filter) << 8) |
                                    (uint32_t(shader_sampler_binding.min_filter) << 12) |
@@ -5587,6 +5641,29 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
     }
     if (!samplers_overflowed_count) {
+      if (sampler_verify_pending) {
+        auto same = [](const auto& a, const auto& b) {
+          if (a.size() != b.size()) return false;
+          for (size_t k = 0; k < a.size(); ++k) {
+            if (a[k].first.value != b[k].first.value || a[k].second != b[k].second) return false;
+          }
+          return true;
+        };
+        unchanged_census_.mismatches += !same(verify_samplers_[0], current_samplers_vertex_) ||
+                                        !same(verify_samplers_[1], current_samplers_pixel_);
+      }
+      if (!i) {
+        SamplerStageInputs& inputs = sampler_stage_inputs_;
+        inputs.vertex_shader = vertex_shader;
+        inputs.pixel_shader = pixel_shader;
+        inputs.submission = GetCurrentSubmission();
+        inputs.fetch_mask = sampler_fetch_mask;
+        inputs.anisotropic_override = anisotropic_override;
+        inputs.force_trilinear = force_trilinear;
+        inputs.fetch_key = fetch_key;
+        inputs.scene_filtering = scene_filtering;
+        inputs.valid = true;
+      }
       break;
     }
     assert_zero(i);
@@ -5609,7 +5686,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  texture_cache_->set_skip_unchanged_requests(unchanged_inputs, unchanged_verify);
+  const uint64_t texture_hits_before = texture_cache_->unchanged_request_hits();
   texture_cache_->RequestTextures(used_texture_mask);
+  texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
+  texture_section_skip_allowed_ = unchanged_inputs;
+  texture_section_verify_ = unchanged_verify;
   if (frame_dump_ && frame_dump_->recording()) {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
@@ -5656,7 +5738,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.normalized_color_mask = normalized_color_mask;
     fh1_draw.vertex_shader = vertex_shader;
     fh1_draw.pixel_shader = pixel_shader;
-    fh1_draw.state_epoch = state_epoch_;
+    fh1_draw.state_epoch = unchanged_inputs ? memo_state : state_epoch_;
+    fh1_draw.state_is_hash = unchanged_inputs;
     fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
@@ -9161,107 +9244,206 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // layout, image views and samplers is still alive and is reused.
   bool write_vertex_textures = texture_count_vertex || sampler_count_vertex;
   bool write_pixel_textures = texture_count_pixel || sampler_count_pixel;
-  descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
-  size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
-    for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_vertex_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
-  size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
-    for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_pixel_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
-
-  DrawCostMark(kCostImageInfos);
-  if (write_vertex_textures &&
-      ReuseTextureDescriptorSet(
-          false, texture_count_vertex, sampler_count_vertex,
-          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
-          descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
-          descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)) {
-    write_vertex_textures = false;
-  }
   // Pushed pixel textures: no set to allocate or write, only a push recorded
   // after the binds when the contents or the layout changed.
   const bool push_pixel_textures =
       write_pixel_textures && current_guest_graphics_pipeline_layout_->textures_pixel_pushed();
   bool pixel_textures_push_needed = false;
-  if (push_pixel_textures) {
-    write_pixel_textures = false;
-    const uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
-    const VkDescriptorSetLayout pixel_layout =
-        current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
-    const VkDescriptorImageInfo* pixel_textures =
-        descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
-    const VkDescriptorImageInfo* pixel_samplers =
-        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset;
-    LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
-    bool same = (current_graphics_descriptor_sets_bound_up_to_date_ & pixel_bit) &&
-                last.layout == pixel_layout && last.texture_count == texture_count_pixel &&
-                last.sampler_count == sampler_count_pixel;
-    for (uint32_t i = 0; same && i < texture_count_pixel + sampler_count_pixel; ++i) {
-      const VkDescriptorImageInfo& a = last.infos[i];
-      const VkDescriptorImageInfo& b =
-          i < texture_count_pixel ? pixel_textures[i] : pixel_samplers[i - texture_count_pixel];
-      same = a.sampler == b.sampler && a.imageView == b.imageView &&
-             a.imageLayout == b.imageLayout;
+  const VkDescriptorImageInfo* push_pixel_texture_infos = nullptr;
+  const VkDescriptorImageInfo* push_pixel_sampler_infos = nullptr;
+  size_t vertex_texture_image_info_offset = 0, vertex_sampler_image_info_offset = 0;
+  size_t pixel_texture_image_info_offset = 0, pixel_sampler_image_info_offset = 0;
+  // NL-3.2: with the same shaders, layout, frame, samplers and texture
+  // bindings as the last UpdateBindings, its image infos, and so its sets or
+  // its push, are this draw's.
+  const uint32_t pixel_set_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  TextureSectionInputs& section = texture_section_inputs_;
+  auto last_set_matches = [&](const LastTextureDescriptorSet& last, VkDescriptorSetLayout layout,
+                              uint32_t texture_count, uint32_t sampler_count, bool needs_set) {
+    return (!needs_set || (last.set != VK_NULL_HANDLE && last.frame == frame_current_)) &&
+           last.layout == layout && last.texture_count == texture_count &&
+           last.sampler_count == sampler_count &&
+           last.infos.size() == size_t(texture_count) + sampler_count;
+  };
+  const bool texture_section_unchanged =
+      texture_section_skip_allowed_ && !bindless && section.valid &&
+      section.vertex_shader == vertex_shader && section.pixel_shader == pixel_shader &&
+      section.layout == current_guest_graphics_pipeline_layout_ &&
+      section.frame == frame_current_ &&
+      section.texture_inputs_generation == texture_inputs_generation_ &&
+      (!write_vertex_textures ||
+       last_set_matches(
+           last_texture_descriptor_sets_[0],
+           current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+           texture_count_vertex, sampler_count_vertex, true)) &&
+      (!write_pixel_textures ||
+       last_set_matches(
+           push_pixel_textures ? last_pushed_pixel_textures_ : last_texture_descriptor_sets_[1],
+           current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
+           texture_count_pixel, sampler_count_pixel, !push_pixel_textures));
+  section.valid = false;
+  if (texture_section_unchanged && !texture_section_verify_) {
+    ++unchanged_census_.texture_sections;
+    // As ReuseTextureDescriptorSet and the push comparison find them.
+    auto reuse_set = [&](uint32_t set_index, VkDescriptorSet set) {
+      if (current_graphics_descriptor_sets_[set_index] != set) {
+        current_graphics_descriptor_sets_[set_index] = set;
+        current_graphics_descriptor_sets_bound_up_to_date_ &= ~(UINT32_C(1) << set_index);
+      }
+      current_graphics_descriptor_set_values_up_to_date_ |= UINT32_C(1) << set_index;
+    };
+    if (write_vertex_textures) {
+      reuse_set(SpirvShaderTranslator::kDescriptorSetTexturesVertex,
+                last_texture_descriptor_sets_[0].set);
+      write_vertex_textures = false;
     }
-    if (!same) {
-      pixel_textures_push_needed = true;
-      last.layout = pixel_layout;
-      last.texture_count = texture_count_pixel;
-      last.sampler_count = sampler_count_pixel;
-      last.infos.assign(pixel_textures, pixel_textures + texture_count_pixel);
-      last.infos.insert(last.infos.end(), pixel_samplers, pixel_samplers + sampler_count_pixel);
+    if (push_pixel_textures) {
+      const LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
+      pixel_textures_push_needed =
+          !(current_graphics_descriptor_sets_bound_up_to_date_ & pixel_set_bit);
+      push_pixel_texture_infos = last.infos.data();
+      push_pixel_sampler_infos = last.infos.data() + texture_count_pixel;
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+          VK_NULL_HANDLE;
+      current_graphics_descriptor_set_values_up_to_date_ |= pixel_set_bit;
+      write_pixel_textures = false;
+    } else if (write_pixel_textures) {
+      reuse_set(SpirvShaderTranslator::kDescriptorSetTexturesPixel,
+                last_texture_descriptor_sets_[1].set);
+      write_pixel_textures = false;
     }
-    // A later non-pushed layout must not take this slot as a bound set.
-    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
-        VK_NULL_HANDLE;
-    current_graphics_descriptor_set_values_up_to_date_ |= pixel_bit;
-  }
-  if (write_pixel_textures &&
-      ReuseTextureDescriptorSet(
-          true, texture_count_pixel, sampler_count_pixel,
-          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
-          descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
-          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset)) {
-    write_pixel_textures = false;
-  }
+    DrawCostMark(kCostImageInfos);
+  } else {
+    descriptor_write_image_info_.clear();
+    descriptor_write_image_info_.reserve(
+        (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+        (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+    vertex_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (write_vertex_textures && texture_count_vertex) {
+      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (write_vertex_textures && sampler_count_vertex) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_vertex_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+    pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (write_pixel_textures && texture_count_pixel) {
+      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (write_pixel_textures && sampler_count_pixel) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_pixel_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+    if (texture_section_unchanged) {
+      // Verify: the skip would have taken the last infos for these.
+      ++unchanged_census_.texture_sections;
+      auto same_infos = [&](const LastTextureDescriptorSet& last, size_t texture_offset,
+                            uint32_t texture_count, size_t sampler_offset,
+                            uint32_t sampler_count) {
+        const VkDescriptorImageInfo* infos = descriptor_write_image_info_.data();
+        for (uint32_t k = 0; k < texture_count + sampler_count; ++k) {
+          const VkDescriptorImageInfo& a = last.infos[k];
+          const VkDescriptorImageInfo& b = k < texture_count
+                                               ? infos[texture_offset + k]
+                                               : infos[sampler_offset + k - texture_count];
+          if (a.sampler != b.sampler || a.imageView != b.imageView ||
+              a.imageLayout != b.imageLayout) {
+            return false;
+          }
+        }
+        return true;
+      };
+      unchanged_census_.mismatches +=
+          (write_vertex_textures &&
+           !same_infos(last_texture_descriptor_sets_[0], vertex_texture_image_info_offset,
+                       texture_count_vertex, vertex_sampler_image_info_offset,
+                       sampler_count_vertex)) ||
+          (write_pixel_textures &&
+           !same_infos(push_pixel_textures ? last_pushed_pixel_textures_
+                                           : last_texture_descriptor_sets_[1],
+                       pixel_texture_image_info_offset, texture_count_pixel,
+                       pixel_sampler_image_info_offset, sampler_count_pixel));
+    }
 
+    DrawCostMark(kCostImageInfos);
+    if (write_vertex_textures &&
+        ReuseTextureDescriptorSet(
+            false, texture_count_vertex, sampler_count_vertex,
+            current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+            descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+            descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)) {
+      write_vertex_textures = false;
+    }
+    // Pushed pixel textures: no set to allocate or write, only a push recorded
+    // after the binds when the contents or the layout changed.
+    if (push_pixel_textures) {
+      write_pixel_textures = false;
+      const uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+      const VkDescriptorSetLayout pixel_layout =
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
+      const VkDescriptorImageInfo* pixel_textures =
+          descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
+      const VkDescriptorImageInfo* pixel_samplers =
+          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset;
+      push_pixel_texture_infos = pixel_textures;
+      push_pixel_sampler_infos = pixel_samplers;
+      LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
+      bool same = (current_graphics_descriptor_sets_bound_up_to_date_ & pixel_bit) &&
+                  last.layout == pixel_layout && last.texture_count == texture_count_pixel &&
+                  last.sampler_count == sampler_count_pixel;
+      for (uint32_t i = 0; same && i < texture_count_pixel + sampler_count_pixel; ++i) {
+        const VkDescriptorImageInfo& a = last.infos[i];
+        const VkDescriptorImageInfo& b =
+            i < texture_count_pixel ? pixel_textures[i] : pixel_samplers[i - texture_count_pixel];
+        same = a.sampler == b.sampler && a.imageView == b.imageView &&
+               a.imageLayout == b.imageLayout;
+      }
+      if (!same) {
+        pixel_textures_push_needed = true;
+        last.layout = pixel_layout;
+        last.texture_count = texture_count_pixel;
+        last.sampler_count = sampler_count_pixel;
+        last.infos.assign(pixel_textures, pixel_textures + texture_count_pixel);
+        last.infos.insert(last.infos.end(), pixel_samplers, pixel_samplers + sampler_count_pixel);
+      }
+      // A later non-pushed layout must not take this slot as a bound set.
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+          VK_NULL_HANDLE;
+      current_graphics_descriptor_set_values_up_to_date_ |= pixel_bit;
+    }
+    if (write_pixel_textures &&
+        ReuseTextureDescriptorSet(
+            true, texture_count_pixel, sampler_count_pixel,
+            current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
+            descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+            descriptor_write_image_info_.data() + pixel_sampler_image_info_offset)) {
+      write_pixel_textures = false;
+    }
+  }
   // Make sure new descriptor sets are bound to the command buffer.
   current_graphics_descriptor_sets_bound_up_to_date_ &=
       current_graphics_descriptor_set_values_up_to_date_;
@@ -9450,11 +9632,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       deferred_command_buffer_.CmdVkPushTextureDescriptorSet(
           current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
           SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_count_pixel,
-          sampler_count_pixel, descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
-          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset);
+          sampler_count_pixel, push_pixel_texture_infos, push_pixel_sampler_infos);
     }
     current_graphics_descriptor_sets_bound_up_to_date_ |=
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  }
+  if (!bindless) {
+    section.vertex_shader = vertex_shader;
+    section.pixel_shader = pixel_shader;
+    section.layout = current_guest_graphics_pipeline_layout_;
+    section.frame = frame_current_;
+    section.texture_inputs_generation = texture_inputs_generation_;
+    section.valid = true;
   }
   DrawCostMark(kCostDescriptorBinds);
   return true;

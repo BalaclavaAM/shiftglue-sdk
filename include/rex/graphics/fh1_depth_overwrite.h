@@ -34,6 +34,9 @@ struct Fh1DrawInfo {
   // The command processor's register state epoch (0: unknown), for reusing
   // derivations while it holds.
   uint64_t state_epoch = 0;
+  // NL-3.2: state_epoch is the register state hash, so derivations can be
+  // remembered per state rather than for the last one only.
+  bool state_is_hash = false;
 };
 
 class Fh1DepthOverwrite {

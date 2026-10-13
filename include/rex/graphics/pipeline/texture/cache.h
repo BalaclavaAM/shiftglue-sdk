@@ -119,6 +119,14 @@ class TextureCache {
     texture_bindings_in_sync_ &= ~mask;
   }
 
+  // Bindings not written since the last RequestTextures that derived them.
+  uint32_t texture_bindings_in_sync() const { return texture_bindings_in_sync_; }
+  uint64_t current_submission_index() const { return current_submission_index_; }
+  // Whether a texture may have become outdated since the last RequestTextures.
+  bool texture_may_have_become_outdated() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
+  }
+
   virtual void RequestTextures(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.
