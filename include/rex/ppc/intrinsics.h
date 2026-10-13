@@ -272,16 +272,24 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
 }
 
 // Vector Shift Right
+// Vector Shift Right - shift the whole 128-bit vector right by the low 3 bits
+// of vB's last byte (big-endian byte 15, host index 0), carrying across the
+// two 64-bit halves.
 inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b) {
-  b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
-  return simde_mm_castps_si128(simde_mm_insert_ps(
-      simde_mm_castsi128_ps(simde_mm_srl_epi64(a, b)),
-      simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
+  int shift = simde_mm_extract_epi8(b, 0) & 0x7;
+  if (shift == 0)
+    return a;
+  simde__m128i shifted = simde_mm_srli_epi64(a, shift);
+  // The high half's low bits move into the low half's high bits.
+  simde__m128i carry = simde_mm_srli_si128(simde_mm_slli_epi64(a, 64 - shift), 8);
+  return simde_mm_or_si128(shifted, carry);
 }
 
 // Vector Shift Left - shift entire 128-bit vector left by bits in low 3 bits of b
 inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
-  int shift = simde_mm_extract_epi8(b, 15) & 0x7;  // Get low 3 bits from byte 15 (BE: byte 0)
+  // The count is the low 3 bits of vB's last byte (big-endian byte 15, host
+  // index 0), as the hardware reads it when the bytes disagree.
+  int shift = simde_mm_extract_epi8(b, 0) & 0x7;
   if (shift == 0)
     return a;
 
@@ -323,6 +331,25 @@ inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
 #else
 #error "Unsupported architecture for simde_mm_vsl (only x86_64 and ARM64 supported)"
 #endif
+}
+
+// Vector Maximum / Minimum Floating Point with the AltiVec rules the SSE
+// min/max do not have: a NaN operand is the result (vA first), and between
+// zeros of either sign the maximum is +0 and the minimum is -0.
+inline simde__m128 simde_mm_vmaxfp(simde__m128 a, simde__m128 b) {
+  simde__m128 r = simde_mm_max_ps(a, b);
+  // Equal values (both zeros among them): the sign bit of the result is set
+  // only when both are negative, which the AND of the two gives.
+  r = simde_mm_blendv_ps(r, simde_mm_and_ps(a, b), simde_mm_cmpeq_ps(a, b));
+  r = simde_mm_blendv_ps(r, b, simde_mm_cmpunord_ps(b, b));
+  return simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
+}
+
+inline simde__m128 simde_mm_vminfp(simde__m128 a, simde__m128 b) {
+  simde__m128 r = simde_mm_min_ps(a, b);
+  r = simde_mm_blendv_ps(r, simde_mm_or_ps(a, b), simde_mm_cmpeq_ps(a, b));
+  r = simde_mm_blendv_ps(r, b, simde_mm_cmpunord_ps(b, b));
+  return simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
 }
 
 // Vector Shift Left by Octet - shift entire vector left by bytes in bits [121:124] of vB

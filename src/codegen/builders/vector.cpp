@@ -119,14 +119,21 @@ bool build_vnmsubfp(BuilderContext& ctx) {
 }
 
 bool build_vmaxfp(BuilderContext& ctx) {
+  // rex::ppc::simde_mm_vmaxfp: a NaN operand is the result and max(-0, +0) is +0.
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("max");
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, rex::ppc::simde_mm_vmaxfp(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("min");
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, rex::ppc::simde_mm_vminfp(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
   return true;
 }
 
@@ -140,8 +147,12 @@ bool build_vrefp(BuilderContext& ctx) {
 bool build_vrsqrtefp(BuilderContext& ctx) {
   // TODO: see if we can use rsqrt safely
   ctx.emit_set_flush_mode(true);
+  // A negative input gives the positive QNaN, as the hardware does.
   ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+      "simde_mm_blendv_ps(simde_mm_div_ps(simde_mm_set1_ps(1), "
+      "simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32))), "
+      "simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000)), "
+      "simde_mm_cmplt_ps(simde_mm_load_ps({vA}.f32), simde_mm_setzero_ps()))");
   return true;
 }
 
@@ -167,10 +178,16 @@ bool build_vexptefp(BuilderContext& ctx) {
   // Construct 2^n by adding n to the IEEE 754 exponent bias and shifting into place
   ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
   ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
+  ctx.println("\t\tsimde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));");
+  // Beyond the float exponent range the bias arithmetic wraps: 2^x is +inf
+  // from 128 up and, with denormals flushed, 0 below -126.
   ctx.println(
-      "\t\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits)));",
-      vD);
+      "\t\tr = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)), "
+      "simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));");
+  ctx.println(
+      "\t\tr = simde_mm_blendv_ps(r, simde_mm_setzero_ps(), "
+      "simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)));");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", vD);
   ctx.println("\t}}");
   return true;
 }
@@ -582,6 +599,12 @@ bool build_vcmpbfp(BuilderContext& ctx) {
       "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))))), "
       "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x40000000)))));",
       vD, vA, vB);
+  // A NaN in either operand sets both bits, as the hardware does.
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_load_ps({}.f32), "
+      "simde_mm_and_ps(simde_mm_cmpunord_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), "
+      "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0xC0000000))))));",
+      ctx.v_temp(), ctx.v_temp(), vA, vB);
   // result = gt_mask | lt_neg_mask
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_load_ps({}.f32), "
@@ -1609,6 +1632,28 @@ bool build_vavguw(BuilderContext& ctx) {
 
 bool build_vmaxuw(BuilderContext& ctx) {
   ctx.emit_vec_int_binary("max_epu32", "u32");
+  return true;
+}
+
+
+bool build_vpkpx(BuilderContext& ctx) {
+  // Vector Pack Pixel: each 32-bit pixel (bit 24 alpha, 8 bits each of red,
+  // green and blue) becomes a 1:5:5:5 halfword; vA's four fill the high half
+  // of vD, vB's the low half (the same operand order as the other packs).
+  auto pack = [](const std::string& v) {
+    return fmt::format(
+        "simde_mm_or_si128(simde_mm_or_si128("
+        "simde_mm_and_si128(simde_mm_srli_epi32(simde_mm_load_si128((simde__m128i*){0}.u32), 9), "
+        "simde_mm_set1_epi32(0xFC00)), "
+        "simde_mm_and_si128(simde_mm_srli_epi32(simde_mm_load_si128((simde__m128i*){0}.u32), 6), "
+        "simde_mm_set1_epi32(0x03E0))), "
+        "simde_mm_and_si128(simde_mm_srli_epi32(simde_mm_load_si128((simde__m128i*){0}.u32), 3), "
+        "simde_mm_set1_epi32(0x001F)))",
+        v);
+  };
+  ctx.println("	simde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32({}, {}));",
+              ctx.v(ctx.insn.operands[0]), pack(ctx.v(ctx.insn.operands[2])),
+              pack(ctx.v(ctx.insn.operands[1])));
   return true;
 }
 
