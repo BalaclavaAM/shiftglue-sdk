@@ -114,6 +114,13 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_argument_as_local"), "non_argument_as_local");
   MergeBool(cfg.nonVolatileRegistersAsLocalVariables, toml["non_volatile_as_local"].value_or(false),
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
+  MergeBool(cfg.nonVolatileFprsAsLocalVariables, toml["non_volatile_fprs_as_local"].value_or(true),
+            hasBool("non_volatile_fprs_as_local"), "non_volatile_fprs_as_local");
+  MergeBool(cfg.nonVolatileVectorsAsLocalVariables,
+            toml["non_volatile_vectors_as_local"].value_or(true),
+            hasBool("non_volatile_vectors_as_local"), "non_volatile_vectors_as_local");
+  MergeBool(cfg.nonVolatileReloadAfterCall, toml["non_volatile_reload_after_call"].value_or(false),
+            hasBool("non_volatile_reload_after_call"), "non_volatile_reload_after_call");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
   MergeBool(cfg.abiPoisonChecks, toml["abi_poison_checks"].value_or(false),

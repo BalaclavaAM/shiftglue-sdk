@@ -100,7 +100,18 @@ struct RecompilerConfig {
   bool skipMsr = false;
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
+  /// Keep the non-volatile registers a function uses in C++ locals, publishing
+  /// the written ones to ctx at every call and return. Correct on FH1, but its
+  /// hot threads spent 7-13 % more cycles per frame on x86-64 than with the
+  /// registers in ctx (Pinyon Shift NEXT_LEVEL_RESEARCH.md NL-1.4), so off.
   bool nonVolatileRegistersAsLocalVariables = false;
+  /// With non_volatile_as_local: also the FPRs f14-f31 and the VRs v14-v31,
+  /// v64-v127 (both on by default; off keeps that class in ctx).
+  bool nonVolatileFprsAsLocalVariables = true;
+  bool nonVolatileVectorsAsLocalVariables = true;
+  /// With non_volatile_as_local: read the locals back from ctx after every
+  /// call (a callee that leaves a changed value in one is then seen).
+  bool nonVolatileReloadAfterCall = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
   /// Emit a resume switch at every function entry and register every linked-call
   /// return address, so the runtime can re-enter a function at a return address

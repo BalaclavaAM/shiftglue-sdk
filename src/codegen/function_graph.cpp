@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cstring>
 #include <optional>
+#include <set>
 #include <cctype>
 #include <string_view>
 #include <unordered_map>
@@ -519,7 +520,8 @@ std::string PropagateFlushMode(const std::string& body) {
 // ctx.cr2-cr4 come back unchanged, and the volatile fields are dead. Hooks,
 // the setjmp copy, longjmp and exceptions keep the full synchronization.
 std::string SyncLocalCrRegisters(const std::string& body, const std::string& spill,
-                                 const std::string& spill_nv, const std::string& reload) {
+                                 const std::string& spill_nv, const std::string& reload,
+                                 const std::string& reload_after_call = {}) {
   auto contains = [](std::string_view line, std::string_view what) {
     return line.find(what) != std::string_view::npos;
   };
@@ -590,11 +592,78 @@ std::string SyncLocalCrRegisters(const std::string& body, const std::string& spi
         out += '\n';
       }
       emit(line);
+      if (calls && !leaves && !reload_after_call.empty()) {
+        out += reload_after_call;
+        out += '\n';
+      }
       continue;
     }
     emit(line);
   }
   return out;
+}
+
+// The non-volatile register locals (r14-r31, f14-f31, v14-v31, v64-v127) a
+// function body assigns: `rN.u64 = `, `vN.u8[i] = `, or a vector store whose
+// destination is the local (`simde_mm_store_*((...*)vN.`).
+std::vector<std::string> WrittenLocalRegisters(const std::string& body) {
+  std::set<std::string> written;
+  auto isNonVolatile = [](char kind, unsigned index) {
+    if (kind == 'r' || kind == 'f')
+      return index >= 14 && index < 32;
+    return (index >= 14 && index < 32) || (index >= 64 && index < 128);
+  };
+  auto parseRegister = [&](std::string_view text, size_t at, std::string& out) {
+    if (at >= text.size())
+      return false;
+    char kind = text[at];
+    if (kind != 'r' && kind != 'f' && kind != 'v')
+      return false;
+    size_t q = at + 1;
+    while (q < text.size() && std::isdigit(static_cast<unsigned char>(text[q])))
+      q++;
+    if (q == at + 1 || q >= text.size() || (text[q] != '.' && text[q] != '[' && text[q] != ' '))
+      return false;
+    unsigned index = static_cast<unsigned>(std::stoul(std::string(text.substr(at + 1, q - at - 1))));
+    if (!isNonVolatile(kind, index))
+      return false;
+    out = std::string(text.substr(at, q - at));
+    return true;
+  };
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos)
+      end = body.size();
+    std::string_view line(body.data() + pos, end - pos);
+    pos = end + 1;
+    size_t first = line.find_first_not_of('\t');
+    if (first == std::string_view::npos)
+      continue;
+    std::string_view code = line.substr(first);
+    if (code.ends_with("// nv-helper"))
+      continue;  // an inlined save or restore: the local only gets its entry value back
+    std::string reg;
+    if (code.starts_with("simde_mm_store")) {
+      size_t open = code.find('(');
+      size_t comma = code.find(',');
+      if (open != std::string_view::npos && comma != std::string_view::npos) {
+        // the destination operand ends at the first comma: `(...*)vN.` or `vN.`
+        size_t cast = code.rfind(')', comma);
+        size_t start = (cast != std::string_view::npos && cast > open) ? cast + 1 : open + 1;
+        if (parseRegister(code, start, reg))
+          written.insert(reg);
+      }
+      continue;
+    }
+    if (!parseRegister(code, 0, reg))
+      continue;
+    size_t eq = code.find(" = ");
+    size_t paren = code.find('(');
+    if (eq != std::string_view::npos && (paren == std::string_view::npos || eq < paren))
+      written.insert(reg);
+  }
+  return std::vector<std::string>(written.begin(), written.end());
 }
 
 }  // namespace
@@ -798,7 +867,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     auto it = knownRegs.find(reg);
     return it == knownRegs.end() ? std::nullopt : std::optional<uint32_t>(it->second);
   };
-  auto tryFoldRodataLoad = [&](const ppc_insn& insn, uint32_t address, std::string& out) -> bool {
+  auto tryFoldRodataLoad = [&](const ppc_insn& insn, uint32_t address, std::string& out,
+                               BuilderContext& regs) -> bool {
     uint32_t size = 0;
     switch (insn.opcode->id) {
       case PPC_INST_LFS: case PPC_INST_LWZ: case PPC_INST_LWA: size = 4; break;
@@ -826,32 +896,32 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         double d = double(f);
         uint64_t dbits;
         std::memcpy(&dbits, &d, sizeof dbits);
-        emit_println(out, "\tctx.f{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", regs.f(insn.operands[0]),
                      dbits, target);
         break;
       }
       case PPC_INST_LFD:
-        emit_println(out, "\tctx.f{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", regs.f(insn.operands[0]),
                      load_and_swap<uint64_t>(bytes), target);
         break;
       case PPC_INST_LD:
-        emit_println(out, "\tctx.r{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", regs.r(insn.operands[0]),
                      load_and_swap<uint64_t>(bytes), target);
         break;
       case PPC_INST_LWZ:
-        emit_println(out, "\tctx.r{}.u64 = 0x{:08X}u;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:08X}u;  // folded 0x{:08X}", regs.r(insn.operands[0]),
                      load_and_swap<uint32_t>(bytes), target);
         break;
       case PPC_INST_LWA:
-        emit_println(out, "\tctx.r{}.s64 = int32_t(0x{:08X}u);  // folded 0x{:08X}",
-                     insn.operands[0], load_and_swap<uint32_t>(bytes), target);
+        emit_println(out, "\t{}.s64 = int32_t(0x{:08X}u);  // folded 0x{:08X}",
+                     regs.r(insn.operands[0]), load_and_swap<uint32_t>(bytes), target);
         break;
       case PPC_INST_LHZ:
-        emit_println(out, "\tctx.r{}.u64 = 0x{:04X}u;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:04X}u;  // folded 0x{:08X}", regs.r(insn.operands[0]),
                      load_and_swap<uint16_t>(bytes), target);
         break;
       case PPC_INST_LBZ:
-        emit_println(out, "\tctx.r{}.u64 = 0x{:02X}u;  // folded 0x{:08X}", insn.operands[0],
+        emit_println(out, "\t{}.u64 = 0x{:02X}u;  // folded 0x{:08X}", regs.r(insn.operands[0]),
                      bytes[0], target);
         break;
       default:
@@ -1043,7 +1113,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         }
 
         const size_t bodyBefore = body.size();
-        bool folded = ctx.config.foldRodataLoads && tryFoldRodataLoad(insn, blockBase, body);
+        bool folded = ctx.config.foldRodataLoads && tryFoldRodataLoad(insn, blockBase, body, builderCtx);
         if (!folded && !DispatchInstruction(id, builderCtx)) {
           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
           allRecompiled = false;
@@ -1138,10 +1208,19 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   body = PropagateFlushMode(body);
 
   // CR fields kept in locals are synchronized with ctx at every boundary.
+  // Non-volatile GPR, FPR and VR locals (non_volatile_as_local) join the full
+  // synchronization (a hook given ctx, the setjmp copy, longjmp and the SEH
+  // catch block), and the ones the function writes are published at calls
+  // and returns below.
   bool anyCrLocal = false;
   for (size_t i = 0; i < 8; i++)
     anyCrLocal |= localVariables.cr[i];
-  if (anyCrLocal) {
+  bool anyNvLocal = false;
+  for (size_t i = 14; i < 32; i++)
+    anyNvLocal |= localVariables.r[i] || localVariables.f[i] || localVariables.v[i];
+  for (size_t i = 64; i < 128; i++)
+    anyNvLocal |= localVariables.v[i];
+  if (anyCrLocal || anyNvLocal) {
     std::string spill = "\t";
     std::string spill_nv;
     std::string reload = "\t";
@@ -1154,10 +1233,57 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         spill_nv += fmt::format("ctx.cr{0} = cr{0}; ", i);
       }
     }
+    for (size_t i = 14; i < 32; i++) {
+      if (localVariables.r[i]) {
+        spill += fmt::format("ctx.r{0} = r{0}; ", i);
+        reload += fmt::format("r{0} = ctx.r{0}; ", i);
+      }
+      if (localVariables.f[i]) {
+        spill += fmt::format("ctx.f{0} = f{0}; ", i);
+        reload += fmt::format("f{0} = ctx.f{0}; ", i);
+      }
+    }
+    for (size_t i = 14; i < 128; i++) {
+      if (i >= 32 && i < 64)
+        continue;
+      if (localVariables.v[i]) {
+        spill += fmt::format("ctx.v{0} = v{0}; ", i);
+        reload += fmt::format("v{0} = ctx.v{0}; ", i);
+      }
+    }
+    // The non-volatile locals this function writes are published before every
+    // call, tail call and return, so ctx holds the register file at every
+    // function boundary: a callee may read any register through ctx (its own
+    // entry loads, a share_registers function, a host hook), and after the
+    // inlined restore the publish at return hands the caller its values back.
+    // Locals the function never writes keep their entry value, which ctx still
+    // holds, since every callee restores what it publishes.
+    for (const std::string& reg : WrittenLocalRegisters(body)) {
+      spill_nv += fmt::format("ctx.{0} = {0}; ", reg);
+    }
     if (!spill_nv.empty()) {
       spill_nv = "\t" + spill_nv;
     }
-    body = SyncLocalCrRegisters(body, spill, spill_nv, reload);
+    // Optionally the non-volatile locals are read back from ctx after every
+    // call, so a callee that leaves a changed value in one (hand-written code)
+    // is seen as it would be on the console. Off by default: FH1's race and
+    // boot run without it, and it costs a load per local per call.
+    std::string reload_nv;
+    for (size_t i = 14; ctx.config.nonVolatileReloadAfterCall && i < 32; i++) {
+      if (localVariables.r[i])
+        reload_nv += fmt::format("r{0} = ctx.r{0}; ", i);
+      if (localVariables.f[i])
+        reload_nv += fmt::format("f{0} = ctx.f{0}; ", i);
+    }
+    for (size_t i = 14; ctx.config.nonVolatileReloadAfterCall && i < 128; i++) {
+      if ((i >= 32 && i < 64) || !localVariables.v[i])
+        continue;
+      reload_nv += fmt::format("v{0} = ctx.v{0}; ", i);
+    }
+    if (!reload_nv.empty()) {
+      reload_nv = "\t" + reload_nv;
+    }
+    body = SyncLocalCrRegisters(body, spill, spill_nv, reload, reload_nv);
   }
 
   // --- Emit local variable declarations, then body ---
@@ -1173,18 +1299,36 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       emit_println(out, "\tPPCCRRegister cr{0} = ctx.cr{0};", i);
   }
 
+  // A non-volatile local starts as the register's value in ctx, so until the
+  // function writes it the local holds what the caller left there, exactly as
+  // the register would: a function that reads one before writing it still
+  // works, and the locals a function publishes before calling a
+  // share_registers function are always the right values. A non-argument
+  // volatile local is dead on entry and starts at zero.
   for (size_t i = 0; i < 32; i++) {
-    if (localVariables.r[i])
+    if (!localVariables.r[i])
+      continue;
+    if (i >= 14)
+      emit_println(out, "\tPPCRegister r{0} = ctx.r{0};", i);
+    else
       emit_println(out, "\tPPCRegister r{}{{}};", i);
   }
 
   for (size_t i = 0; i < 32; i++) {
-    if (localVariables.f[i])
+    if (!localVariables.f[i])
+      continue;
+    if (i >= 14)
+      emit_println(out, "\tPPCRegister f{0} = ctx.f{0};", i);
+    else
       emit_println(out, "\tPPCRegister f{}{{}};", i);
   }
 
   for (size_t i = 0; i < 128; i++) {
-    if (localVariables.v[i])
+    if (!localVariables.v[i])
+      continue;
+    if ((i >= 14 && i < 32) || i >= 64)
+      emit_println(out, "\tPPCVRegister v{0} = ctx.v{0};", i);
+    else
       emit_println(out, "\tPPCVRegister v{}{{}};", i);
   }
 

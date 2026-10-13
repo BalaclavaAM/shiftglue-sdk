@@ -113,6 +113,17 @@ struct BuilderContext {
    * False when the function shares registers with an intra-function bl partner.
    */
   bool localizeNonVolatiles() const;
+  /// `__savegprlr_N`, `__restfpr_N` and the other register save/restore helpers.
+  static bool isSaveRestoreHelper(std::string_view name);
+  /// Write the localized non-volatile GPRs, FPRs and VRs referenced so far to
+  /// ctx (before a call into a function that reads them through ctx), and read
+  /// them back (after it returns).
+  void publishLocalNonVolatiles(std::string_view indent);
+  void reloadLocalNonVolatiles(std::string_view indent);
+  /// Emit a save/restore helper's body with this function's locals in place of
+  /// the registers it stores or loads (`return;` after it when tail-called).
+  void inlineSaveRestoreHelper(const rex::codegen::FunctionNode& helper, std::string_view indent,
+                               bool tail);
 
   /**
    * @brief Get expression for general-purpose register access.

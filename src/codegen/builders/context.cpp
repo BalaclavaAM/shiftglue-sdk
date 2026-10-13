@@ -13,6 +13,10 @@
 #include "helpers.h"
 
 #include <algorithm>
+#include <cctype>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
@@ -45,7 +49,134 @@ const FunctionGraph& BuilderContext::graph() const {
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  // The save/restore helpers read and write the caller's registers through
+  // ctx for the share_registers functions that still call them; a localized
+  // caller inlines their bodies on its locals instead.
+  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters() &&
+         !isSaveRestoreHelper(fn.name());
+}
+
+bool BuilderContext::isSaveRestoreHelper(std::string_view name) {
+  return name.find("__rest") == 0 || name.find("__save") == 0;
+}
+
+void BuilderContext::publishLocalNonVolatiles(std::string_view indent) {
+  for (size_t i = 14; i < 32; ++i) {
+    if (locals.r[i])
+      println("{}ctx.r{} = r{};", indent, i, i);
+    if (locals.f[i])
+      println("{}ctx.f{} = f{};", indent, i, i);
+  }
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64)
+      continue;
+    if (locals.v[i])
+      println("{}ctx.v{} = v{};", indent, i, i);
+  }
+}
+
+// A localized function keeps the registers a save/restore helper would store
+// or load in locals the helper cannot see, so the helper's body is inlined
+// with the caller's locals in place of ctx: the frame holds exactly what the
+// guest code expects, and the restore leaves the locals at their entry values
+// for the publish at return. The helper's own generated body is the source,
+// rendered once and cached, so every helper variant is covered.
+void BuilderContext::inlineSaveRestoreHelper(const rex::codegen::FunctionNode& helper,
+                                             std::string_view indent, bool tail) {
+  static std::mutex cacheMutex;
+  static std::unordered_map<std::string, std::vector<std::string>> cache;
+  std::vector<std::string> lines;
+  {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto it = cache.find(helper.name());
+    if (it == cache.end()) {
+      rex::codegen::EmitContext sub = emitCtx;
+      sub.referenced = nullptr;
+      const std::string body = helper.emitCpp(sub);
+      size_t pos = 0;
+      while (pos < body.size()) {
+        size_t end = body.find('\n', pos);
+        if (end == std::string::npos)
+          end = body.size();
+        std::string_view line(body.data() + pos, end - pos);
+        pos = end + 1;
+        size_t first = line.find_first_not_of('\t');
+        if (first == std::string_view::npos)
+          continue;
+        std::string_view code = line.substr(first);
+        if (code.starts_with("//") || code.starts_with("DEFINE_REX_FUNC") ||
+            code.starts_with("REX_FUNC_PROLOGUE") || code.starts_with("REX_PROBE_CALL") ||
+            code.starts_with("REX_PROBE_INDIRECT") || code == "}" || code == "return;" ||
+            code.starts_with("PPC") || code.starts_with("uint32_t ea"))
+          continue;
+        lines.emplace_back(code);
+      }
+      it = cache.emplace(helper.name(), std::move(lines)).first;
+    }
+    lines = it->second;
+  }
+  for (const std::string& line : lines) {
+    std::string rewritten;
+    size_t pos = 0;
+    while (pos < line.size()) {
+      size_t at = line.find("ctx.", pos);
+      if (at == std::string::npos) {
+        rewritten.append(line, pos, std::string::npos);
+        break;
+      }
+      rewritten.append(line, pos, at - pos);
+      size_t p = at + 4;
+      char kind = p < line.size() ? line[p] : 0;
+      size_t q = p + 1;
+      while (q < line.size() && std::isdigit(static_cast<unsigned char>(line[q])))
+        q++;
+      if ((kind == 'r' || kind == 'f' || kind == 'v') && q > p + 1 &&
+          (q == line.size() || !std::isalnum(static_cast<unsigned char>(line[q])))) {
+        size_t index = std::stoul(std::string(line.substr(p + 1, q - p - 1)));
+        std::string name;
+        if (kind == 'r' && index >= 14)
+          name = r(index);
+        else if (kind == 'f' && index >= 14)
+          name = f(index);
+        else if (kind == 'v' && ((index >= 14 && index < 32) || index >= 64))
+          name = v(index);
+        if (!name.empty()) {
+          rewritten += name;
+          pos = q;
+          continue;
+        }
+      }
+      rewritten.append("ctx.");
+      pos = at + 4;
+    }
+    if (rewritten.find("ea") != std::string::npos)
+      (void)ea();
+    if (rewritten.find("temp") != std::string::npos)
+      (void)temp();
+    // The marker tells the publish pass that a local written here only takes
+    // its entry value back (a restore), which ctx still holds.
+    if (rewritten.starts_with("ctx.fpscr."))
+      println("{}{}", indent, rewritten);  // the flush-mode pass matches these lines exactly
+    else
+      println("{}{}  // nv-helper", indent, rewritten);
+  }
+  if (tail)
+    println("{}return;", indent);
+}
+
+void BuilderContext::reloadLocalNonVolatiles(std::string_view indent) {
+  for (size_t i = 14; i < 32; ++i) {
+    if (locals.r[i])
+      println("{}r{} = ctx.r{};", indent, i, i);
+    if (locals.f[i])
+      println("{}f{} = ctx.f{};", indent, i, i);
+  }
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64)
+      continue;
+    if (locals.v[i])
+      println("{}v{} = ctx.v{};", indent, i, i);
+  }
 }
 
 std::string BuilderContext::r(size_t index) {
@@ -62,7 +193,7 @@ std::string BuilderContext::r(size_t index) {
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
   if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
-      (localizeNonVolatiles() && index >= 14)) {
+      (localizeNonVolatiles() && cfg.nonVolatileFprsAsLocalVariables && index >= 14)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -72,7 +203,8 @@ std::string BuilderContext::f(size_t index) {
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
   if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
-      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+      (localizeNonVolatiles() && cfg.nonVolatileVectorsAsLocalVariables &&
+       ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
@@ -214,31 +346,25 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // function (cfg.directCallsBypassThunk), so Clang can inline it.
       const std::string callee = calleeSymbol(*targetFn);
 
-      // Handle save/restore helpers. Gated on the global setting, not this
-      // function's: the helper bodies are emitted under it too, so once they
-      // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        // print nothing - these are handled by local variable tracking
+      // A localized function keeps its non-volatiles in locals the helper
+      // cannot see, so the helper's body is inlined on them. A share_registers
+      // function works in ctx and keeps the call (the helper bodies are never
+      // localized).
+      if (localizeNonVolatiles() && isSaveRestoreHelper(name)) {
+        inlineSaveRestoreHelper(*targetFn, "\t", false);
         return;
       }
 
       // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
-      // the owner left live, so hand it the localized copies through ctx and take
-      // them back afterwards. Only registers already localized here can be live at
-      // this point, so that set is the whole live-in the funclet can see.
+      // the owner left live, and a share_registers function reads the caller's
+      // registers through ctx, so hand them the localized copies and take them
+      // back afterwards. Only registers already localized here can be live at
+      // this point, so that set is the whole live-in the callee can see.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
-        }
+        publishLocalNonVolatiles("\t");
         emitCtx.reference(name);
         println("\t{}(ctx, base);", callee);
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
-        }
+        reloadLocalNonVolatiles("\t");
         return;
       }
 
@@ -320,19 +446,15 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       // The strong `__imp__` definition when the host does not override the
       // function (cfg.directCallsBypassThunk), so Clang can inline it.
       const std::string callee = calleeSymbol(*targetFn);
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        println("{}return;", indent);
+      if (localizeNonVolatiles() && isSaveRestoreHelper(name)) {
+        inlineSaveRestoreHelper(*targetFn, indent, true);
         return;
       }
       // A tail branch never comes back to this frame. Publish localized
-      // non-volatiles before entering a shared-register SEH funclet, but do not
+      // non-volatiles before entering a shared-register function, but do not
       // emit the normal post-call reload sequence.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("{}ctx.r{} = r{};", indent, i, i);
-        }
+        publishLocalNonVolatiles(indent);
       }
       emitCtx.reference(name);
       println("{}REX_TAIL_CALL({});", indent, callee);
