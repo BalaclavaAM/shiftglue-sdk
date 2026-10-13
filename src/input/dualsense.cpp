@@ -257,6 +257,21 @@ void TriggerModel::Reset() {
 // cleanly in second, 4-12 spinning in first, -2.75 locking the fronts.
 constexpr float kPastPeakSlip = 1.0f;
 
+bool TriggerModel::SpinBuzz(float slip, double dt_s) {
+  // On past the tyre's peak, off once it is clearly back in grip, and never
+  // for less than a quarter of a second.
+  if (!spin_buzzing_ && slip > kPastPeakSlip) {
+    spin_buzzing_ = true;
+    spin_hold_s_ = 0.25;
+  } else if (spin_buzzing_) {
+    spin_hold_s_ = std::max(0.0, spin_hold_s_ - dt_s);
+    if (spin_hold_s_ <= 0.0 && slip < 0.7f * kPastPeakSlip) {
+      spin_buzzing_ = false;
+    }
+  }
+  return spin_buzzing_;
+}
+
 TriggerEffects TriggerModel::Step(const TriggerInputs& inputs, const TriggerSettings& settings,
                                   double dt_s) {
   TriggerEffects out;
@@ -317,10 +332,12 @@ TriggerEffects TriggerModel::Step(const TriggerInputs& inputs, const TriggerSett
     if (click_left_s_ > 0.0) {
       click_left_s_ -= dt_s;
       out.right = Bow(4, 6, Level(1.0f, scale), Level(1.0f, scale));
-    } else if (throttle > 0.1f && slip_ > kPastPeakSlip) {
+    } else if (SpinBuzz(throttle > 0.1f ? slip_ : 0.0f, dt_s)) {
+      // A faint, steady buzz. Loud ones (high amplitude) read as noise, and
+      // slow ones (under about 30 Hz) as separate clicks; switching on and
+      // off at the threshold clicks too, hence the hysteresis and hold.
       const float t = std::clamp((slip_ - kPastPeakSlip) / 3.0f, 0.0f, 1.0f);
-      const int frequency = 10 + 5 * int(std::lround(t * 9.0f));
-      out.right = Vibration(3, Level(0.4f + 0.6f * t, scale), frequency);
+      out.right = Vibration(3, Level(0.05f + 0.15f * t, scale), 40);
     } else {
       out.right = spring;
     }
@@ -330,7 +347,7 @@ TriggerEffects TriggerModel::Step(const TriggerInputs& inputs, const TriggerSett
     throttle_buzz_ = Smooth(throttle_buzz_, buzz, dt_s);
     throttle_buzzing_ = throttle_buzz_ > (throttle_buzzing_ ? 0.3f : 0.4f);
     out.right = throttle_buzzing_
-                    ? Vibration(3, Level((throttle_buzz_ - 0.3f) / 0.7f, scale), 30)
+                    ? Vibration(3, Level(0.05f + 0.15f * (throttle_buzz_ - 0.3f) / 0.7f, scale), 40)
                     : spring;
   }
   return out;

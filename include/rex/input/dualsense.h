@@ -179,6 +179,10 @@ class TriggerModel {
   int last_gear_ = 0;
   double click_left_s_ = 0.0;
   double abs_hold_s_ = 0.0;
+  bool spin_buzzing_ = false;
+  double spin_hold_s_ = 0.0;
+
+  bool SpinBuzz(float slip, double dt_s);
 };
 
 struct Rgb {

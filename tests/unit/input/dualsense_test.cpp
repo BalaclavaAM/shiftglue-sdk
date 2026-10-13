@@ -197,6 +197,10 @@ TEST_CASE("Telemetry drives ABS, wheelspin and the gear click", "[input][dualsen
   CHECK(ds::ReportedFamily(effects.left) == 1);
   CHECK(ds::ReportedFamily(effects.right) == 3);  // wheelspin buzz
 
+  // Slip dipping just under the peak keeps the buzz (no on-off clicking).
+  car.rear_slip = 0.9f;
+  for (int i = 0; i < 60; ++i) effects = model.Step(inputs, settings, 1.0 / 60.0);
+  CHECK(ds::ReportedFamily(effects.right) == 3);
   car.rear_slip = 0.0f;
   for (int i = 0; i < 60; ++i) effects = model.Step(inputs, settings, 1.0 / 60.0);
   CHECK(ds::ReportedFamily(effects.right) == 1);  // spring
