@@ -568,6 +568,7 @@ bool build_vaddcuw(BuilderContext& ctx);
 bool build_vsubcuw(BuilderContext& ctx);
 bool build_vavguw(BuilderContext& ctx);
 bool build_vmaxuw(BuilderContext& ctx);
+bool build_vpkpx(BuilderContext& ctx);
 bool build_vrlw(BuilderContext& ctx);
 
 // Vector splat

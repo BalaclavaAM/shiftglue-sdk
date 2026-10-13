@@ -105,11 +105,6 @@ mfvscr.test_1  # not implemented: VSCR is not modelled (no FH1 use)
 mfvscr.test_mtvscr_1  # not implemented: VSCR is not modelled (no FH1 use)
 stwcx.test_fail  # a store-conditional without a reservation succeeds here; the title never relies on the failure
 stwcx.test_stdcx_fail  # a store-conditional without a reservation succeeds here; the title never relies on the failure
-vpkpx.test_1  # not implemented: pixel pack (no FH1 use)
-vpkpx.test_2  # not implemented: pixel pack (no FH1 use)
-vpkpx.test_3  # not implemented: pixel pack (no FH1 use)
-vpkpx.test_4  # not implemented: pixel pack (no FH1 use)
-vpkpx.test_5  # not implemented: pixel pack (no FH1 use)
 vrsqrtefp.test_1  # hardware returns a 12-bit estimate; the recompiler returns the exact value
 vrsqrtefp.test_2  # hardware returns a 12-bit estimate; the recompiler returns the exact value
 vrsqrtefp.test_3  # hardware returns a 12-bit estimate; the recompiler returns the exact value

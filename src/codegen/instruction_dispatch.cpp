@@ -603,6 +603,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_VSUBCUW, build_vsubcuw},
       {PPC_INST_VAVGUW, build_vavguw},
       {PPC_INST_VMAXUW, build_vmaxuw},
+      {PPC_INST_VPKPX, build_vpkpx},
 
       //=====================================================================
       // Vector - Splat
