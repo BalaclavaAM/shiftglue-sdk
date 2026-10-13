@@ -58,6 +58,16 @@ REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, true, "GPU/Vulkan",
                     "shader instead of a buffer-to-image copy, which NVIDIA runs on the copy "
                     "engine serialized with the frame")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// A low-spec setting (#515): the host image of a mipmapped texture larger
+// than this starts at the first guest level that fits, so its larger
+// levels take no video memory and are never uploaded. Shaders address
+// textures in normalized coordinates (unnormalized fetches are divided by
+// the guest size), so a smaller image samples the same, only blurrier.
+REXCVAR_DEFINE_UINT32(vulkan_texture_max_size, 0, "GPU/Vulkan",
+                      "Largest width or height of a mipmapped texture's top level; "
+                      "larger ones drop their top levels (0: no limit, otherwise at "
+                      "least 64)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
                     "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
                     "device without them, to measure that path where BC is supported")
@@ -1621,10 +1631,30 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
   }
 }
 
+uint32_t VulkanTextureCache::GetTextureLevelsToSkip(const TextureKey& key) {
+  uint32_t max_size = REXCVAR_GET(vulkan_texture_max_size);
+  // Resolve output (scaled or loaded from guest memory) has no mips, and 3D
+  // textures would also halve their depth.
+  if (!max_size || !key.mip_max_level || key.scaled_resolve ||
+      key.dimension == xenos::DataDimension::k3D) {
+    return 0;
+  }
+  // At least 64 so the new top level is above the packed mip tail, which
+  // holds the levels of 16 texels and less.
+  max_size = std::max(max_size, UINT32_C(64));
+  const uint32_t size = std::max(key.GetWidth(), key.GetHeight());
+  uint32_t skip = 0;
+  while (skip < key.mip_max_level && (size >> skip) > max_size) {
+    ++skip;
+  }
+  return skip;
+}
+
 VkResult VulkanTextureCache::CreateTextureImageForKey(TextureKey key, uint32_t scale_log2,
                                                       uint32_t levels, VkImage& image,
                                                       VmaAllocation& allocation,
-                                                      uint32_t& copy_words_out) {
+                                                      uint32_t& copy_words_out,
+                                                      uint32_t skip_levels) {
   copy_words_out = 0;
   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   const HostFormatPair& host_format = GetHostFormatPair(key);
@@ -1682,6 +1712,10 @@ VkResult VulkanTextureCache::CreateTextureImageForKey(TextureKey key, uint32_t s
   // A texture replacement 2, 4 or 8 times the guest size.
   image_create_info.extent.width <<= scale_log2;
   image_create_info.extent.height <<= scale_log2;
+  image_create_info.extent.width =
+      std::max(image_create_info.extent.width >> skip_levels, UINT32_C(1));
+  image_create_info.extent.height =
+      std::max(image_create_info.extent.height >> skip_levels, UINT32_C(1));
   image_create_info.extent.depth = is_3d ? depth_or_array_size : 1;
   image_create_info.mipLevels = levels;
   image_create_info.arrayLayers = is_3d ? 1 : depth_or_array_size;
@@ -1762,12 +1796,14 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   VkImage image;
   VmaAllocation allocation;
   uint32_t copy_words = 0;
-  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1, image, allocation, copy_words) !=
-      VK_SUCCESS) {
+  const uint32_t skip_levels = GetTextureLevelsToSkip(key);
+  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1 - skip_levels, image, allocation,
+                               copy_words, skip_levels) != VK_SUCCESS) {
     return nullptr;
   }
   auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
   texture->set_copy_words(copy_words);
+  texture->set_skipped_levels(skip_levels);
   return texture;
 }
 
@@ -1801,6 +1837,7 @@ void VulkanTextureCache::VulkanTexture::SwapImage(VkImage image, VmaAllocation a
   usage_ = Usage::kUndefined;
   replacement_scale_log2_ = scale_log2;
   replacement_levels_ = scale_log2 ? levels : 0;
+  skipped_levels_ = 0;
   VmaAllocationInfo allocation_info;
   vmaGetAllocationInfo(cache.vma_allocator_, allocation_, &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
@@ -1827,11 +1864,13 @@ void VulkanTextureCache::UseGuestImage(VulkanTexture& texture) {
   VkImage image;
   VmaAllocation allocation;
   uint32_t copy_words = 0;
-  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1, image, allocation, copy_words) !=
-      VK_SUCCESS) {
+  const uint32_t skip_levels = GetTextureLevelsToSkip(key);
+  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1 - skip_levels, image, allocation,
+                               copy_words, skip_levels) != VK_SUCCESS) {
     return;
   }
   texture.SwapImage(image, allocation, copy_words, 0, 0);
+  texture.set_skipped_levels(skip_levels);
   OnTextureImageSwitched(texture);
 }
 
@@ -1894,10 +1933,10 @@ bool VulkanTextureCache::TryLoadTextureReplacement(VulkanTexture& texture) {
   }
   const texture_replacement::Format& format = *lookup.format;
   const texture_replacement::Image& image = *lookup.image;
-  if (!lookup.scale_log2) {
+  if (!lookup.scale_log2 && !texture.skipped_levels()) {
     UseGuestImage(texture);
   } else if (texture.replacement_scale_log2() != lookup.scale_log2 ||
-             texture.replacement_levels() != lookup.levels) {
+             texture.replacement_levels() != lookup.levels || texture.skipped_levels()) {
     VkImage replacement_image;
     VmaAllocation replacement_allocation;
     uint32_t copy_words = 0;
@@ -2176,6 +2215,17 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   uint32_t bytes_per_block = guest_format_info->bytes_per_block();
   uint32_t level_first = load_base ? 0 : 1;
   uint32_t level_last = load_mips ? texture_key.mip_max_level : 0;
+  // Levels above the host image (vulkan_texture_max_size) are not loaded.
+  const uint32_t skipped_levels = vulkan_texture.skipped_levels();
+  if (skipped_levels) {
+    if (!load_mips) {
+      return true;
+    }
+    if (skipped_levels > guest_layout.packed_level) {
+      return false;
+    }
+    level_first = std::max(level_first, skipped_levels);
+  }
   assert_true(level_first <= level_last);
   uint32_t level_packed = guest_layout.packed_level;
   uint32_t level_stored_first = std::min(level_first, level_packed);
@@ -2794,7 +2844,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     copy_region.bufferRowLength = level_host_layout.x_pitch_blocks * host_block_width;
     copy_region.bufferImageHeight = level_host_layout.y_pitch_blocks * host_block_height;
     copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.imageSubresource.mipLevel = level;
+    copy_region.imageSubresource.mipLevel = level - skipped_levels;
     copy_region.imageSubresource.baseArrayLayer = 0;
     copy_region.imageSubresource.layerCount = array_size;
     copy_region.imageOffset.x = 0;

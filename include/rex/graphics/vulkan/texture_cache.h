@@ -191,9 +191,12 @@ class VulkanTextureCache final : public TextureCache {
   // The image of a texture with the key, scale_log2 times larger in both
   // directions (a texture replacement) with levels mips; copy_words_out as
   // VulkanTexture::copy_words (0 when scaled).
+  // Guest levels vulkan_texture_max_size leaves out of a new texture's image.
+  static uint32_t GetTextureLevelsToSkip(const TextureKey& key);
+  // skip_levels: the image starts at that guest level (vulkan_texture_max_size).
   VkResult CreateTextureImageForKey(TextureKey key, uint32_t scale_log2, uint32_t levels,
                                     VkImage& image, VmaAllocation& allocation,
-                                    uint32_t& copy_words_out);
+                                    uint32_t& copy_words_out, uint32_t skip_levels = 0);
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -278,6 +281,10 @@ class VulkanTextureCache final : public TextureCache {
     // in that format.
     uint32_t copy_words() const { return copy_words_; }
     void set_copy_words(uint32_t words) { copy_words_ = words; }
+    // Guest levels left out of the host image by vulkan_texture_max_size:
+    // host level 0 holds guest level skipped_levels().
+    uint32_t skipped_levels() const { return skipped_levels_; }
+    void set_skipped_levels(uint32_t levels) { skipped_levels_ = levels; }
     VkImageView GetCopyView();
     // PD-4: the bindless slot of a view GetView returned, remembered with the
     // last view of the signedness.
@@ -349,6 +356,7 @@ class VulkanTextureCache final : public TextureCache {
     VmaAllocation allocation_;
     uint32_t replacement_scale_log2_ = 0;
     uint32_t replacement_levels_ = 0;
+    uint32_t skipped_levels_ = 0;
     uint32_t copy_words_ = 0;
     VkImageView copy_view_ = VK_NULL_HANDLE;
     VkImageView copy_view_2d_ = VK_NULL_HANDLE;
