@@ -1381,10 +1381,13 @@ PrimitiveProcessor::CacheTransaction::~CacheTransaction() {
 
   std::lock_guard<std::recursive_mutex> cache_lock(processor_.cache_mutex_);
 
+  // The invalidation callback zeroes the size if the range was written during
+  // processing, which may have read the old indices (xenia-edge 1b0e9d00ea).
+  const bool written = !processor_.cache_currently_processing_size_bytes_;
   processor_.cache_currently_processing_base_ = 0;
   processor_.cache_currently_processing_size_bytes_ = 0;
 
-  if (result_type_ == ResultType::kNewSet) {
+  if (result_type_ == ResultType::kNewSet && !written) {
     size_t new_entry_index;
     if (processor_.cache_bucket_free_first_entry_ != SIZE_MAX) {
       new_entry_index = processor_.cache_bucket_free_first_entry_;
@@ -1453,6 +1456,14 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
   uint32_t bucket_l2_bits_index_first = bucket_index_first >> 12;
   uint32_t bucket_l2_bits_index_last = bucket_index_last >> 12;
   std::lock_guard<std::recursive_mutex> cache_lock(cache_mutex_);
+  // A conversion in progress over the written range has read stale indices;
+  // its transaction must not store the result (xenia-edge 1b0e9d00ea).
+  if (cache_currently_processing_size_bytes_ &&
+      cache_currently_processing_base_ < physical_address_end &&
+      cache_currently_processing_base_ + cache_currently_processing_size_bytes_ >
+          physical_address_start) {
+    cache_currently_processing_size_bytes_ = 0;
+  }
   for (uint32_t bucket_l2_bits_index = bucket_l2_bits_index_first;
        bucket_l2_bits_index <= bucket_l2_bits_index_last; ++bucket_l2_bits_index) {
     uint64_t bucket_l2_bits_mask = UINT64_MAX;
@@ -1510,7 +1521,11 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
           // the specified range.
           if (entry_key.base < physical_address_end) {
             uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
+            // Any overlap with the written range invalidates the entry. The
+            // test against the range's end kept entries that end inside it,
+            // so a rewritten index buffer drew with stale converted indices
+            // (xenia-edge 1b0e9d00ea).
+            if (entry_end > physical_address_start) {
               // Invalidate the entry.
               any_invalidated = true;
               // Remove the entry from the cache map.
