@@ -221,7 +221,9 @@ bool build_ldarx(BuilderContext& ctx) {
 
 bool build_lfd(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
+  // r1 is the stack pointer: guest stacks are never in the physical view.
+  ctx.print("\t{}.u64 = {}(", ctx.f(ctx.insn.operands[0]),
+            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U64" : "REX_LOAD_U64");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
@@ -239,7 +241,8 @@ bool build_lfdx(BuilderContext& ctx) {
 
 bool build_lfs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
+  ctx.print("\t{}.u32 = {}(", ctx.temp(),
+            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U32" : "REX_LOAD_U32");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
@@ -448,7 +451,9 @@ bool build_stdux(BuilderContext& ctx) {
 
 bool build_stfd(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
+  ctx.print("{}", ctx.mmio_check_d_form()      ? "\tREX_MM_STORE_U64("
+                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U64("
+                                              : "\tREX_STORE_U64(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}, {}.u64);", static_cast<int32_t>(ctx.insn.operands[1]),
@@ -487,7 +492,9 @@ bool build_stfiwx(BuilderContext& ctx) {
 bool build_stfs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
+  ctx.print("{}", ctx.mmio_check_d_form()      ? "\tREX_MM_STORE_U32("
+                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U32("
+                                              : "\tREX_STORE_U32(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}, {}.u32);", static_cast<int32_t>(ctx.insn.operands[1]), ctx.temp());

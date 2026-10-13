@@ -14,6 +14,7 @@
 #include "builder_context.h"
 
 #include <cstring>
+#include <string>
 
 #include <rex/codegen/function_scanner.h>
 #include <rex/logging.h>
@@ -337,7 +338,11 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
  */
 inline void emitSignExtendLoadDForm(BuilderContext& ctx, const char* cast_type,
                                     const char* load_macro) {
-  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, load_macro);
+  // r1 is the stack pointer: guest stacks are never in the physical view.
+  std::string macro = load_macro;
+  if (ctx.insn.operands[2] == 1 && macro.starts_with("REX_LOAD_"))
+    macro = "REX_STACK_LOAD_" + macro.substr(9);
+  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, macro);
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}));", static_cast<int32_t>(ctx.insn.operands[1]));
