@@ -336,20 +336,43 @@ inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
 // Vector Maximum / Minimum Floating Point with the AltiVec rules the SSE
 // min/max do not have: a NaN operand is the result (vA first), and between
 // zeros of either sign the maximum is +0 and the minimum is -0.
+// A denormal input is a signed zero to the hardware (non-Java mode), and a
+// NaN result is quiet. The flush is explicit because DAZ only makes the
+// compare treat a denormal as zero while its bits stay in the operand.
+inline simde__m128 simde_mm_vflushfp(simde__m128 x) {
+  simde__m128i bits = simde_mm_castps_si128(x);
+  simde__m128i exponent = simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7F800000));
+  simde__m128i denormal = simde_mm_cmpeq_epi32(exponent, simde_mm_setzero_si128());
+  simde__m128i sign = simde_mm_and_si128(bits, simde_mm_set1_epi32(int(0x80000000)));
+  return simde_mm_castsi128_ps(simde_mm_blendv_epi8(bits, sign, denormal));
+}
+
+inline simde__m128 simde_mm_vquietnan(simde__m128 x) {
+  simde__m128 nan = simde_mm_cmpunord_ps(x, x);
+  simde__m128 quiet = simde_mm_or_ps(x, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000)));
+  return simde_mm_blendv_ps(x, quiet, nan);
+}
+
 inline simde__m128 simde_mm_vmaxfp(simde__m128 a, simde__m128 b) {
+  a = simde_mm_vflushfp(a);
+  b = simde_mm_vflushfp(b);
   simde__m128 r = simde_mm_max_ps(a, b);
   // Equal values (both zeros among them): the sign bit of the result is set
   // only when both are negative, which the AND of the two gives.
   r = simde_mm_blendv_ps(r, simde_mm_and_ps(a, b), simde_mm_cmpeq_ps(a, b));
   r = simde_mm_blendv_ps(r, b, simde_mm_cmpunord_ps(b, b));
-  return simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
+  r = simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
+  return simde_mm_vquietnan(r);
 }
 
 inline simde__m128 simde_mm_vminfp(simde__m128 a, simde__m128 b) {
+  a = simde_mm_vflushfp(a);
+  b = simde_mm_vflushfp(b);
   simde__m128 r = simde_mm_min_ps(a, b);
   r = simde_mm_blendv_ps(r, simde_mm_or_ps(a, b), simde_mm_cmpeq_ps(a, b));
   r = simde_mm_blendv_ps(r, b, simde_mm_cmpunord_ps(b, b));
-  return simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
+  r = simde_mm_blendv_ps(r, a, simde_mm_cmpunord_ps(a, a));
+  return simde_mm_vquietnan(r);
 }
 
 // Vector Shift Left by Octet - shift entire vector left by bytes in bits [121:124] of vB

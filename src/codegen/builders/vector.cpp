@@ -614,12 +614,16 @@ bool build_vcmpbfp(BuilderContext& ctx) {
   // CR6 from vD: movemask_ps only checks bit 31, but lower-bound violations only
   // set bit 30. Shift left by 1 to move bit 30 into bit 31, then OR with original
   // so movemask detects both upper and lower bound violations.
-  if (isRecordForm(ctx.insn))
+  // CR6 holds only the "all in bounds" bit (0b0010); unlike the compares, all
+  // elements out of bounds sets nothing.
+  if (isRecordForm(ctx.insn)) {
     ctx.println(
         "\t{}.setFromMask(simde_mm_castsi128_ps(simde_mm_or_si128("
         "simde_mm_load_si128((simde__m128i*){}.f32), "
         "simde_mm_slli_epi32(simde_mm_load_si128((simde__m128i*){}.f32), 1))), 0xF);",
         ctx.cr(6), vD, vD);
+    ctx.println("\t{}.lt = 0;", ctx.cr(6));
+  }
   return true;
 }
 
