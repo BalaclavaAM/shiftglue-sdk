@@ -24,6 +24,7 @@
 
 #include <CLI/CLI.hpp>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 
 #include <rex/codegen/binary_view.h>
@@ -127,17 +128,28 @@ RegValue ParseRegisterDirective(const std::string& line, size_t directive_idx) {
 
   RegValue rv;
   rv.reg = std::move(reg);
-  rv.value = line.substr(sp2 + 1);
-  rv.is_float = (line.find('.', sp2) != std::string::npos);
+  rv.value = rex::string::trim_string(line.substr(sp2 + 1));
+  // xenia spells a float register's bit pattern as `[3FF0000000000000]`.
+  if (rv.value.size() > 2 && rv.value.front() == '[' && rv.value.back() == ']')
+    rv.value = "0x" + rv.value.substr(1, rv.value.size() - 2);
+  rv.is_float = (rv.value.find('.') != std::string::npos);
   return rv;
 }
 
+/* Two spellings: `10001000 00 01 02` and xenia's `0x0000000010001000 [00, 01, 02]`.
+   The address is kept as the hex digits the template prefixes with 0x. */
 MemValue ParseMemoryDirective(const std::string& line, size_t directive_idx) {
   auto sp1 = line.find(' ', directive_idx);
   auto sp2 = line.find(' ', sp1 + 1);
   MemValue mv;
   mv.address = line.substr(sp1 + 1, sp2 - sp1 - 1);
-  mv.data = ParseHexBytes(line.substr(sp2 + 1));
+  if (mv.address.starts_with("0x") || mv.address.starts_with("0X"))
+    mv.address.erase(0, 2);
+  if (mv.address.size() > 8)
+    mv.address.erase(0, mv.address.size() - 8);
+  std::string bytes = line.substr(sp2 + 1);
+  std::erase_if(bytes, [](char c) { return c == '[' || c == ']' || c == ','; });
+  mv.data = ParseHexBytes(bytes);
   return mv;
 }
 
@@ -224,16 +236,19 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
     spec.name = name;
     spec.symbol = symbolIt->second;
 
-    while (getline() && !line.empty() && line[0] == '#') {
+    // Only `#_` lines are directives; a plain `#` comment (a hand-encoded
+    // instruction's mnemonic, a disabled instruction) is skipped like code.
+    auto is_directive = [&]() { return line.starts_with("#_"); };
+    while (getline() && is_directive()) {
       ApplyDirective(line, "REGISTER_IN", "MEMORY_IN", spec.inputs, spec.mem_inputs);
     }
-    while (line.empty() || line[0] != '#') {
+    while (!is_directive()) {
       if (!getline())
         break;
     }
     do {
       ApplyDirective(line, "REGISTER_OUT", "MEMORY_OUT", spec.outputs, spec.mem_outputs);
-    } while (getline() && !line.empty() && line[0] == '#');
+    } while (getline() && is_directive());
 
     if (!spec.inputs.empty() || !spec.outputs.empty() || !spec.mem_inputs.empty() ||
         !spec.mem_outputs.empty()) {
@@ -299,31 +314,77 @@ std::string CategoryFromStem(std::string_view stem) {
   return "misc";
 }
 
-bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir) {
+std::map<std::string, std::string> LoadSkipList(const std::string& path) {
+  std::map<std::string, std::string> skips;
+  if (path.empty())
+    return skips;
+  std::ifstream in(path);
+  if (!in.is_open()) {
+    REXLOG_WARN("Unable to open skip list: {}", path);
+    return skips;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    std::string reason;
+    if (auto hash = line.find('#'); hash != std::string::npos) {
+      reason = rex::string::trim_string(line.substr(hash + 1));
+      line = line.substr(0, hash);
+    }
+    line = rex::string::trim_string(line);
+    if (!line.empty())
+      skips[line] = reason;
+  }
+  return skips;
+}
+
+bool RecompileTests(std::string_view binDir, const std::vector<std::string>& asmDirs,
+                    std::string_view outDir, const std::string& skipFile) {
+  const auto skips = LoadSkipList(skipFile);
   std::array<ui::KeyValueRow, 3> header_rows = {{
       {"Bin dir", std::string(binDir)},
-      {"ASM dir", std::string(asmDir)},
+      {"ASM dirs", fmt::format("{}", fmt::join(asmDirs, ";"))},
       {"Output dir", std::string(outDir)},
   }};
   ui::KeyValueBlock("Recompiling PPC tests:", header_rows);
 
   fs::create_directories(outDir);
 
+  // One pair of translation units per test file (`<stem>.functions.cpp`,
+  // `<stem>.cases.cpp`), so a corpus of a hundred thousand cases compiles in
+  // parallel instead of as one unit; `ppc_test_decls.h` declares them all.
+  // Several assembly directories may contribute files (a corpus kept outside
+  // the repository); a stem names one file across all of them.
   std::map<std::string, std::unordered_set<size_t>> functionsByFile;
+  std::map<std::string, std::vector<std::string>> functionNamesByFile;
+  std::map<std::string, std::string> functionsCodeByFile;
   std::vector<std::string> allFunctionNames;
-  std::stringstream functionsOut;
+  std::vector<std::string> stems;
+  std::map<std::string, std::string> asmPathByStem;
 
-  for (const auto& entry : fs::directory_iterator(binDir)) {
-    if (entry.path().extension() != ".bin")
-      continue;
-    auto stem = entry.path().stem().string();
+  for (const auto& asmDir : asmDirs) {
+    for (const auto& entry : fs::directory_iterator(asmDir)) {
+      if (entry.path().extension() != ".s")
+        continue;
+      auto stem = entry.path().stem().string();
+      if (asmPathByStem.count(stem)) {
+        REXLOG_ERROR("Test file {} appears in more than one assembly directory", stem);
+        return false;
+      }
+      asmPathByStem[stem] = entry.path().string();
+      stems.push_back(stem);
+    }
+  }
+  std::sort(stems.begin(), stems.end());
+
+  for (const auto& stem : stems) {
+    auto binPath = fmt::format("{}/{}.bin", binDir, stem);
     REXLOG_DEBUG("Processing binary file: {}", stem);
 
     std::vector<uint8_t> fileData;
     {
-      std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+      std::ifstream file(binPath, std::ios::binary | std::ios::ate);
       if (!file) {
-        REXLOG_WARN("Failed to load binary file: {}", entry.path().string());
+        REXLOG_WARN("Failed to load binary file: {}", binPath);
         continue;
       }
       auto size = file.tellg();
@@ -369,14 +430,19 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
       if (code.empty())
         continue;
       functionsByFile[stem].emplace(fn->base());
-      allFunctionNames.push_back(fmt::format("{}_{:X}", stem, fn->base()));
+      auto name = fmt::format("{}_{:X}", stem, fn->base());
+      functionNamesByFile[stem].push_back(name);
+      allFunctionNames.push_back(name);
       recompiledCode += code;
     }
-    functionsOut << recompiledCode << '\n';
+    functionsCodeByFile[stem] = std::move(recompiledCode);
   }
 
-  std::unordered_map<std::string, std::string> allSymbols;
+  // Labels repeat across files (`test_mulhdux_1` is in instr_mulhdx.s and
+  // instr_mulhdux.s), so each file resolves its labels against its own map.
+  std::map<std::string, std::unordered_map<std::string, std::string>> symbolsByFile;
   for (const auto& [stem, addresses] : functionsByFile) {
+    auto& allSymbols = symbolsByFile[stem];
     auto mapPath = fmt::format("{}/{}.map", binDir, stem);
     auto mapSymbols = ParseMapFile(mapPath);
     for (const auto& [addr, name] : mapSymbols) {
@@ -388,7 +454,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
 
     std::vector<size_t> sortedAddresses(addresses.begin(), addresses.end());
     std::sort(sortedAddresses.begin(), sortedAddresses.end());
-    std::ifstream in(fmt::format("{}/{}.s", asmDir, stem));
+    std::ifstream in(asmPathByStem[stem]);
     if (!in.is_open())
       continue;
     std::string line;
@@ -407,55 +473,66 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     }
   }
 
-  nlohmann::json templateData;
-  templateData["functions"] = nlohmann::json::array();
+  nlohmann::json sharedData;
+  sharedData["functions"] = nlohmann::json::array();
   for (const auto& funcName : allFunctionNames)
-    templateData["functions"].push_back({{"name", funcName}});
-  templateData["functions_code"] = functionsOut.str();
-  templateData["image_base"] = "82010000";
-  templateData["image_size"] = "100000";
-  templateData["code_base"] = "82010000";
-  templateData["code_size"] = "100000";
-
-  templateData["tests"] = nlohmann::json::array();
-  size_t totalTests = 0;
-  for (const auto& [stem, addresses] : functionsByFile) {
-    auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), allSymbols);
-    std::string category = CategoryFromStem(stem);
-    for (const auto& spec : specs) {
-      nlohmann::json testJson;
-      testJson["name"] = BuildHierarchicalName(stem, spec.name);
-      testJson["category"] = category;
-      testJson["stem"] = stem;
-      testJson["symbol"] = spec.symbol;
-      testJson["inputs"]["registers"] = SerializeRegisters(spec.inputs);
-      testJson["inputs"]["memory"] = SerializeMemory(spec.mem_inputs);
-      testJson["outputs"]["registers"] = SerializeRegisters(spec.outputs);
-      testJson["outputs"]["memory"] = SerializeMemory(spec.mem_outputs);
-      if (spec.name == "test_stvlx_differential") {
-        testJson["partial_store_differential"] = true;
-        testJson["partial_store_kind"] = "left";
-      } else if (spec.name == "test_stvrx_differential") {
-        testJson["partial_store_differential"] = true;
-        testJson["partial_store_kind"] = "right";
-      } else {
-        testJson["partial_store_differential"] = false;
-      }
-      templateData["tests"].push_back(testJson);
-      ++totalTests;
-    }
-  }
+    sharedData["functions"].push_back({{"name", funcName}});
+  sharedData["image_base"] = "82010000";
+  sharedData["image_size"] = "100000";
+  sharedData["code_base"] = "82010000";
+  sharedData["code_size"] = "100000";
 
   codegen::TemplateRegistry registry;
-  auto writeRendered = [&](std::string_view templateId, std::string_view filename) {
-    auto rendered = codegen::renderWithJson(registry, std::string(templateId), templateData);
+  auto writeRendered = [&](std::string_view templateId, std::string_view filename,
+                           const nlohmann::json& data) {
+    auto rendered = codegen::renderWithJson(registry, std::string(templateId), data);
     std::ofstream out(fmt::format("{}/{}", outDir, filename));
     out << rendered;
   };
-  writeRendered("test/ppc_config_h", "ppc_config.h");
-  writeRendered("test/ppc_test_decls_h", "ppc_test_decls.h");
-  writeRendered("test/ppc_test_functions_cpp", "ppc_test_functions.cpp");
-  writeRendered("test/ppc_test_cases_cpp", "ppc_test_cases.cpp");
+  writeRendered("test/ppc_config_h", "ppc_config.h", sharedData);
+  writeRendered("test/ppc_test_decls_h", "ppc_test_decls.h", sharedData);
+
+  size_t totalTests = 0;
+  for (const auto& stem : stems) {
+    nlohmann::json unitData = sharedData;
+    unitData["functions"] = nlohmann::json::array();
+    for (const auto& funcName : functionNamesByFile[stem])
+      unitData["functions"].push_back({{"name", funcName}});
+    unitData["functions_code"] = functionsCodeByFile[stem];
+    unitData["tests"] = nlohmann::json::array();
+    if (functionsByFile.count(stem)) {
+      auto specs = ParseTestSpecs(asmPathByStem[stem], symbolsByFile[stem]);
+      std::string category = CategoryFromStem(stem);
+      for (const auto& spec : specs) {
+        nlohmann::json testJson;
+        testJson["name"] = BuildHierarchicalName(stem, spec.name);
+        if (auto skip = skips.find(testJson["name"].get<std::string>()); skip != skips.end())
+          testJson["skip"] = skip->second.empty() ? "listed in the skip file" : skip->second;
+        else
+          testJson["skip"] = "";
+        testJson["category"] = category;
+        testJson["stem"] = stem;
+        testJson["symbol"] = spec.symbol;
+        testJson["inputs"]["registers"] = SerializeRegisters(spec.inputs);
+        testJson["inputs"]["memory"] = SerializeMemory(spec.mem_inputs);
+        testJson["outputs"]["registers"] = SerializeRegisters(spec.outputs);
+        testJson["outputs"]["memory"] = SerializeMemory(spec.mem_outputs);
+        if (spec.name == "test_stvlx_differential") {
+          testJson["partial_store_differential"] = true;
+          testJson["partial_store_kind"] = "left";
+        } else if (spec.name == "test_stvrx_differential") {
+          testJson["partial_store_differential"] = true;
+          testJson["partial_store_kind"] = "right";
+        } else {
+          testJson["partial_store_differential"] = false;
+        }
+        unitData["tests"].push_back(testJson);
+        ++totalTests;
+      }
+    }
+    writeRendered("test/ppc_test_functions_cpp", fmt::format("{}.functions.cpp", stem), unitData);
+    writeRendered("test/ppc_test_cases_cpp", fmt::format("{}.cases.cpp", stem), unitData);
+  }
 
   REXLOG_TRACE("Generated {} test cases", totalTests);
   return true;
@@ -463,8 +540,9 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
 
 struct RecompileTestsArgs {
   std::string bin_dir;
-  std::string asm_dir;
+  std::vector<std::string> asm_dirs;
   std::string output;
+  std::string skip_file;
 };
 
 }  // namespace
@@ -477,15 +555,19 @@ void RegisterRecompileTests(CLI::App& parent, const CliContext& ctx, DeferredAct
   sub->add_option("--bin-dir", args->bin_dir, "Directory containing linked .bin and .map files")
       ->type_name("PATH")
       ->required();
-  sub->add_option("--asm-dir", args->asm_dir, "Directory containing .s assembly source files")
+  sub->add_option("--asm-dir", args->asm_dirs,
+                  "Directory containing .s assembly source files (repeatable)")
       ->type_name("PATH")
       ->required();
   sub->add_option("--output", args->output, "Output path for recompile-tests")
       ->type_name("PATH")
       ->required();
+  sub->add_option("--skip-file", args->skip_file,
+                  "Cases to emit as skipped: one `<name> # <reason>` per line")
+      ->type_name("PATH");
   sub->callback([args, &pending]() {
     pending = [args]() -> rex::Result<void> {
-      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output)) {
+      if (!RecompileTests(args->bin_dir, args->asm_dirs, args->output, args->skip_file)) {
         return Err<void>(rex::ErrorCategory::Validation, "Test recompilation failed");
       }
       return rex::Ok();

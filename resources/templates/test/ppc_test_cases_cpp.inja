@@ -6,13 +6,16 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <simde/x86/sse.h>
 #include "ppc_config.h"
 #include <rex/ppc.h>
 #include <rex/system/xmemory.h>
 #include "ppc_test_decls.h"
 
-// Global memory instance - same class used by real runtime
-static rex::memory::Memory& get_memory() {
+// Global memory instance - same class used by real runtime. One per process:
+// the cases are split over many translation units, so the function is inline
+// (its local static is shared), not static.
+inline rex::memory::Memory& get_memory() {
     static rex::memory::Memory memory;
     static bool initialized = false;
     if (!initialized) {
@@ -32,7 +35,7 @@ static rex::memory::Memory& get_memory() {
     return memory;
 }
 
-static uint32_t partial_store_random(uint32_t& state) {
+inline uint32_t partial_store_random(uint32_t& state) {
     state ^= state << 13;
     state ^= state >> 17;
     state ^= state << 5;
@@ -41,9 +44,15 @@ static uint32_t partial_store_random(uint32_t& state) {
 
 ## for test in tests
 TEST_CASE("{{ test.name }}", "[ppc][{{ test.category }}][{{ test.stem }}]") {
+## if test.skip != ""
+    SKIP("{{ test.skip }}");
+## endif
     auto& mem = get_memory();
     uint8_t* memory = mem.virtual_membase();
     PPCContext ctx{};
+    // A test that writes FPSCR (mtfsf, mtfsfi) leaves the host's rounding and
+    // flush modes behind for the next test; start every test from the default.
+    simde_mm_setcsr(0x1F80);
     ctx.fpscr.loadFromHost();
 
 ## for reg in test.inputs.registers
