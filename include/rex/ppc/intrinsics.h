@@ -279,9 +279,12 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b) {
   int shift = simde_mm_extract_epi8(b, 0) & 0x7;
   if (shift == 0)
     return a;
-  simde__m128i shifted = simde_mm_srli_epi64(a, shift);
+  // Variable counts go through the vector-count forms: the immediate forms
+  // need a constant on NEON.
+  simde__m128i shifted = simde_mm_srl_epi64(a, simde_mm_cvtsi32_si128(shift));
   // The high half's low bits move into the low half's high bits.
-  simde__m128i carry = simde_mm_srli_si128(simde_mm_slli_epi64(a, 64 - shift), 8);
+  simde__m128i carry =
+      simde_mm_srli_si128(simde_mm_sll_epi64(a, simde_mm_cvtsi32_si128(64 - shift)), 8);
   return simde_mm_or_si128(shifted, carry);
 }
 
