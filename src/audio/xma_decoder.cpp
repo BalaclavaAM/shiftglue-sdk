@@ -27,6 +27,9 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+REXCVAR_DEFINE_BOOL(xma_decode_kicks_inline, true, "Audio",
+                    "Decode a kicked XMA context on the thread that wrote the kick register "
+                    "instead of leaving it to the decoder thread");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -293,14 +296,18 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         context.Enable();
       }
     }
-    // Decode inline. waiting on the worker sweep stalls the realtime
-    // audio thread 50-100ms during kick bursts.
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = contexts_[context_id];
-        if (context.Work()) {
-          context.SignalWorkDone();
+    // Decode inline by default: waiting on the worker sweep stalled the
+    // realtime audio thread 50-100 ms during kick bursts. The cvar leaves the
+    // decode to the worker thread, to measure what the inline decode costs
+    // the guest audio thread (NEXT_LEVEL_RESEARCH.md NL-4.1).
+    if (REXCVAR_GET(xma_decode_kicks_inline)) {
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          auto& context = contexts_[context_id];
+          if (context.Work()) {
+            context.SignalWorkDone();
+          }
         }
       }
     }
