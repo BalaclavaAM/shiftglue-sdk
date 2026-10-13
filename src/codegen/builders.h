@@ -128,6 +128,7 @@ bool build_clrlwi(BuilderContext& ctx);
 
 // Rotate left double word
 bool build_rldcl(BuilderContext& ctx);
+bool build_rotld(BuilderContext& ctx);
 bool build_rldcr(BuilderContext& ctx);
 bool build_rldic(BuilderContext& ctx);
 bool build_rldicl(BuilderContext& ctx);
@@ -291,6 +292,9 @@ bool build_lwa(BuilderContext& ctx);
 bool build_lwaux(BuilderContext& ctx);
 bool build_lwax(BuilderContext& ctx);
 bool build_lwbrx(BuilderContext& ctx);
+bool build_ldbrx(BuilderContext& ctx);
+bool build_stdbrx(BuilderContext& ctx);
+bool build_lmw(BuilderContext& ctx);
 bool build_lwz(BuilderContext& ctx);
 bool build_lwzu(BuilderContext& ctx);
 bool build_lwzux(BuilderContext& ctx);
@@ -426,6 +430,9 @@ bool build_mtcrf(BuilderContext& ctx);
 bool build_mtctr(BuilderContext& ctx);
 bool build_mtlr(BuilderContext& ctx);
 bool build_mtmsrd(BuilderContext& ctx);
+bool build_mtmsr(BuilderContext& ctx);
+bool build_icbi(BuilderContext& ctx);
+bool build_mcrxr(BuilderContext& ctx);
 bool build_mtfsf(BuilderContext& ctx);
 bool build_mtxer(BuilderContext& ctx);
 
@@ -556,6 +563,11 @@ bool build_vsraw(BuilderContext& ctx);
 bool build_vsrw(BuilderContext& ctx);
 bool build_vsro(BuilderContext& ctx);
 bool build_vrlh(BuilderContext& ctx);
+bool build_vrlb(BuilderContext& ctx);
+bool build_vaddcuw(BuilderContext& ctx);
+bool build_vsubcuw(BuilderContext& ctx);
+bool build_vavguw(BuilderContext& ctx);
+bool build_vmaxuw(BuilderContext& ctx);
 bool build_vrlw(BuilderContext& ctx);
 
 // Vector splat

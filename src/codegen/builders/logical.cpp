@@ -467,4 +467,13 @@ bool build_crxor(BuilderContext& ctx) {
   return true;
 }
 
+bool build_rotld(BuilderContext& ctx) {
+  // rotld rA, rS, rB: rldcl with no mask.
+  ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}.u8 & 0x3F);",
+              ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+              ctx.r(ctx.insn.operands[2]));
+  emitRecordFormCompare(ctx);
+  return true;
+}
+
 }  // namespace rex::codegen

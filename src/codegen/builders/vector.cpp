@@ -1565,4 +1565,51 @@ bool build_vupklsh(BuilderContext& ctx) {
   return true;
 }
 
+//=============================================================================
+// Byte and word forms the test corpus exercises (none are used by FH1)
+//=============================================================================
+
+bool build_vrlb(BuilderContext& ctx) {
+  for (size_t i = 0; i < 16; i++) {
+    ctx.println("\t{{ uint32_t sh = {}.u8[{}] & 0x7;", ctx.v(ctx.insn.operands[2]), i);
+    ctx.println("\t{}.u8[{}] = uint8_t(({}.u8[{}] << sh) | (sh ? ({}.u8[{}] >> (8 - sh)) : 0)); }}",
+                ctx.v(ctx.insn.operands[0]), i, ctx.v(ctx.insn.operands[1]), i,
+                ctx.v(ctx.insn.operands[1]), i);
+  }
+  return true;
+}
+
+bool build_vaddcuw(BuilderContext& ctx) {
+  // Carry out of each unsigned word add.
+  for (size_t i = 0; i < 4; i++) {
+    ctx.println("\t{}.u32[{}] = (uint64_t({}.u32[{}]) + {}.u32[{}]) >> 32;",
+                ctx.v(ctx.insn.operands[0]), i, ctx.v(ctx.insn.operands[1]), i,
+                ctx.v(ctx.insn.operands[2]), i);
+  }
+  return true;
+}
+
+bool build_vsubcuw(BuilderContext& ctx) {
+  // 1 when the unsigned word subtract does not borrow.
+  for (size_t i = 0; i < 4; i++) {
+    ctx.println("\t{}.u32[{}] = {}.u32[{}] >= {}.u32[{}] ? 1 : 0;", ctx.v(ctx.insn.operands[0]), i,
+                ctx.v(ctx.insn.operands[1]), i, ctx.v(ctx.insn.operands[2]), i);
+  }
+  return true;
+}
+
+bool build_vavguw(BuilderContext& ctx) {
+  for (size_t i = 0; i < 4; i++) {
+    ctx.println("\t{}.u32[{}] = uint32_t((uint64_t({}.u32[{}]) + {}.u32[{}] + 1) >> 1);",
+                ctx.v(ctx.insn.operands[0]), i, ctx.v(ctx.insn.operands[1]), i,
+                ctx.v(ctx.insn.operands[2]), i);
+  }
+  return true;
+}
+
+bool build_vmaxuw(BuilderContext& ctx) {
+  ctx.emit_vec_int_binary("max_epu32", "u32");
+  return true;
+}
+
 }  // namespace rex::codegen

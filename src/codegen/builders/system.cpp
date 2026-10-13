@@ -371,4 +371,32 @@ bool build_clrldi(BuilderContext& ctx) {
   return true;
 }
 
+//=============================================================================
+// Forms the test corpus exercises (none are used by FH1)
+//=============================================================================
+
+bool build_icbi(BuilderContext& ctx) {
+  // Instruction cache invalidate: generated code is not patched at run time.
+  (void)ctx;
+  return true;
+}
+
+bool build_mcrxr(BuilderContext& ctx) {
+  // crfD = XER[SO, OV, CA, 0]; the three XER bits are cleared.
+  auto cr = ctx.cr(ctx.insn.operands[0]);
+  ctx.println("\t{}.lt = {}.so;", cr, ctx.xer());
+  ctx.println("\t{}.gt = {}.ov;", cr, ctx.xer());
+  ctx.println("\t{}.eq = {}.ca;", cr, ctx.xer());
+  ctx.println("\t{}.so = 0;", cr);
+  ctx.println("\t{}.so = 0;", ctx.xer());
+  ctx.println("\t{}.ov = 0;", ctx.xer());
+  ctx.println("\t{}.ca = 0;", ctx.xer());
+  return true;
+}
+
+bool build_mtmsr(BuilderContext& ctx) {
+  // The 32-bit form of mtmsrd: the same interrupt-enable contract.
+  return build_mtmsrd(ctx);
+}
+
 }  // namespace rex::codegen
