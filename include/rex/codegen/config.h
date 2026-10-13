@@ -109,6 +109,12 @@ struct RecompilerConfig {
   /// SwitchToFiber, ...), which keeps the host call chain intact: every
   /// function then has a single entry.
   bool interiorResume = true;
+  /// Call a known guest function through its strong `__imp__` definition
+  /// instead of the weak `sub_` thunk, so Clang can inline it. Functions the
+  /// host overrides with a strong `sub_` of its own must be listed in
+  /// hostOverriddenFunctions, or direct calls would skip the override.
+  bool directCallsBypassThunk = false;
+  std::vector<uint32_t> hostOverriddenFunctions;
   /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
   /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC
   /// non-volatile registers and poison the volatile ones dead at a return.

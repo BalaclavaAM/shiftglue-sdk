@@ -120,6 +120,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("abi_poison_checks"), "abi_poison_checks");
   MergeBool(cfg.interiorResume, toml["interior_resume"].value_or(true), hasBool("interior_resume"),
             "interior_resume");
+  MergeBool(cfg.directCallsBypassThunk, toml["direct_calls_bypass_thunk"].value_or(false),
+            hasBool("direct_calls_bypass_thunk"), "direct_calls_bypass_thunk");
+  if (auto overridden = toml["host_overridden_functions"].as_array()) {
+    for (const auto& elem : *overridden) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostOverriddenFunctions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }
@@ -466,6 +474,12 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     }
     REXCODEGEN_TRACE("Loaded {} function configs ({} standalone, {} chunks)", cfg.functions.size(),
                      cfg.functions.size() - chunks_count, chunks_count);
+  }
+  if (!cfg.hostOverriddenFunctions.empty()) {
+    std::sort(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end());
+    cfg.hostOverriddenFunctions.erase(
+        std::unique(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end()),
+        cfg.hostOverriddenFunctions.end());
   }
   if (!cfg.exceptionHandlerFuncHints.empty()) {
     std::sort(cfg.exceptionHandlerFuncHints.begin(), cfg.exceptionHandlerFuncHints.end());

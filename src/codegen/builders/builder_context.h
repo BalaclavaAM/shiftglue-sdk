@@ -163,6 +163,9 @@ struct BuilderContext {
   /// Get expression for effective address temporary (always "ea")
   const char* ea();
 
+  /// The symbol a direct call or tail call to `fn` names.
+  std::string calleeSymbol(const rex::codegen::FunctionNode& fn) const;
+
   //=========================================================================
   // Output Helpers
   //=========================================================================

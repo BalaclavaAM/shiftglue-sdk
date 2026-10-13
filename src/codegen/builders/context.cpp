@@ -172,6 +172,19 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+std::string BuilderContext::calleeSymbol(const rex::codegen::FunctionNode& fn) const {
+  const auto& cfg = config();
+  // Only generated guest functions have the weak thunk over a strong `__imp__`
+  // body; a [rexcrt] hook or a save/restore helper is named directly.
+  if (!cfg.directCallsBypassThunk || fn.authority() == rex::codegen::FunctionAuthority::IMPORT ||
+      !fn.name().starts_with("sub_"))
+    return fn.name();
+  if (std::binary_search(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end(),
+                         static_cast<uint32_t>(fn.base())))
+    return fn.name();
+  return "__imp__" + fn.name();
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -197,6 +210,9 @@ void BuilderContext::emit_function_call(uint32_t address) {
     if (target->isFunction()) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
+      // The strong `__imp__` definition when the host does not override the
+      // function (cfg.directCallsBypassThunk), so Clang can inline it.
+      const std::string callee = calleeSymbol(*targetFn);
 
       // Handle save/restore helpers. Gated on the global setting, not this
       // function's: the helper bodies are emitted under it too, so once they
@@ -218,7 +234,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
             println("\tctx.r{} = r{};", i, i);
         }
         emitCtx.reference(name);
-        println("\t{}(ctx, base);", name);
+        println("\t{}(ctx, base);", callee);
         for (size_t i = 14; i < 32; ++i) {
           if (locals.r[i])
             println("\tr{} = ctx.r{};", i, i);
@@ -233,7 +249,7 @@ void BuilderContext::emit_function_call(uint32_t address) {
       emitCtx.reference(name);
       if (poison)
         println("\tREX_ABI_POISON_PRE(0x{:08X});", base);
-      println("\t{}(ctx, base);", name);
+      println("\t{}(ctx, base);", callee);
       if (poison)
         println("\tREX_ABI_POISON_POST(0x{:08X});", base);
       return;
@@ -301,6 +317,9 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
     if (target->isFunction()) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
+      // The strong `__imp__` definition when the host does not override the
+      // function (cfg.directCallsBypassThunk), so Clang can inline it.
+      const std::string callee = calleeSymbol(*targetFn);
       if (cfg.nonVolatileRegistersAsLocalVariables &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         println("{}return;", indent);
@@ -316,7 +335,7 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
         }
       }
       emitCtx.reference(name);
-      println("{}REX_TAIL_CALL({});", indent, name);
+      println("{}REX_TAIL_CALL({});", indent, callee);
       return;
     }
 
