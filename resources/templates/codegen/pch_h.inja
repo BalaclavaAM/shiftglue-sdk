@@ -51,7 +51,7 @@
 //=============================================================================
 
 extern const rex::PPCImageInfo PPCImageConfig;
-extern PPCFuncMapping PPCFuncMappings[];
+extern const PPCFuncMapping PPCFuncMappings[];
 
 //=============================================================================
 // Function Definition Macros

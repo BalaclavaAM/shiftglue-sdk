@@ -54,4 +54,4 @@ struct PPCFuncMapping {
   PPCFunc* host;
 };
 
-extern PPCFuncMapping PPCFuncMappings[];
+extern const PPCFuncMapping PPCFuncMappings[];
