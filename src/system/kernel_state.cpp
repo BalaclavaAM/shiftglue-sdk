@@ -66,7 +66,8 @@ std::filesystem::path ModuleLibraryPath(const std::string& name) {
 }  // namespace
 
 
-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+// 25 ms, as xenia-canary 8d2d80dfde: the 100 ms wait only lengthened boot.
+constexpr uint32_t kDeferredOverlappedDelayMillis = 25;
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
