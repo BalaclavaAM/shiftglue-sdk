@@ -31,6 +31,10 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(fh1_surface_rows_on_demand, true, "GPU",
+                    "Size each FH1 surface image to the rows its uses claim and grow it when a "
+                    "claim reaches further, instead of the whole EDRAM addressing period "
+                    "(NEXT_LEVEL_RESEARCH.md NL-3.5)");
 REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
@@ -532,6 +536,7 @@ void Fh1NativeExecutor::Shutdown() {
   }
   initialized_ = false;
   StopSpecializeThread();
+  ReleaseRetiredImages(true);
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
@@ -756,18 +761,23 @@ void Fh1NativeExecutor::EndUntiledTiling() {
   untile_bands_.clear();
 }
 
-Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key) {
+Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key,
+                                                                 uint32_t rows) {
   const uint32_t packed = key.Pack();
-  if (Surface* existing = FindSurface(packed)) return existing;
-  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-  const auto& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
+  if (Surface* existing = FindSurface(packed)) {
+    if (rows) EnsureSurfaceRows(*existing, rows);
+    return existing;
+  }
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   Surface surface;
   surface.key = key;
   surface.width = key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
   surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
-  surface.image_height = std::max(surface.height, untile_height_);
+  const uint32_t full_rows = std::max(surface.height, untile_height_);
+  surface.image_height =
+      REXCVAR_GET(fh1_surface_rows_on_demand) && rows
+          ? std::min(full_rows, std::max(untile_height_, AlignSurfaceRows(rows)))
+          : full_rows;
   surface.samples = single_sample_msaa_ ? 1u
                     : two_sample_msaa_ && key.msaa == uint32_t(xenos::MsaaSamples::k4X)
                         ? 2u
@@ -786,6 +796,28 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     Skip("surface_format");
     return nullptr;
   }
+  if (!CreateSurfaceImage(surface)) return nullptr;
+  surface_bytes_ += surface.bytes;
+  Surface& stored = surfaces_.emplace(packed, surface).first->second;
+  // Render targets must be initialized before use; zero is also what the
+  // stencil tracking assumes for a new surface.
+  TransitionForAttachment(stored);
+  BeginSurfaceRendering(stored, false);
+  VkClearAttachment clear = {};
+  clear.aspectMask = AspectMask(stored);
+  VkClearRect clear_rect = {};
+  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.layerCount = 1;
+  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+  Count("surface_created");
+  return &stored;
+}
+
+bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
+  const SurfaceKey& key = surface.key;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   VkImageCreateInfo image_info = {};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_info.flags = surface.uint_format != VK_FORMAT_UNDEFINED
@@ -798,24 +830,29 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // Transfers: the untile copies, the HUD snapshot, and the copy into a
+  // grown image.
   image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                      (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                                    : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-                     (untile_height_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                                     : 0);
-  // The front buffer's format: present_hdr's HUD snapshot copies it.
-  if (!key.is_depth && surface.samples == 1 &&
-      key.format == uint32_t(xenos::ColorRenderTargetFormat::k_2_10_10_10)) {
-    image_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  }
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  surface.image = VK_NULL_HANDLE;
+  surface.memory = VK_NULL_HANDLE;
+  surface.view = VK_NULL_HANDLE;
+  surface.uint_view = VK_NULL_HANDLE;
+  surface.sampled_view = VK_NULL_HANDLE;
+  surface.stencil_view = VK_NULL_HANDLE;
+  surface.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  surface.stage = 0;
+  surface.access = 0;
+  surface.bytes = 0;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, image_info,
                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal,
                                                         surface.image, surface.memory)) {
     Skip("surface_create");
-    return nullptr;
+    return false;
   }
   auto create_view = [&](VkFormat format, VkImageAspectFlags aspect, VkImageView& view_out) {
     VkImageViewCreateInfo view_info = {};
@@ -836,36 +873,141 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   } else {
     views_created = create_view(surface.format, VK_IMAGE_ASPECT_COLOR_BIT, surface.view);
     if (views_created && surface.uint_format != VK_FORMAT_UNDEFINED) {
-      views_created = create_view(surface.uint_format, VK_IMAGE_ASPECT_COLOR_BIT, surface.uint_view);
+      views_created =
+          create_view(surface.uint_format, VK_IMAGE_ASPECT_COLOR_BIT, surface.uint_view);
     }
     surface.sampled_view = surface.uint_view ? surface.uint_view : surface.view;
   }
   if (!views_created) {
+    // DestroySurface subtracts the surface's bytes, which this one never added.
     DestroySurface(surface);
     Skip("surface_view_create");
-    return nullptr;
+    return false;
   }
   VkMemoryRequirements requirements = {};
   dfn.vkGetImageMemoryRequirements(device, surface.image, &requirements);
   surface.bytes = requirements.size;
-  surface_bytes_ += surface.bytes;
-  Surface& stored = surfaces_.emplace(packed, surface).first->second;
-  // Render targets must be initialized before use; zero is also what the
-  // stencil tracking assumes for a new surface.
-  TransitionForAttachment(stored);
-  BeginSurfaceRendering(stored, false);
+  return true;
+}
+
+uint32_t Fh1NativeExecutor::AlignSurfaceRows(uint32_t rows) {
+  // Whole 128-row steps: few regrowths, little slack.
+  return (rows + 127) & ~uint32_t(127);
+}
+
+uint32_t Fh1NativeExecutor::ClaimRows(const SurfaceKey& key, uint32_t base,
+                                      uint32_t length) const {
+  if (!key.pitch_tiles || !length) return 0;
+  const uint32_t pitch = key.pitch_tiles << uint32_t(key.Is64bpp());
+  const uint32_t offset =
+      (base + xenos::kEdramTileCount - key.base_tiles) % xenos::kEdramTileCount;
+  const uint32_t tile_rows = (offset + length + pitch - 1) / pitch;
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_y_log2);
+}
+
+void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
+  const uint32_t full_rows = std::max(surface.height, untile_height_);
+  rows = std::min(rows, full_rows);
+  if (rows <= surface.image_height) return;
+  // Grow by half again at least, so a surface that keeps reaching further
+  // is copied a few times, not once per tile row.
+  const uint32_t old_rows = surface.image_height;
+  const uint32_t new_rows =
+      std::min(full_rows, AlignSurfaceRows(std::max(rows, old_rows + old_rows / 2)));
+  // Nothing may render into the old image after this point.
+  FlushPendingClears(surface);
+  command_processor_.EndRenderPass();
+  rendering_id_ = 0;
+  Surface grown = surface;
+  grown.image_height = new_rows;
+  grown.pending_clears.clear();
+  if (!CreateSurfaceImage(grown)) {
+    Skip("surface_grow");
+    return;
+  }
+  // Copy the old rows in; the rows past them are cleared to zero below, as a
+  // created surface is.
+  const VkImageAspectFlags aspect = AspectMask(surface);
+  Transition(grown, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  Transition(surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+  auto& commands = command_processor_.deferred_command_buffer();
+  VkImageCopy region = {};
+  region.srcSubresource = {aspect, 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.extent = {surface.width * scale_, old_rows * scale_, 1};
+  commands.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+  // The old image lives until the GPU has finished this submission.
+  RetiredImage retired;
+  retired.submission = command_processor_.GetCurrentSubmission();
+  retired.image = surface.image;
+  retired.memory = surface.memory;
+  retired.views[0] = surface.view;
+  retired.views[1] = surface.uint_view;
+  retired.views[2] =
+      surface.sampled_view != surface.view && surface.sampled_view != surface.uint_view
+          ? surface.sampled_view
+          : VK_NULL_HANDLE;
+  retired.views[3] = surface.stencil_view;
+  retired_images_.push_back(retired);
+  surface_bytes_ += grown.bytes;
+  surface_bytes_ -= surface.bytes;
+  surface.image = grown.image;
+  surface.memory = grown.memory;
+  surface.view = grown.view;
+  surface.uint_view = grown.uint_view;
+  surface.sampled_view = grown.sampled_view;
+  surface.stencil_view = grown.stencil_view;
+  surface.image_height = new_rows;
+  surface.bytes = grown.bytes;
+  surface.layout = grown.layout;
+  surface.stage = grown.stage;
+  surface.access = grown.access;
+  TransitionForAttachment(surface);
+  BeginSurfaceRendering(surface, false);
   VkClearAttachment clear = {};
-  clear.aspectMask = AspectMask(stored);
+  clear.aspectMask = aspect;
   VkClearRect clear_rect = {};
-  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.rect.offset = {0, int32_t(old_rows * scale_)};
+  clear_rect.rect.extent = {surface.width * scale_, (new_rows - old_rows) * scale_};
   clear_rect.layerCount = 1;
-  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
-  Count("surface_created");
-  return &stored;
+  commands.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+  Count("surface_grown");
+}
+
+void Fh1NativeExecutor::ReleaseRetiredImages(bool all) {
+  if (retired_images_.empty()) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  size_t kept = 0;
+  for (size_t i = 0; i < retired_images_.size(); ++i) {
+    RetiredImage& retired = retired_images_[i];
+    if (!all && retired.submission > completed) {
+      retired_images_[kept++] = retired;
+      continue;
+    }
+    for (VkImageView view : retired.views) {
+      if (view) dfn.vkDestroyImageView(device, view, nullptr);
+    }
+    if (retired.image) dfn.vkDestroyImage(device, retired.image, nullptr);
+    if (retired.memory) dfn.vkFreeMemory(device, retired.memory, nullptr);
+  }
+  retired_images_.resize(kept);
 }
 
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
                                    bool transfer) {
+  // The image must hold every row a claim reaches before anything is
+  // transferred or drawn there.
+  if (Surface* surface = FindSurface(packed_key)) {
+    EnsureSurfaceRows(*surface, ClaimRows(surface->key, base, length));
+  }
   const auto runs = tiles_.Claim(base, length, packed_key, transfer);
   if (runs.empty()) return;
   Surface* dest = FindSurface(packed_key);
@@ -1302,6 +1444,10 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
                  column_end - column_first, packed_key);
     }
     return;
+  }
+  if (Surface* surface = FindSurface(packed_key)) {
+    const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    EnsureSurfaceRows(*surface, row_end * (xenos::kEdramTileHeightSamples >> msaa_y_log2));
   }
   const uint32_t previous_owner = claim.previous_owner;
   if (previous_owner == kNoOwner) return;
@@ -2003,7 +2149,9 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
+    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], height_used)) {
+      used_bits &= ~(1u << i);
+    }
   }
   pending_used_bits_ = used_bits;
   if (depth_stencil_written && (used_bits & 1)) {
@@ -3013,7 +3161,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
   auto clear = [&](const SurfaceKey& key, uint32_t value, uint32_t value_lo) {
-    Surface* surface = GetOrCreateSurface(key);
+    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
@@ -3078,6 +3226,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   hud_snapshot_taken_ = false;
   hud_scene_base_ = UINT32_MAX;
   if (!initialized_) return;
+  ReleaseRetiredImages(false);
   UpdateCoarseShading();
   GpuDrain();
   frame_ = frame;
@@ -3124,7 +3273,8 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     return;
   }
   const uint32_t width = surface->width * scale_;
-  const uint32_t height = surface->height * scale_;
+  // The rows the image holds: on demand they may stop short of the period.
+  const uint32_t height = surface->image_height * scale_;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();

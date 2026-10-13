@@ -188,6 +188,10 @@ class Fh1NativeExecutor {
     // The EDRAM addressing period's height; the image may be taller
     // (fh1_untile_predicated_tiling), its rows past the period host-only.
     uint32_t height = 0;
+    // The rows the image holds. With fh1_surface_rows_on_demand it starts at
+    // what the first use claims and grows when a claim reaches further, up
+    // to the period (or the untile height); rows no claim reached are never
+    // read, since tile ownership routes every read to a claimed row.
     uint32_t image_height = 0;
     // The image's memory requirement.
     uint64_t bytes = 0;
@@ -257,7 +261,17 @@ class Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
-  Surface* GetOrCreateSurface(const SurfaceKey& key);
+  // rows: the guest rows the caller is about to claim (0: the whole period).
+  Surface* GetOrCreateSurface(const SurfaceKey& key, uint32_t rows = 0);
+  // Creates the image, its memory and views at surface.image_height.
+  bool CreateSurfaceImage(Surface& surface);
+  // Grows the image (copying what it holds) so it has at least `rows` guest rows.
+  void EnsureSurfaceRows(Surface& surface, uint32_t rows);
+  static uint32_t AlignSurfaceRows(uint32_t rows);
+  // Guest rows a claim of tiles [base, base + length) needs in a surface.
+  uint32_t ClaimRows(const SurfaceKey& key, uint32_t base, uint32_t length) const;
+  // Destroys images replaced by growth once their submissions completed.
+  void ReleaseRetiredImages(bool all);
   Surface* FindSurface(uint32_t packed_key);
   void DestroySurface(Surface& surface);
   // Layout, stage and access transition (a barrier pushed to the command
@@ -447,6 +461,13 @@ class Fh1NativeExecutor {
   VkDeviceSize transfer_words_size_ = 0;
   // Outgrown buffers may still be in use by submitted commands.
   std::vector<std::pair<VkBuffer, VkDeviceMemory>> retired_buffers_;
+  struct RetiredImage {
+    uint64_t submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView views[4] = {};
+  };
+  std::vector<RetiredImage> retired_images_;
 
   std::vector<PendingTransfer> pending_transfers_;
   std::vector<PendingReadback> pending_readbacks_;
