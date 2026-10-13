@@ -205,6 +205,8 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
   }
 
   codegen_flags_ = image_info.codegen_flags;
+  folded_ranges_ = image_info.folded_ranges;
+  folded_hash_ = image_info.folded_hash;
 
   if (!function_dispatcher_->InitializeFunctionTable(image_info.code_base, image_info.code_size,
                                                      image_info.image_base, image_info.image_size,
@@ -388,6 +390,30 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
 
   kernel_state_->SetExecutableModule(module);
   REXSYS_DEBUG("  XEX image loaded successfully");
+
+  // The generated code folded read-only image bytes into literals; a different
+  // or patched image would run with stale constants, so refuse it.
+  if (folded_ranges_ && folded_ranges_[0].size != 0) {
+    uint64_t hash = 14695981039346656037ull;
+    size_t ranges = 0, bytes = 0;
+    for (const PPCFoldedRange* range = folded_ranges_; range->size != 0; ++range) {
+      const auto* data = memory_->TranslateVirtual<const uint8_t*>(range->guest);
+      for (uint32_t i = 0; i < range->size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+      }
+      ++ranges;
+      bytes += range->size;
+    }
+    if (hash != folded_hash_) {
+      REXSYS_ERROR(
+          "Runtime::LoadXexImage: the image's read-only data differs from the data the generated "
+          "code folded ({} ranges, {} bytes): hash {:016X}, expected {:016X}",
+          ranges, bytes, hash, folded_hash_);
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    REXSYS_INFO("  Folded read-only data verified ({} ranges, {} bytes)", ranges, bytes);
+  }
   return X_STATUS_SUCCESS;
 }
 

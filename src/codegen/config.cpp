@@ -122,6 +122,12 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             "interior_resume");
   MergeBool(cfg.directCallsBypassThunk, toml["direct_calls_bypass_thunk"].value_or(false),
             hasBool("direct_calls_bypass_thunk"), "direct_calls_bypass_thunk");
+  MergeBool(cfg.foldRodataLoads, toml["fold_rodata_loads"].value_or(false),
+            hasBool("fold_rodata_loads"), "fold_rodata_loads");
+  MergeBool(cfg.guestLineDirectives, toml["guest_line_directives"].value_or(false),
+            hasBool("guest_line_directives"), "guest_line_directives");
+  MergeBool(cfg.disassemblyComments, toml["disassembly_comments"].value_or(true),
+            hasBool("disassembly_comments"), "disassembly_comments");
   if (auto overridden = toml["host_overridden_functions"].as_array()) {
     for (const auto& elem : *overridden) {
       if (auto val = elem.value<int64_t>())

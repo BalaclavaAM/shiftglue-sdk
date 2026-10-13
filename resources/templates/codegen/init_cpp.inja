@@ -14,6 +14,8 @@ const rex::PPCImageInfo PPCImageConfig = {
     .image_size = REX_IMAGE_SIZE,
     .func_mappings = PPCFuncMappings,
     .rexcrt_heap = REXCRT_HEAP,
+    .folded_ranges = PPCFoldedRanges,
+    .folded_hash = PPCFoldedHash,
 {% if has_dll_modules and not is_dll %}
     .register_modules = RegisterRecompiledModules,
 {% endif %}

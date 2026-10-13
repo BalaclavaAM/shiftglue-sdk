@@ -114,6 +114,16 @@ struct RecompilerConfig {
   /// host overrides with a strong `sub_` of its own must be listed in
   /// hostOverriddenFunctions, or direct calls would skip the override.
   bool directCallsBypassThunk = false;
+  /// Replace a load whose address is a constant formed by lis/addi and points
+  /// into a read-only section (.rdata) with the literal value. The folded
+  /// ranges are hashed and checked against the loaded image at start.
+  bool foldRodataLoads = false;
+  /// Emit `#line <guest offset> "<project>.guest"` before each instruction's
+  /// code, so debug line tables (and sample profiles built from them) name
+  /// guest addresses and survive changes to the generated C++.
+  bool guestLineDirectives = false;
+  /// Emit the `// mnemonic operands` comment before each instruction's code.
+  bool disassemblyComments = true;
   std::vector<uint32_t> hostOverriddenFunctions;
   /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
   /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC

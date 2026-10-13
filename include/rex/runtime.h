@@ -193,6 +193,8 @@ class Runtime {
   ui::ImGuiDrawer* imgui_drawer_ = nullptr;
   bool tool_mode_ = false;
   PPCCodegenFlags codegen_flags_{};
+  const PPCFoldedRange* folded_ranges_ = nullptr;
+  u64 folded_hash_ = 0;
   bool setup_complete_ = false;
 
   std::unique_ptr<memory::Memory> memory_;

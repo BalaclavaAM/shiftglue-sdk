@@ -14,6 +14,7 @@
 #include <rex/types.h>
 
 struct PPCFuncMapping;
+struct PPCFoldedRange;
 
 namespace rex::system {
 class KernelState;
@@ -47,6 +48,8 @@ struct PPCImageInfo {
   bool rexcrt_heap = false;  ///< Set by codegen when [rexcrt] has heap functions
   RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects
   PPCCodegenFlags codegen_flags{};                 ///< Set by codegen from the config flags
+  const PPCFoldedRange* folded_ranges = nullptr;   ///< Read-only bytes folded into literals
+  u64 folded_hash = 0;                             ///< FNV-1a 64 of those bytes, in table order
 };
 
 }  // namespace rex

@@ -60,6 +60,17 @@ struct EmitContext {
     if (referenced)
       referenced->emplace(name);
   }
+
+  /// Read-only image ranges folded into literals (fold_rodata_loads), by
+  /// address, with the widest access seen at each.
+  std::map<uint32_t, uint32_t>* foldedRanges = nullptr;
+
+  void fold(uint32_t address, uint32_t size) const {
+    if (!foldedRanges)
+      return;
+    auto& width = (*foldedRanges)[address];
+    width = std::max(width, size);
+  }
 };
 
 //=============================================================================

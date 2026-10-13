@@ -55,3 +55,13 @@ struct PPCFuncMapping {
 };
 
 extern const PPCFuncMapping PPCFuncMappings[];
+
+// Read-only image bytes the generator folded into literals (fold_rodata_loads):
+// the runtime checks their FNV-1a 64 hash against the loaded image, so a
+// patched or different image is refused instead of running stale constants.
+struct PPCFoldedRange {
+  uint32_t guest;
+  uint32_t size;
+};
+extern const PPCFoldedRange PPCFoldedRanges[];  // terminated by {0, 0}
+extern const uint64_t PPCFoldedHash;

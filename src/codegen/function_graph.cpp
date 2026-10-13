@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
+#include <optional>
 #include <cctype>
 #include <string_view>
 #include <unordered_map>
@@ -782,6 +784,130 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   const JumpTable* activeJt = nullptr;
   bool allRecompiled = true;
   CSRState csrState = CSRState::Unknown;
+
+  // fold_rodata_loads: GPRs whose 32-bit value is known from lis/li/addi/ori
+  // along the straight-line path (cleared at labels, calls and hooks). A D-form
+  // load through one of them from .rdata becomes the literal it would read.
+  std::unordered_map<uint32_t, uint32_t> knownRegs;
+  auto knownValue = [&](uint32_t reg) -> std::optional<uint32_t> {
+    auto it = knownRegs.find(reg);
+    return it == knownRegs.end() ? std::nullopt : std::optional<uint32_t>(it->second);
+  };
+  auto tryFoldRodataLoad = [&](const ppc_insn& insn, uint32_t address, std::string& out) -> bool {
+    uint32_t size = 0;
+    switch (insn.opcode->id) {
+      case PPC_INST_LFS: case PPC_INST_LWZ: case PPC_INST_LWA: size = 4; break;
+      case PPC_INST_LFD: case PPC_INST_LD: size = 8; break;
+      case PPC_INST_LHZ: size = 2; break;
+      case PPC_INST_LBZ: size = 1; break;
+      default: return false;
+    }
+    auto baseValue = knownValue(insn.operands[2]);
+    if (!baseValue)
+      return false;
+    uint32_t target = *baseValue + static_cast<int32_t>(insn.operands[1]);
+    const auto* section = ctx.binary.findSection(target);
+    if (!section || section->name != ".rdata" || !section->contains(target + size - 1))
+      return false;
+    const uint8_t* bytes = section->translate(target);
+    if (!bytes)
+      return false;
+    const char* dest = (insn.opcode->id == PPC_INST_LFS || insn.opcode->id == PPC_INST_LFD) ? "f" : "r";
+    switch (insn.opcode->id) {
+      case PPC_INST_LFS: {
+        uint32_t bits = load_and_swap<uint32_t>(bytes);
+        float f;
+        std::memcpy(&f, &bits, sizeof f);
+        double d = double(f);
+        uint64_t dbits;
+        std::memcpy(&dbits, &d, sizeof dbits);
+        emit_println(out, "\tctx.f{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+                     dbits, target);
+        break;
+      }
+      case PPC_INST_LFD:
+        emit_println(out, "\tctx.f{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+                     load_and_swap<uint64_t>(bytes), target);
+        break;
+      case PPC_INST_LD:
+        emit_println(out, "\tctx.r{}.u64 = 0x{:016X}ull;  // folded 0x{:08X}", insn.operands[0],
+                     load_and_swap<uint64_t>(bytes), target);
+        break;
+      case PPC_INST_LWZ:
+        emit_println(out, "\tctx.r{}.u64 = 0x{:08X}u;  // folded 0x{:08X}", insn.operands[0],
+                     load_and_swap<uint32_t>(bytes), target);
+        break;
+      case PPC_INST_LWA:
+        emit_println(out, "\tctx.r{}.s64 = int32_t(0x{:08X}u);  // folded 0x{:08X}",
+                     insn.operands[0], load_and_swap<uint32_t>(bytes), target);
+        break;
+      case PPC_INST_LHZ:
+        emit_println(out, "\tctx.r{}.u64 = 0x{:04X}u;  // folded 0x{:08X}", insn.operands[0],
+                     load_and_swap<uint16_t>(bytes), target);
+        break;
+      case PPC_INST_LBZ:
+        emit_println(out, "\tctx.r{}.u64 = 0x{:02X}u;  // folded 0x{:08X}", insn.operands[0],
+                     bytes[0], target);
+        break;
+      default:
+        return false;
+    }
+    (void)dest;
+    ctx.fold(target, size);
+    (void)address;
+    return true;
+  };
+  // Keep knownRegs honest after an instruction: what it writes is unknown.
+  auto trackRegisters = [&](const ppc_insn& insn) {
+    const std::string_view name = insn.opcode->name;
+    switch (insn.opcode->id) {
+      case PPC_INST_LIS:
+        knownRegs[insn.operands[0]] = static_cast<uint32_t>(insn.operands[1]) << 16;
+        return;
+      case PPC_INST_LI:
+        knownRegs[insn.operands[0]] = static_cast<uint32_t>(static_cast<int32_t>(insn.operands[1]));
+        return;
+      case PPC_INST_ADDI:
+      case PPC_INST_ADDIS:
+      case PPC_INST_ORI: {
+        auto baseValue = knownValue(insn.operands[1]);
+        if (!baseValue) {
+          knownRegs.erase(insn.operands[0]);
+          return;
+        }
+        uint32_t imm = static_cast<uint32_t>(insn.operands[2]);
+        if (insn.opcode->id == PPC_INST_ADDI)
+          knownRegs[insn.operands[0]] = *baseValue + static_cast<int32_t>(imm);
+        else if (insn.opcode->id == PPC_INST_ADDIS)
+          knownRegs[insn.operands[0]] = *baseValue + (imm << 16);
+        else
+          knownRegs[insn.operands[0]] = *baseValue | (imm & 0xFFFF);
+        return;
+      }
+      default:
+        break;
+    }
+    if (name == "bl" || name == "bctrl" || name == "blrl" || name == "lmw" || name == "sc" ||
+        name.starts_with("bcl") || name.starts_with("bdnzl") || name.starts_with("bdzl")) {
+      knownRegs.clear();  // a call clobbers the volatile registers; lmw writes many
+      return;
+    }
+    if (name.starts_with("st")) {
+      // Stores write only their update register.
+      if (name.ends_with("u") || name.ends_with("ux")) {
+        knownRegs.erase(insn.operands[1]);
+        knownRegs.erase(insn.operands[2]);
+      }
+      return;
+    }
+    if (name.starts_with("b"))
+      return;  // branches write no GPR
+    knownRegs.erase(insn.operands[0]);
+    if (name.ends_with("u") || name.ends_with("ux")) {
+      knownRegs.erase(insn.operands[1]);
+      knownRegs.erase(insn.operands[2]);
+    }
+  };
   RecompilerLocalVariables localVariables;
 
   // Local map for late-detected jump tables (can't mutate const config)
@@ -823,6 +949,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
         csrState = CSRState::Unknown;
+        knownRegs.clear();
       }
 
       // Look up switch table for this address
@@ -896,12 +1023,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();
+          knownRegs.clear();  // a hook may write any register
         }
 
-        if (!DispatchInstruction(id, builderCtx)) {
+        bool folded = ctx.config.foldRodataLoads && tryFoldRodataLoad(insn, blockBase, body);
+        if (!folded && !DispatchInstruction(id, builderCtx)) {
           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
           allRecompiled = false;
         }
+        if (ctx.config.foldRodataLoads)
+          trackRegisters(insn);
 
         // Check for mid-asm hook AFTER instruction
         if (hookIt != ctx.config.midAsmHooks.end() && hookIt->second.afterInstruction) {

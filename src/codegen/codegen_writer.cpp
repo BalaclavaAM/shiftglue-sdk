@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <string>
 #include <unordered_map>
+#include <map>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -292,6 +293,8 @@ bool CodegenWriter::write(bool force) {
   const size_t maxFileBytes = REXCVAR_GET(max_file_size_bytes);
   std::unordered_set<std::string> referenced;
   emitCtx.referenced = &referenced;
+  std::map<uint32_t, uint32_t> foldedRanges;
+  emitCtx.foldedRanges = &foldedRanges;
   for (const auto* fn : functions) {
     referenced.clear();
     std::string code = fn->emitCpp(emitCtx);
@@ -304,6 +307,34 @@ bool CodegenWriter::write(bool force) {
     references.push_back(referenced);
   }
   emitCtx.referenced = nullptr;
+  emitCtx.foldedRanges = nullptr;
+
+  // The read-only bytes folded into literals, with their FNV-1a 64 hash for the
+  // runtime's check against the loaded image (rex/ppc/func.h PPCFoldedRange).
+  {
+    uint64_t hash = 14695981039346656037ull;
+    size_t bytes = 0;
+    println("#include \"{}_pch.h\"\n", projectName);
+    println("const PPCFoldedRange PPCFoldedRanges[] = {{");
+    for (const auto& [address, size] : foldedRanges) {
+      const auto* section = binary().findSection(address);
+      const uint8_t* data = section ? section->translate(address) : nullptr;
+      if (!data)
+        continue;
+      for (uint32_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+      }
+      bytes += size;
+      println("	{{ 0x{:08X}, {} }},", address, size);
+    }
+    println("	{{ 0, 0 }}");
+    println("}};");
+    println("const uint64_t PPCFoldedHash = 0x{:016X}ull;", hash);
+    SaveCurrentOutData(fmt::format("{}_folds.cpp", projectName));
+    REXCODEGEN_TRACE("Folded {} read-only ranges ({} bytes) into literals", foldedRanges.size(),
+                     bytes);
+  }
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);
@@ -341,6 +372,7 @@ bool CodegenWriter::write(bool force) {
   {
     auto& recompFiles = tmplData["recomp_files"];
     recompFiles = nlohmann::json::array();
+    recompFiles.push_back(fmt::format("{}_folds.cpp", projectName));
     for (size_t i = 0; i < buckets.size(); ++i) {
       recompFiles.push_back(fmt::format("{}_recomp.{}.cpp", projectName, i));
     }
