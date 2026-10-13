@@ -191,6 +191,14 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 #define REX_STACK_STORE_U32(x, y) (*(REX_STACK_QUAL u32*)(base + (u32)(x)) = __builtin_bswap32(y))
 #define REX_STACK_STORE_U64(x, y) (*(REX_STACK_QUAL u64*)(base + (u32)(x)) = __builtin_bswap64(y))
 
+// Reference copies (reference_functions): the generator wraps a `ref_sub_X`
+// body in push_macro/pop_macro and points the store macros here, so every
+// store is logged for the verifier's rollback and comparison (rex/ppc/reference.h).
+#define REX_REF_STORE_U8(x, y)   ::rex::ppc::RefStore<u8>((volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), (u8)(y))
+#define REX_REF_STORE_U16(x, y)                                                                ::rex::ppc::RefStore<u16>((volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap16(y))
+#define REX_REF_STORE_U32(x, y)                                                                ::rex::ppc::RefStore<u32>((volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap32(y))
+#define REX_REF_STORE_U64(x, y)                                                                ::rex::ppc::RefStore<u64>((volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap64(y))
+
 #define REX_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================
