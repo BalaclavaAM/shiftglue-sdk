@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -76,7 +77,11 @@ class AudioSystem : public system::IAudioSystem {
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
 
-  rex::thread::global_critical_region global_critical_region_;
+  // Guards clients_. The global critical region is never taken while holding
+  // it, so its holders can't delay the pump (xenia-edge 12e3b4223d): before,
+  // every pump took the global lock to read the callback, and a guest thread
+  // holding it for I/O stalled the audio worker (#416).
+  std::mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
