@@ -1008,8 +1008,19 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           }
         }
 
+        // A line directive names the guest byte offset, so the debug line
+        // table maps host code back to guest addresses whatever the C++ looks
+        // like. Instructions are 4 apart, so an instruction's lines stay
+        // distinct up to four C++ lines; longer expansions bleed into the
+        // next instruction's numbers.
+        if (ctx.config.guestLineDirectives) {
+          emit_println(body, "#line {} \"{}.guest\"", blockBase - ctx.binary.baseAddress() + 1,
+                       ctx.config.projectName);
+        }
+
         // Emit comment with instruction disassembly
-        emit_println(body, "\t// {} {}", insn.opcode->name, insn.op_str);
+        if (ctx.config.disassemblyComments)
+          emit_println(body, "\t// {} {}", insn.opcode->name, insn.op_str);
 
         // Check for mid-asm hook BEFORE instruction
         auto hookIt = ctx.config.midAsmHooks.find(blockBase);
