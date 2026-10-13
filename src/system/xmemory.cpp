@@ -2111,7 +2111,7 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
   }
 
   // Not caring about the contents anymore.
-  TriggerCallbacks(std::move(global_lock), address, size, true, true);
+  TriggerCallbacks(std::move(global_lock), address, size, true, true, true, false, true);
 
   return BaseHeap::Decommit(address, size);
 }
@@ -2135,7 +2135,8 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   // thus callback handlers will keep considering this range valid forever.
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
-    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true);
+    TriggerCallbacks(std::move(global_lock), base_address, region_size, true, true, true, false,
+                     true);
   }
 
   return BaseHeap::Release(base_address, out_region_size);
@@ -2146,9 +2147,13 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   auto global_lock = global_critical_region_.Acquire();
 
   // Only invalidate if making writable again, for simplicity - not when simply
-  // marking some range as immutable, for instance.
+  // marking some range as immutable, for instance. The guest is announcing a
+  // write rather than reacting to a fault, so invalidate even with no watch
+  // armed: a range that was read-only when it was last uploaded never got one,
+  // and would otherwise stay stale for as long as the guest keeps it read-only
+  // outside of its own writes.
   if (protect & memory::kMemoryProtectWrite) {
-    TriggerCallbacks(std::move(global_lock), address, size, true, true, false);
+    TriggerCallbacks(std::move(global_lock), address, size, true, true, false, false, true);
   }
 
   if (!parent_heap_->Protect(GetPhysicalAddress(address), size, protect, old_protect)) {
@@ -2289,7 +2294,7 @@ uint32_t CurrentAccessFaultVirtualAddress() { return access_fault_virtual_addres
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                     uint32_t virtual_address, uint32_t length, bool is_write,
                                     bool unwatch_exact_range, bool unprotect,
-                                    bool notify_access_observers) {
+                                    bool notify_access_observers, bool invalidate_unwatched) {
   PERF_counter_inc(kWriteWatchTriggers);
 
   if (virtual_address < heap_base_) {
@@ -2346,7 +2351,15 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     any_invalidation_watched |= invalidation_block != 0;
   }
   if (!any_watched) {
-    return false;
+    if (!invalidate_unwatched || !is_write) {
+      return false;
+    }
+    // The guest announced a write (protect, decommit, release) rather than
+    // faulting on one. A range that was read-only when the GPU last uploaded
+    // it never got a watch, and page validity persists across frames
+    // (clear_memory_page_state off), so raise the invalidation callbacks
+    // anyway or the range stays stale (xenia-edge 5ddf045a83).
+    any_invalidation_watched = true;
   }
 
   // Trigger callbacks.

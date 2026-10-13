@@ -338,11 +338,14 @@ class PhysicalHeap : public BaseHeap {
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers,
                              bool enable_access_notifications = false);
-  // Returns true if any page in the range was watched.
+  // Returns true if any page in the range was watched. With
+  // invalidate_unwatched the callbacks are raised even when no watch is armed,
+  // for a caller that knows the range is about to change (a protect, decommit
+  // or release by the guest) rather than one reacting to a fault.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
                         bool unwatch_exact_range, bool unprotect = true,
-                        bool notify_access_observers = false);
+                        bool notify_access_observers = false, bool invalidate_unwatched = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
