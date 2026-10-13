@@ -1,0 +1,21 @@
+test_mcrxr_1:
+  #_ REGISTER_IN r3 0x0000000000000001
+  #_ REGISTER_IN r4 0x0000000000000001
+  addc r5, r3, r4
+  # mcrxr 1 (hand-encoded: not in this binutils)
+  .long 0x7C800400
+  blr
+  #_ REGISTER_OUT r3 0x0000000000000001
+  #_ REGISTER_OUT r4 0x0000000000000001
+  #_ REGISTER_OUT r5 0x0000000000000002
+
+test_mcrxr_2:
+  #_ REGISTER_IN r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_IN r4 0x0000000000000001
+  addc r5, r3, r4
+  # mcrxr 2 (hand-encoded: not in this binutils)
+  .long 0x7D000400
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r4 0x0000000000000001
+  #_ REGISTER_OUT r5 0x0000000000000000

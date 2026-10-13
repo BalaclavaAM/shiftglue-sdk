@@ -1,6 +1,6 @@
-test_jumptable:
+the_function:
   cmpwi cr6, r3, 3
-  bgt cr6, .case_3
+  bgt .case_3
   lis r11, .the_table@h
   addi r11, r11, .the_table@l
   slwi r3, r3, 2
@@ -16,7 +16,7 @@ test_jumptable:
   li r11, 8
   b .the_divide
 .case_1:
-  li r11, 16 
+  li r11, 16
   b .the_divide
 .case_2:
   li r11, 24
@@ -33,15 +33,15 @@ test_jumptable_constants:
   mfspr r12, lr
   li r3, 0
   li r4, 1024
-  bl test_jumptable
+  bl the_function
   li r3, 1
   li r4, 1024
-  bl test_jumptable
+  bl the_function
   li r3, 2
   li r4, 1024
-  bl test_jumptable
+  bl the_function
   li r3, 3
   li r4, 1024
-  bl test_jumptable
+  bl the_function
   mtspr lr, r12
   blr
