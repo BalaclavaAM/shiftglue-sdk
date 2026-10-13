@@ -65,7 +65,8 @@ void ReportStaleIncludes(const fs::path& manifest_path,
 }
 
 Result<void> RecompileProject(const fs::path& manifest_path, const CliContext& ctx,
-                              const std::vector<std::string>& targets, bool ignore_stamp) {
+                              const std::vector<std::string>& targets, bool ignore_stamp,
+                              bool abi_poison) {
   auto manifest = rex::codegen::ManifestConfig::Load(manifest_path);
   if (!manifest) {
     return Err<void>(rex::ErrorCategory::Config, "Failed to load manifest");
@@ -76,6 +77,7 @@ Result<void> RecompileProject(const fs::path& manifest_path, const CliContext& c
   rex::codegen::ProjectRecompilerOptions opts{
       .targets = targets,
       .force = ctx.generate_despite_errors,
+      .abiPoisonChecks = abi_poison,
       .reporter = &progress,
       .ignoreStamp = ignore_stamp,
       .sdkVersion = REXGLUE_VERSION_FLOOR "-" REXGLUE_VERSION_CHANNEL,
@@ -134,6 +136,7 @@ struct CodegenArgs {
   std::string config_path;
   std::vector<std::string> targets;
   bool ignore_stamp = false;
+  bool abi_poison = false;
 };
 
 }  // namespace
@@ -182,7 +185,8 @@ Result<std::string> DiscoverManifestInCwd() {
 }
 
 Result<void> CodegenFromConfig(const std::string& config_path, const CliContext& ctx,
-                               const std::vector<std::string>& targets, bool ignore_stamp) {
+                               const std::vector<std::string>& targets, bool ignore_stamp,
+                               bool abi_poison) {
   REXLOG_TRACE("Generating code with config: {}", config_path);
 
   fs::path manifest_path = config_path;
@@ -207,7 +211,8 @@ Result<void> CodegenFromConfig(const std::string& config_path, const CliContext&
     REXLOG_INFO("Regenerated generated/rexglue.cmake for SDK v{}", current_version);
   }
 
-  if (auto run_result = RecompileProject(manifest_path, ctx, targets, ignore_stamp); !run_result) {
+  if (auto run_result = RecompileProject(manifest_path, ctx, targets, ignore_stamp, abi_poison);
+      !run_result) {
     return run_result;
   }
 
@@ -229,6 +234,9 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
       ->take_all();
   sub->add_flag("--ignore-stamp", args->ignore_stamp,
                 "Regenerate even when inputs match the recorded stamp");
+  sub->add_flag("--abi-poison", args->abi_poison,
+                "Checking build: wrap guest calls in PowerPC ABI preservation checks and "
+                "poison the volatile registers dead at a return (abi_poison_checks)");
 
   sub->callback([args, &ctx, &pending]() {
     pending = [args, &ctx]() -> Result<void> {
@@ -239,7 +247,7 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
           return Err<void>(discovered.error());
         path = *discovered;
       }
-      return CodegenFromConfig(path, ctx, args->targets, args->ignore_stamp);
+      return CodegenFromConfig(path, ctx, args->targets, args->ignore_stamp, args->abi_poison);
     };
   });
 }

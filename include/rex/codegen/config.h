@@ -102,6 +102,10 @@ struct RecompilerConfig {
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
+  /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
+  /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC
+  /// non-volatile registers and poison the volatile ones dead at a return.
+  bool abiPoisonChecks = false;
 
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets

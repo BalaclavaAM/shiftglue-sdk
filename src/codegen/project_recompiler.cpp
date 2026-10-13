@@ -313,6 +313,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     RecompilerConfig cfg = std::move(targeted[0].config);
     if (opts.enableExceptionHandlers)
       cfg.generateExceptionHandlers = true;
+    if (opts.abiPoisonChecks)
+      cfg.abiPoisonChecks = true;
 
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);
@@ -336,6 +338,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     RecompilerConfig cfg = std::move(targeted[i + 1].config);
     if (opts.enableExceptionHandlers)
       cfg.generateExceptionHandlers = true;
+    if (opts.abiPoisonChecks)
+      cfg.abiPoisonChecks = true;
 
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);
