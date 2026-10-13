@@ -686,8 +686,15 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   }
 
   auto& c = state.caps;
-  c.type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
-  c.sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
+  c.type = 0x01;  // XINPUT_DEVTYPE_GAMEPAD
+  // XINPUT_DEVSUBTYPE_WHEEL (2) for a wheel when asked, GAMEPAD (1) otherwise:
+  // a title may read the subtype to pick its steering model (after
+  // xenia-canary 103257c5aa); the wheel detection is the one the steering
+  // shaping uses.
+  c.sub_type = (REXCVAR_GET(input_report_wheel_subtype) &&
+                (state.wheel_type || IsListedWheel(state.guid)))
+                   ? 0x02
+                   : 0x01;
   c.flags = cap_flags;
   c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
   c.gamepad.left_trigger = 0xFF;
