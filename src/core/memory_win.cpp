@@ -177,6 +177,68 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   return true;
 }
 
+#ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+namespace {
+
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+
+// VirtualAlloc2 and MapViewOfFile3 (Windows 10 1803 and later) map a view at
+// any page-aligned file offset, where MapViewOfFileEx rounds the offset to the
+// 64 KB allocation granularity. The guest's 0xE0000000 physical view starts
+// 4 KB into the physical heap; mapping it there removes the +0x1000 select
+// from every generated guest memory access (NEXT_LEVEL_RESEARCH.md NL-1.1).
+// Resolved at run time so the binary still loads on an older system, which
+// Memory::Initialize then refuses with a message instead of running with the
+// wrong view.
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE process, PVOID base_address, SIZE_T size,
+                                       ULONG allocation_type, ULONG page_protection,
+                                       void* extended_parameters, ULONG parameter_count);
+using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE file_mapping, HANDLE process, PVOID base_address,
+                                        ULONG64 offset, SIZE_T view_size, ULONG allocation_type,
+                                        ULONG page_protection, void* extended_parameters,
+                                        ULONG parameter_count);
+
+struct PlaceholderViewApi {
+  VirtualAlloc2Fn virtual_alloc2 = nullptr;
+  MapViewOfFile3Fn map_view_of_file3 = nullptr;
+  bool available() const { return virtual_alloc2 && map_view_of_file3; }
+};
+
+const PlaceholderViewApi& placeholder_view_api() {
+  static const PlaceholderViewApi api = [] {
+    PlaceholderViewApi resolved;
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelbase) {
+      kernelbase = LoadLibraryW(L"kernelbase.dll");
+    }
+    if (kernelbase) {
+      resolved.virtual_alloc2 =
+          reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
+      resolved.map_view_of_file3 =
+          reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
+    }
+    return resolved;
+  }();
+  return api;
+}
+
+}  // namespace
+#endif
+
+bool MapFileViewOffsetsAreExact() {
+#ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+  return placeholder_view_api().available();
+#else
+  // MapViewOfFile3FromApp takes any page-aligned offset.
+  return true;
+#endif
+}
+
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
   DWORD protect = ToWin32ProtectFlags(access) | (commit ? SEC_COMMIT : SEC_RESERVE);
@@ -202,6 +264,26 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset) {
 #ifdef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+  const PlaceholderViewApi& placeholders = placeholder_view_api();
+  if (placeholders.available()) {
+    // A placeholder reservation replaced by the view: the only way to map a
+    // view at a file offset that is page-aligned but not 64 KB-aligned.
+    HANDLE process = GetCurrentProcess();
+    void* placeholder = placeholders.virtual_alloc2(
+        process, base_address, length, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+        nullptr, 0);
+    if (!placeholder) {
+      return nullptr;
+    }
+    void* mapping = placeholders.map_view_of_file3(
+        reinterpret_cast<HANDLE>(handle), process, placeholder, ULONG64(file_offset), length,
+        MEM_REPLACE_PLACEHOLDER, ULONG(ToWin32ProtectFlags(access)), nullptr, 0);
+    if (!mapping) {
+      VirtualFree(placeholder, 0, MEM_RELEASE);
+      return nullptr;
+    }
+    return mapping;
+  }
   DWORD target_address_low = static_cast<DWORD>(file_offset);
   DWORD target_address_high = static_cast<DWORD>(file_offset >> 32);
   DWORD file_access = 0;

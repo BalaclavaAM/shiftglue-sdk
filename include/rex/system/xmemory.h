@@ -35,21 +35,26 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 
 namespace rex::memory::detail {
 
-/// Compensates for host allocation granularity coarser than 4KB on the 0xE0
-/// physical heap. When the granularity exceeds 0x1000, the backing file maps the
-/// 0xE0 heap at a 0x1000-byte offset that the mapping API rounds away (Windows
-/// MapViewOfFileEx rounds down to 64KB; macOS arm64 uses 16KB pages), so guest
-/// accesses must add it back. This must agree with PhysicalHeap::Initialize,
-/// which only sets host_address_offset when allocation_granularity() > 0x1000:
-///   - Windows:        64KB granularity  -> offset
-///   - macOS arm64:    16KB granularity  -> offset
-///   - macOS x86_64:    4KB granularity  -> no offset
+/// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
+/// 0xE0 heap starts 0x1000 bytes into the physical heap; where the mapping API
+/// cannot place a view at a page-aligned offset finer than the allocation
+/// granularity, the view is mapped rounded down and guest accesses add the
+/// offset back. This must agree with PhysicalHeap::Initialize, which sets
+/// host_address_offset only when allocation_granularity() > 0x1000 and
+/// MapFileViewOffsetsAreExact() is false:
+///   - Windows:        placeholder views (VirtualAlloc2, MapViewOfFile3) map
+///                     the view exactly -> no offset; Memory::Initialize
+///                     refuses to run where they are missing (before 1803)
+///   - macOS arm64:    16KB pages        -> offset
+///   - macOS x86_64:    4KB pages        -> no offset
 ///   - Linux, Android: the page size, known only at run time: 4KB kernels
 ///                     need no offset, 16KB and 64KB ones (some ARM64
-///                     distributions and devices) do
-#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
+///                     distributions and devices) do. A build with
+///                     REX_PHYSICAL_HEAP_4K_PAGES assumes 4KB and refuses to
+///                     run on anything else.
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC || defined(REX_PHYSICAL_HEAP_4K_PAGES)
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32 || defined(__aarch64__)
+#if REX_PLATFORM_MAC && defined(__aarch64__)
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;

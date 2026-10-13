@@ -137,10 +137,16 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
-#define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
-#elif REX_PLATFORM_MAC
+// The 0xE0000000 physical view starts 4 KB into the physical heap. Where the
+// runtime maps it there, a guest access is base + address and nothing else:
+// Windows (placeholder views; the runtime refuses to start without them),
+// x86-64 macOS (4 KB pages) and Linux or Android builds made for 4 KB-page
+// kernels (REX_PHYSICAL_HEAP_4K_PAGES). Elsewhere the view is mapped rounded
+// down to the page size and accesses at or above 0xE0000000 add 0x1000 back.
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && !REX_ARCH_ARM64) || defined(REX_PHYSICAL_HEAP_4K_PAGES)
 #define REX_PHYS_HOST_OFFSET(addr) 0u
+#elif REX_PLATFORM_MAC
+#define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 // Linux and Android: 0x1000 only on kernels with pages larger than 4 KB,
 // chosen by the runtime at startup.

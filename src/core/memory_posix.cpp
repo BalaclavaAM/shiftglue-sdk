@@ -448,6 +448,12 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
   (void)path;
 #endif
 }
+bool MapFileViewOffsetsAreExact() {
+  // mmap takes any page-aligned offset, so a 4 KB offset is exact on 4 KB
+  // kernels only.
+  return page_size() <= 0x1000;
+}
+
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset) {
   // file_offset must be page-aligned

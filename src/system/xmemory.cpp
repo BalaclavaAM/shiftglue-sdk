@@ -154,6 +154,26 @@ bool Memory::Initialize() {
     return false;
   }
 
+#if REX_PLATFORM_WIN32 || defined(REX_PHYSICAL_HEAP_4K_PAGES)
+  // Generated code and PhysicalHostOffset add nothing to accesses at
+  // 0xE0000000 and above in this build (REX_PHYS_HOST_OFFSET is 0), so the
+  // view has to sit at its exact 4 KB offset into the physical heap.
+  if (rex::memory::allocation_granularity() > 0x1000 &&
+      !rex::memory::MapFileViewOffsetsAreExact()) {
+#if REX_PLATFORM_WIN32
+    REXSYS_ERROR(
+        "This build maps the 0xE0000000 physical view at its exact 4 KB offset, which needs "
+        "VirtualAlloc2 and MapViewOfFile3: Windows 10 version 1803 or later.");
+#else
+    REXSYS_ERROR(
+        "This build was made for 4 KB memory pages, but this kernel uses {} KB pages. Build "
+        "without PINYON_SHIFT_PHYSICAL_HEAP_4K_PAGES for it.",
+        rex::memory::page_size() / 1024);
+#endif
+    return false;
+  }
+#endif
+
 #if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
   // Reserve a contiguous host range first, then carve guest views into it with
   // MAP_SHARED|MAP_FIXED so all views share the same backing fd. MAP_FIXED at a
@@ -368,9 +388,14 @@ int Memory::MapViewsReserved() {
 
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
-  // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
-  // side if system allocation granularity is bigger than 4 KB.
-  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+  // The 0xE0000000 view starts 4 KB into the physical heap. Where MapFileView
+  // honours page-aligned offsets (placeholder views on Windows) it is mapped
+  // there and guest accesses add nothing; otherwise the offset is rounded to
+  // the allocation granularity and host_address_offset adds it back on the
+  // CPU side.
+  const uint64_t granularity_mask = rex::memory::MapFileViewOffsetsAreExact()
+                                        ? ~uint64_t(0)
+                                        : ~uint64_t(system_allocation_granularity_ - 1);
   for (size_t n = 0; n < rex::countof(map_info); n++) {
     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
         mapping_, mapping_base + map_info[n].virtual_address_start,
@@ -1963,7 +1988,8 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
                               uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
                               VirtualHeap* parent_heap) {
   uint32_t host_address_offset;
-  if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000) {
+  if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000 &&
+      !rex::memory::MapFileViewOffsetsAreExact()) {
     host_address_offset = 0x1000;
   } else {
     host_address_offset = 0;
