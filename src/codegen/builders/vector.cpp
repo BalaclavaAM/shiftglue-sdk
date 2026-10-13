@@ -91,22 +91,27 @@ bool build_vmulfp128(BuilderContext& ctx) {
 }
 
 bool build_vmaddfp(BuilderContext& ctx) {
+  // The product is not rounded before the add (AltiVec fuses it); simde's
+  // fmadd is one instruction on x86 FMA and ARM64 and falls back to a rounded
+  // product on hosts without it.
   ctx.emit_set_flush_mode(true);
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
+      "\tsimde_mm_store_ps({}.f32, simde_mm_fmadd_ps(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
       ctx.v(ctx.insn.operands[3]));
   return true;
 }
 
 bool build_vnmsubfp(BuilderContext& ctx) {
-  // vnmsubfp: vD = -(vA * vB - vC) - negation done by XOR with sign bit (0x80000000)
+  // vnmsubfp: vD = -(vA * vB - vC): one fused multiply-subtract (as vmaddfp),
+  // then the negation by XOR with the sign bit, which keeps the sign of a zero
+  // result as the hardware does.
   ctx.emit_set_flush_mode(true);
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), "
+      "simde_mm_xor_ps(simde_mm_fmsub_ps(simde_mm_load_ps({}.f32), "
+      "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)), "
       "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
       ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
       ctx.v(ctx.insn.operands[3]));

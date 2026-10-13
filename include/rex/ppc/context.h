@@ -22,6 +22,7 @@
 #include <rex/types.h>
 
 #include <simde/x86/avx.h>
+#include <simde/x86/fma.h>
 #include <simde/x86/sse.h>
 #include <simde/x86/sse4.1.h>
 
