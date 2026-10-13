@@ -59,7 +59,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
   // here and emit each resume alias exactly once.
   std::unordered_map<uint32_t, const rex::codegen::FunctionNode*> resumeAliasOwners;
   for (const auto* fn : functions) {
-    if (fn->authority() == rex::codegen::FunctionAuthority::IMPORT) {
+    if (fn->authority() == rex::codegen::FunctionAuthority::IMPORT || !cfg.interiorResume) {
       continue;
     }
     for (uint32_t address : fn->resumableReturnAddresses(ctx.binary())) {
@@ -88,7 +88,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
     }
 
     nlohmann::json resumeAliases = nlohmann::json::array();
-    if (fn->authority() != rex::codegen::FunctionAuthority::IMPORT) {
+    if (fn->authority() != rex::codegen::FunctionAuthority::IMPORT && cfg.interiorResume) {
       for (uint32_t address : fn->resumableReturnAddresses(ctx.binary())) {
         const auto owner = resumeAliasOwners.find(address);
         if (owner != resumeAliasOwners.end() && owner->second == fn) {
@@ -118,6 +118,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"non_argument_as_local", cfg.nonArgumentRegistersAsLocalVariables},
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
       {"abi_poison_checks", cfg.abiPoisonChecks},
+      {"interior_resume", cfg.interiorResume},
   };
 
   return {

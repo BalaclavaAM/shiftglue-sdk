@@ -118,6 +118,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
   MergeBool(cfg.abiPoisonChecks, toml["abi_poison_checks"].value_or(false),
             hasBool("abi_poison_checks"), "abi_poison_checks");
+  MergeBool(cfg.interiorResume, toml["interior_resume"].value_or(true), hasBool("interior_resume"),
+            "interior_resume");
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

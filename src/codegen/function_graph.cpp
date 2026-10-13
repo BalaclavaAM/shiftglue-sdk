@@ -669,7 +669,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // --- First pass: collect labels from all blocks ---
   std::unordered_set<size_t> labels;
   labels.reserve(64);
-  const auto resumeAddresses = resumableReturnAddresses(ctx.binary);
+  // Without interior resume no return address is an entry, so no label and no
+  // switch: the function has a single entry and its loops stay reducible.
+  const auto resumeAddresses =
+      ctx.config.interiorResume ? resumableReturnAddresses(ctx.binary) : std::vector<uint32_t>{};
   labels.insert(resumeAddresses.begin(), resumeAddresses.end());
 
   for (const auto& block : blocks()) {
@@ -798,7 +801,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     }
     emit_println(body, "\t\tdefault: break;");
     emit_println(body, "\t}}\n");
-  } else {
+  } else if (ctx.config.interiorResume) {
     emit_println(body, "\tctx.dispatch_address = 0;");
   }
 

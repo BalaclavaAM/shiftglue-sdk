@@ -102,6 +102,13 @@ struct RecompilerConfig {
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
+  /// Emit a resume switch at every function entry and register every linked-call
+  /// return address, so the runtime can re-enter a function at a return address
+  /// after a guest stack switch (KeSetCurrentStackPointers). Off when the
+  /// title's fiber functions run on host fibers ([rexcrt] CreateFiber,
+  /// SwitchToFiber, ...), which keeps the host call chain intact: every
+  /// function then has a single entry.
+  bool interiorResume = true;
   /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
   /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC
   /// non-volatile registers and poison the volatile ones dead at a return.
