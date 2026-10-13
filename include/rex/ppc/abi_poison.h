@@ -98,7 +98,43 @@ inline void AbiPoisonCapture(const ::PPCContext& ctx, AbiPoisonSnapshot& snapsho
   snapshot.vr_high = AbiPoisonHashVectors(v + 64, 64);
 }
 
+// A poison value names the register and the call site that left it:
+// 0x9R'SSSSSS, R the register number (vector numbers above 15 wrap) and
+// SSSSSS the call site's word offset from the image base 0x82000000. The
+// 0x90000000 range is the XEX's 4 KB view, which the title's data never
+// points into, so a poison that reaches an argument register is recognizable
+// even after small arithmetic.
+constexpr uint32_t kAbiPoisonImageBase = 0x82000000u;
+constexpr uint32_t kAbiPoisonImageWords = 0x00800000u;
+
+inline uint32_t AbiPoisonValue(int reg, uint32_t site) {
+  return 0x90000000u | (uint32_t(reg & 15) << 24) | (((site - kAbiPoisonImageBase) >> 2) & 0x00FFFFFFu);
+}
+
+inline bool AbiPoisonLooksPoisoned(uint64_t value) {
+  const uint32_t low = uint32_t(value);
+  return (low >> 28) == 9 && (low & 0x00FFFFFFu) < kAbiPoisonImageWords &&
+         (value >> 32) == 0;
+}
+
+inline std::atomic<uint64_t> g_abi_poison_dead_reads{0};
+
 inline void AbiPoisonPreCall(::PPCContext& ctx, uint32_t site) {
+  // An argument that still holds a poison was read from a register the ABI
+  // says is dead after an earlier call: the caller of this call site relies
+  // on that earlier callee preserving it.
+  for (int i = 3; i <= 10; ++i) {
+    const uint64_t value = (ctx.*kGprMembers[i]).u64;
+    if (AbiPoisonLooksPoisoned(value)) {
+      const uint64_t count = ++g_abi_poison_dead_reads;
+      if (count <= 500) {
+        const uint32_t low = uint32_t(value);
+        REXCPU_ERROR("ABI_POISON dead read: call at {:08X} passes r{} = {:08X}, which is r{} as left by "
+                     "the call at {:08X}",
+                     site, i, low, (low >> 24) & 15, kAbiPoisonImageBase + ((low & 0x00FFFFFFu) << 2));
+      }
+    }
+  }
   auto& stack = AbiPoisonStack();
   stack.emplace_back();
   AbiPoisonSnapshot& snapshot = stack.back();
@@ -150,26 +186,26 @@ inline void AbiPoisonPostCall(::PPCContext& ctx, uint32_t site) {
   }
   const uint64_t calls = ++g_abi_poison_calls;
   if ((calls & ((uint64_t(1) << 24) - 1)) == 0) {
-    REXCPU_WARN("ABI_POISON summary calls={} mismatches={} dropped={}", calls,
-                g_abi_poison_mismatches.load(), g_abi_poison_dropped.load());
+    REXCPU_WARN("ABI_POISON summary calls={} mismatches={} dead_reads={} dropped={}", calls,
+                g_abi_poison_mismatches.load(), g_abi_poison_dead_reads.load(),
+                g_abi_poison_dropped.load());
   }
 
   // Poison the volatile registers the ABI leaves dead at a return.
-  constexpr uint64_t kGprPoison = 0xDEADBEEFDEADBEEFull;
-  constexpr uint64_t kFprPoison = 0x7FF8DEADBEEF0000ull;  // a quiet NaN
-  constexpr uint32_t kVrPoison = 0xDEADBEEFu;
+  auto poison_for = [site](int reg) -> uint32_t { return AbiPoisonValue(reg, site); };
   PPCRegister* f = &ctx.f0;
   PPCVRegister* v = &ctx.v0;
-  ctx.r0.u64 = kGprPoison;
+  ctx.r0.u64 = poison_for(0);
   for (int i = 5; i <= 12; ++i) {
-    (ctx.*kGprMembers[i]).u64 = kGprPoison;
+    (ctx.*kGprMembers[i]).u64 = poison_for(i);
   }
-  f[0].u64 = kFprPoison;
+  // Quiet NaNs whose payload carries the same code.
+  f[0].u64 = 0x7FF8000000000000ull | poison_for(0);
   for (int i = 5; i <= 13; ++i) {
-    f[i].u64 = kFprPoison;
+    f[i].u64 = 0x7FF8000000000000ull | poison_for(i);
   }
   auto poison_vector = [&](int i) {
-    v[i].u32[0] = v[i].u32[1] = v[i].u32[2] = v[i].u32[3] = kVrPoison;
+    v[i].u32[0] = v[i].u32[1] = v[i].u32[2] = v[i].u32[3] = poison_for(i);
   };
   poison_vector(0);
   for (int i = 4; i <= 13; ++i) {
