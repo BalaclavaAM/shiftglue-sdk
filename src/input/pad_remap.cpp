@@ -120,25 +120,26 @@ std::string FormatPadRemap(const PadRemap& remap) {
   return text;
 }
 
-void ApplyPadRemap(X_INPUT_GAMEPAD& pad) {
-  if (REXCVAR_GET(pad_invert_right_stick_y)) {
-    pad.thumb_ry = int16_t(std::clamp(-int32_t(int16_t(pad.thumb_ry)), -32768, 32767));
-  }
+PadRemap CurrentPadRemap() {
   // Parsed again only when the cvar text changes.
   static std::mutex mutex;
   static std::string parsed_text;
   static PadRemap remap = IdentityPadRemap();
-  PadRemap current;
-  {
-    std::lock_guard lock(mutex);
-    const std::string& text = REXCVAR_GET(pad_remap);
-    if (text != parsed_text) {
-      parsed_text = text;
-      remap = ParsePadRemap(text);
-    }
-    if (parsed_text.empty()) return;
-    current = remap;
+  std::lock_guard lock(mutex);
+  const std::string& text = REXCVAR_GET(pad_remap);
+  if (text != parsed_text) {
+    parsed_text = text;
+    remap = ParsePadRemap(text);
   }
+  return remap;
+}
+
+void ApplyPadRemap(X_INPUT_GAMEPAD& pad) {
+  if (REXCVAR_GET(pad_invert_right_stick_y)) {
+    pad.thumb_ry = int16_t(std::clamp(-int32_t(int16_t(pad.thumb_ry)), -32768, 32767));
+  }
+  const PadRemap current = CurrentPadRemap();
+  if (current == IdentityPadRemap()) return;
   const uint16_t buttons = uint16_t(pad.buttons);
   const uint8_t triggers[2] = {uint8_t(pad.left_trigger), uint8_t(pad.right_trigger)};
   uint16_t out_buttons = 0;

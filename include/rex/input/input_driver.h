@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <rex/input/device.h>
+#include <rex/input/dualsense.h>
 #include <rex/input/input.h>
 #include <rex/kernel.h>
 #include <rex/ui/window.h>
@@ -45,6 +46,22 @@ class InputDriver {
                                       X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+
+  /// Trigger effects for a pad with DeviceInfo::adaptive_triggers. Drivers
+  /// send only changes, rate-limited; false when the device cannot take them.
+  virtual bool SetDeviceTriggerEffects(DeviceId /*id*/,
+                                       const dualsense::TriggerEffects& /*effects*/) {
+    return false;
+  }
+  /// Lightbar colour, or null for the driver's default (the player colour).
+  virtual bool SetDeviceLightbar(DeviceId /*id*/, const dualsense::Rgb* /*colour*/) {
+    return false;
+  }
+  /// Triggers slack and lightbars back to the player colour on every device
+  /// this driver has open, for good (quit and crash paths). `crashing` asks
+  /// for a path that cannot deadlock on the driver's locks and waits for the
+  /// reports to leave.
+  virtual void ReleaseFeedback(bool /*crashing*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;

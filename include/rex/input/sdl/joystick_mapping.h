@@ -30,6 +30,13 @@ struct JoystickInfo {
   bool user_mapping = false;
   // SDL knows it as a racing wheel (its own type, not hid_wheel_guids).
   bool wheel_type = false;
+  // A PlayStation pad (PS3, PS4, PS5 types).
+  bool playstation = false;
+  // A Sony DualSense or Edge seen directly, so its triggers can be driven.
+  bool dualsense = false;
+  // Steam Input's virtual pad.
+  bool steam_virtual = false;
+  bool wireless = false;
 };
 
 std::vector<JoystickInfo> ListJoysticks();

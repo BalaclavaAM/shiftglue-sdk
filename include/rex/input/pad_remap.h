@@ -38,6 +38,9 @@ PadRemap ParsePadRemap(std::string_view text);
 // The shortest text that parses back to `remap` (empty for identity).
 std::string FormatPadRemap(const PadRemap& remap);
 
+// The pad_remap cvar parsed (cached until the text changes).
+PadRemap CurrentPadRemap();
+
 // Rewrites `pad` through the pad_remap and pad_invert_right_stick_y cvars.
 void ApplyPadRemap(X_INPUT_GAMEPAD& pad);
 

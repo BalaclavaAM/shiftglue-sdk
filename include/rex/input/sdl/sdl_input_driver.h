@@ -22,12 +22,21 @@
 
 #include <SDL3/SDL.h>
 
+#include <rex/cvar.h>
+
+REXCVAR_DECLARE(bool, pad_gyro_steering);
+REXCVAR_DECLARE(int32_t, pad_gyro_sensitivity);
+
 #define HID_SDL_THUMB_THRES 0x4E00
 #define HID_SDL_TRIGG_THRES 0x1F
 #define HID_SDL_REPEAT_DELAY 400
 #define HID_SDL_REPEAT_RATE 100
 
 namespace rex::input::sdl {
+
+/// Steam launched the game with Steam Input wrapping a DualSense: SDL is told
+/// to skip the real pad, and the game sees Steam's virtual Xbox pad instead.
+bool SteamInputHidesDualSense();
 
 class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener {
  public:
@@ -44,6 +53,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                               X_INPUT_KEYSTROKE* out_keystroke) override;
   void OnWindowAvailable(rex::ui::Window* window) override;
+  bool SetDeviceTriggerEffects(DeviceId id, const dualsense::TriggerEffects& effects) override;
+  bool SetDeviceLightbar(DeviceId id, const dualsense::Rgb* colour) override;
+  void ReleaseFeedback(bool crashing) override;
 
  private:
   enum class RepeatState {
@@ -72,6 +84,28 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     // A racing wheel: SDL's joystick type, or listed in hid_wheel_guids.
     bool wheel_type;
     std::string guid;
+    // Identity (DS-0.1), read once at open.
+    PadFamily family = PadFamily::kUnknown;
+    uint16_t vendor_id = 0;
+    uint16_t product_id = 0;
+    bool steam_virtual = false;
+    bool dualsense = false;  // trigger effects allowed
+    bool lightbar = false;
+    bool motion = false;
+    dualsense::EffectChannel triggers;
+    // The HID device behind SDL's HIDAPI driver, for the crash path's
+    // direct release, and whether it is a Bluetooth link.
+    std::string hid_path;
+    bool bluetooth = false;
+    // Lightbar: has_colour false = SDL's player colour.
+    bool has_colour = false;
+    dualsense::Rgb colour;
+    // Motion steering (DS-6): sensors on, the tilt estimate and its centre.
+    bool sensors_on = false;
+    bool tilt_valid = false;
+    float tilt_rad = 0.0f;  // counter-clockwise roll seen from the player
+    float tilt_centre_rad = 0.0f;
+    uint64_t gyro_timestamp_ns = 0;
   };
 
   // WindowListener
@@ -86,6 +120,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
+  void OnControllerSensorLocked(const SDL_Event& event);
+  void UpdateSensorsLocked(ControllerState& controller);
+  // Slack triggers and the player colour; `stop_rumble` also stops the
+  // motors (the crash path, where SDL never closes the pad).
+  bool ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble = false);
+  void ApplyPlayerLedHint();
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
@@ -110,6 +150,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::vector<SDL_Event> pending_events_;
   // Never rewound, so a handle held past a disconnect resolves to nothing.
   uint64_t next_device_id_ = 1;
+  // Window focus: trigger effects and lightbar colours are held back while
+  // another window has it.
+  std::atomic<bool> focused_{true};
+  // Set by ReleaseFeedback and on close: no effect is sent after it.
+  std::atomic<bool> feedback_released_{false};
+  int player_led_hint_ = -1;
+  uint64_t log_window_start_ns_ = 0;
+  uint64_t log_window_reports_ = 0;
 };
 
 }  // namespace rex::input::sdl

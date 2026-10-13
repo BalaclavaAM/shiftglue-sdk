@@ -10,6 +10,7 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/input/dualsense.h>
 #include <rex/input/flags.h>
 #include <rex/logging.h>
 
@@ -74,6 +75,20 @@ std::vector<JoystickInfo> ListJoysticks() {
     info.name = name ? name : "Controller";
     info.guid = GuidString(SDL_GetJoystickGUIDForID(ids[i]));
     info.wheel_type = SDL_GetJoystickTypeForID(ids[i]) == SDL_JOYSTICK_TYPE_WHEEL;
+    const SDL_GamepadType type = SDL_GetGamepadTypeForID(ids[i]);
+    info.playstation = type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 ||
+                       type == SDL_GAMEPAD_TYPE_PS5;
+    info.steam_virtual = info.name == "Steam Virtual Gamepad";
+    if (SDL_Joystick* open = SDL_GetJoystickFromID(ids[i])) {
+      if (SDL_Gamepad* gamepad = SDL_GetGamepadFromID(ids[i])) {
+        info.steam_virtual |= SDL_GetGamepadSteamHandle(gamepad) != 0;
+      }
+      const auto connection = SDL_GetJoystickConnectionState(open);
+      info.wireless = connection == SDL_JOYSTICK_CONNECTION_WIRELESS;
+    }
+    info.dualsense = !info.steam_virtual &&
+                     rex::input::dualsense::IsDualSense(SDL_GetJoystickVendorForID(ids[i]),
+                                                        SDL_GetJoystickProductForID(ids[i]));
     if (char* mapping = SDL_GetGamepadMappingForID(ids[i])) {
       info.mapping = mapping;
       SDL_free(mapping);
