@@ -14,6 +14,10 @@
 #include <rex/codegen/function_scanner.h>
 
 #include <array>
+#include <fstream>
+
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
 #include <bitset>
 #include <unordered_set>
 
@@ -244,6 +248,25 @@ void discoverAllFunctions(CodegenContext& ctx) {
 
     REXCODEGEN_TRACE("Analyze: VTable scan found {} vtables, {} new functions", vtables.size(),
                      newFunctions);
+
+    // The class layout the scan read, for reverse engineering: every vtable
+    // with its class, its offset in the complete object, its base classes and
+    // its slots (classes.json beside the generated code; never committed).
+    if (!ctx.Config().outDirectoryPath.empty()) {
+      nlohmann::json classes = nlohmann::json::array();
+      for (const auto& vt : vtables) {
+        nlohmann::json slots = nlohmann::json::array();
+        for (uint32_t slot : vt.slots)
+          slots.push_back(fmt::format("{:08X}", slot));
+        classes.push_back({{"vtable", fmt::format("{:08X}", vt.vtableAddress)},
+                           {"class", vt.className},
+                           {"offset_in_class", vt.offsetInClass},
+                           {"bases", vt.baseClasses},
+                           {"slots", slots}});
+      }
+      std::ofstream out(ctx.Config().outDirectoryPath + "/classes.json");
+      out << classes.dump(1);
+    }
 
     // Continue discovery for vtable functions
     if (newFunctions > 0) {

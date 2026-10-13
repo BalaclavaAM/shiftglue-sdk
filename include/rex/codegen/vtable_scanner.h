@@ -47,7 +47,11 @@ struct RTTICompleteObjectLocator {
 struct VTableInfo {
   uint32_t vtableAddress;       // Address of vtable[0]
   uint32_t colAddress;          // RTTI Complete Object Locator address
+  uint32_t offsetInClass = 0;   // Offset of this vtable in the complete object
   std::string className;        // Demangled class name (optional)
+  // Demangled base class names from the class hierarchy descriptor, in the
+  // array's order (the class itself excluded); empty when none or unreadable.
+  std::vector<std::string> baseClasses;
   std::vector<uint32_t> slots;  // Function addresses in vtable
 };
 
@@ -76,6 +80,12 @@ class VTableScanner {
 
   // Extract class name from type descriptor
   std::string extractClassName(uint32_t colAddr);
+
+  // Base class names from the COL's class hierarchy descriptor.
+  std::vector<std::string> readBaseClasses(uint32_t colAddr);
+
+  // ".?AVName@@" -> "Name"; anything else unchanged.
+  static std::string demangleTypeName(const std::string& mangled);
 
   // Check if an address points to executable code
   bool isExecutableAddress(uint32_t addr) const;

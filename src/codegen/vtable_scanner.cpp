@@ -40,6 +40,8 @@ std::vector<VTableInfo> VTableScanner::scan() {
     info.vtableAddress = *vtableAddr;
     info.colAddress = colAddr;
     info.className = extractClassName(colAddr);
+    info.offsetInClass = readDword(colAddr + 4).value_or(0);
+    info.baseClasses = readBaseClasses(colAddr);
     info.slots = readVTableSlots(*vtableAddr);
 
     if (info.slots.empty()) {
@@ -177,8 +179,10 @@ std::string VTableScanner::extractClassName(uint32_t colAddr) {
   }
 
   // Class name is at typeDescriptor + 8
-  std::string mangled = readString(*typeDescPtr + 8, 256);
+  return demangleTypeName(readString(*typeDescPtr + 8, 256));
+}
 
+std::string VTableScanner::demangleTypeName(const std::string& mangled) {
   // Simple demangling: ".?AVClassName@@" -> "ClassName"
   if (mangled.size() > 4 && (mangled.substr(0, 4) == ".?AV" || mangled.substr(0, 4) == ".?AU")) {
     size_t end = mangled.find("@@");
@@ -186,8 +190,35 @@ std::string VTableScanner::extractClassName(uint32_t colAddr) {
       return mangled.substr(4, end - 4);
     }
   }
-
   return mangled;
+}
+
+std::vector<std::string> VTableScanner::readBaseClasses(uint32_t colAddr) {
+  // MSVC RTTI (32-bit, big-endian here): the COL's class hierarchy descriptor
+  // is {signature, attributes, numBaseClasses, pBaseClassArray}; the array
+  // holds numBaseClasses pointers to base class descriptors, whose first
+  // word is the type descriptor. Entry 0 is the class itself.
+  std::vector<std::string> bases;
+  auto hierarchy = readDword(colAddr + 16);
+  if (!hierarchy || *hierarchy == 0)
+    return bases;
+  auto count = readDword(*hierarchy + 8);
+  auto array = readDword(*hierarchy + 12);
+  if (!count || !array || *count == 0 || *count > 64)
+    return bases;
+  for (uint32_t i = 1; i < *count; ++i) {
+    auto descriptor = readDword(*array + 4 * i);
+    if (!descriptor)
+      break;
+    auto typeDesc = readDword(*descriptor);
+    if (!typeDesc)
+      break;
+    std::string mangled = readString(*typeDesc + 8, 256);
+    if (mangled.find(".?A") != 0)
+      break;
+    bases.push_back(demangleTypeName(mangled));
+  }
+  return bases;
 }
 
 bool VTableScanner::isExecutableAddress(uint32_t addr) const {
