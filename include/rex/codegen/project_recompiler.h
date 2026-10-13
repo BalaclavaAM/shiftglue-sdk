@@ -27,6 +27,8 @@ struct ProjectRecompilerOptions {
   /// Emit the ABI poison checks around guest calls in every module
   /// (RecompilerConfig::abiPoisonChecks), for a checking build.
   bool abiPoisonChecks = false;
+  /// Probe build (RecompilerConfig::callProbes): call counts and indirect targets.
+  bool callProbes = false;
   ProgressReporter* reporter = nullptr;
 
   /// Bypass the stamp gate and regenerate every targeted module.

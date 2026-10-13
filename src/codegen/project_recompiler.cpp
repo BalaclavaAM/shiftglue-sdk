@@ -315,6 +315,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
       cfg.generateExceptionHandlers = true;
     if (opts.abiPoisonChecks)
       cfg.abiPoisonChecks = true;
+    if (opts.callProbes)
+      cfg.callProbes = true;
 
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);
@@ -340,6 +342,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
       cfg.generateExceptionHandlers = true;
     if (opts.abiPoisonChecks)
       cfg.abiPoisonChecks = true;
+    if (opts.callProbes)
+      cfg.callProbes = true;
 
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);

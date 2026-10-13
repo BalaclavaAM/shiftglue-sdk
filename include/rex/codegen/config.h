@@ -124,6 +124,16 @@ struct RecompilerConfig {
   bool guestLineDirectives = false;
   /// Emit the `// mnemonic operands` comment before each instruction's code.
   bool disassemblyComments = true;
+  /// Probe build: count every function entry and record every indirect call's
+  /// target (rex/ppc/probe.h); the runtime writes probe.json at shutdown.
+  bool callProbes = false;
+  /// Functions also emitted a second time as `ref_sub_X` with the reference
+  /// options (every register in ctx, no folding, calls through the thunk), so
+  /// a host verifier can run both on cloned state and compare (lockstep verify).
+  std::vector<uint32_t> referenceFunctions;
+  /// Also take every Nth leaf function (no calls) of at least four instructions
+  /// as a reference function, 0 for none: a broad sample without a hand list.
+  uint32_t referenceSampleEvery = 0;
   std::vector<uint32_t> hostOverriddenFunctions;
   /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
   /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC

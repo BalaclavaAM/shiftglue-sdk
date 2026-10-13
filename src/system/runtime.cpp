@@ -18,6 +18,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/ppc/context.h>          // PPCFuncMapping
+#include <rex/ppc/probe.h>
 #include <rex/platform/exceptions.h>  // SEH exception support
 #include <rex/kernel/crt/heap.h>
 #include <rex/runtime.h>
@@ -262,6 +263,13 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
 void Runtime::Shutdown() {
   if (!instance_ && !setup_complete_ && !memory_) {
     return;
+  }
+
+  // Probe build (codegen call_probes): the call counts and indirect targets.
+  if (rex::ppc::ProbeActive()) {
+    auto path = user_data_root_ / "logs" / "probe.json";
+    if (rex::ppc::ProbeDump(path))
+      REXSYS_INFO("Probe data written to {}", path.string());
   }
 
   if (instance_ == this) {

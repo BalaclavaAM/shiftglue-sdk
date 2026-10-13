@@ -31,6 +31,8 @@
 
 #include <rex/ppc.h>
 #include <rex/ppc/abi_poison.h>
+#include <rex/ppc/probe.h>
+#include <rex/ppc/reference.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>
@@ -325,6 +327,11 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 // poison, so a caller that still reads one changes the route results.
 #define REX_ABI_POISON_PRE(site) ::rex::ppc::AbiPoisonPreCall(ctx, (site))
 #define REX_ABI_POISON_POST(site) ::rex::ppc::AbiPoisonPostCall(ctx, (site))
+
+// Probe build (call_probes): a counter per function entry and the targets of
+// every indirect call site, written to probe.json at shutdown (rex/ppc/probe.h).
+#define REX_PROBE_CALL(site) ::rex::ppc::ProbeCall(REX_CODE_BASE, REX_CODE_SIZE, (site))
+#define REX_PROBE_INDIRECT(site, target) ::rex::ppc::ProbeIndirect((site), (target))
 
 //=============================================================================
 // Flush Mode

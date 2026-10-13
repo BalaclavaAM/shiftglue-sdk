@@ -20,6 +20,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/ppc/probe.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -593,6 +594,12 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
+  // The probe build's counts would be lost with the process; write them here.
+  if (runtime_ && rex::ppc::ProbeActive()) {
+    auto path = runtime_->user_data_root() / "logs" / "probe.json";
+    if (rex::ppc::ProbeDump(path))
+      REXLOG_INFO("Probe data written to {}", path.string());
+  }
   REXLOG_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);

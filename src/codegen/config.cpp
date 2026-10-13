@@ -128,6 +128,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("guest_line_directives"), "guest_line_directives");
   MergeBool(cfg.disassemblyComments, toml["disassembly_comments"].value_or(true),
             hasBool("disassembly_comments"), "disassembly_comments");
+  MergeBool(cfg.callProbes, toml["call_probes"].value_or(false), hasBool("call_probes"),
+            "call_probes");
+  if (auto every = toml["reference_sample_every"].value<int64_t>())
+    cfg.referenceSampleEvery = static_cast<uint32_t>(*every);
+  if (auto references = toml["reference_functions"].as_array()) {
+    for (const auto& elem : *references) {
+      if (auto val = elem.value<int64_t>())
+        cfg.referenceFunctions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   if (auto overridden = toml["host_overridden_functions"].as_array()) {
     for (const auto& elem : *overridden) {
       if (auto val = elem.value<int64_t>())
@@ -480,6 +490,12 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     }
     REXCODEGEN_TRACE("Loaded {} function configs ({} standalone, {} chunks)", cfg.functions.size(),
                      cfg.functions.size() - chunks_count, chunks_count);
+  }
+  if (!cfg.referenceFunctions.empty()) {
+    std::sort(cfg.referenceFunctions.begin(), cfg.referenceFunctions.end());
+    cfg.referenceFunctions.erase(
+        std::unique(cfg.referenceFunctions.begin(), cfg.referenceFunctions.end()),
+        cfg.referenceFunctions.end());
   }
   if (!cfg.hostOverriddenFunctions.empty()) {
     std::sort(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end());
