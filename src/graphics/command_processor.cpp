@@ -112,6 +112,24 @@ REXCVAR_DEFINE_BOOL(gpu_ib_identity_stats, false, "GPU",
                     "from the previous execution at the same address (the display-list "
                     "compiler's potential hit rate)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(gpu_replay_floor_probe, 0, "GPU",
+                     "Diagnostics (NN-0.10, G0): without gpu_record_thread, capture the exit "
+                     "state (registers, bins, shaders) of every indirect buffer, at any depth, "
+                     "whose bytes repeat its previous execution and, at 2, skip a buffer whose "
+                     "bytes and nested buffers match its capture and "
+                     "that holds only state, constants, shader loads and draws, applying the "
+                     "exit state instead: its draws are dropped (a wrong image), so the CPU "
+                     "left is the floor of re-executing recorded lists. 1 captures and counts "
+                     "only (the census)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_trace_ib_writers, 0, "GPU",
+                     "Diagnostics (NN-0.10): watch the pages of the first N indirect buffers "
+                     "called from another buffer (display lists) and of the first N outermost "
+                     "ones, re-armed each time they execute, and log the guest threads (and "
+                     "their link register) that write them")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gpu_trace_wait_reg_mem_writers, false, "GPU",
                     "Diagnostics: while WAIT_REG_MEM waits on a guest memory word, watch its "
                     "page and log the guest threads (and their link register) that write it")
@@ -765,7 +783,164 @@ void CommandProcessor::FlushPendingScratchWrites() {
   }
 }
 
+namespace {
+// gpu_replay_floor_probe (decoder thread only, unsplit decoding).
+struct ReplayProbeIb {
+  // The last execution's hash: the buffer's bytes, then those of the buffers
+  // it called at its capture, in call order.
+  uint64_t hash = 0;
+  // The capture, valid while the hash and the entry state match it.
+  uint64_t capture_hash = 0;
+  uint64_t entry_bin_select = 0, entry_bin_mask = 0;
+  bool entry_select_all = false;
+  bool skippable = false;
+  uint32_t drawn_draws = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> nested;
+  std::vector<std::pair<uint32_t, uint32_t>> exit_registers;
+  uint64_t exit_bin_select = 0, exit_bin_mask = 0;
+  Shader* exit_vertex_shader = nullptr;
+  Shader* exit_pixel_shader = nullptr;
+};
+struct ReplayProbeCapture {
+  bool skippable = true;
+  uint32_t generation = 0;
+  std::vector<uint32_t> touched_generation;
+  std::vector<uint32_t> touched;
+  std::vector<std::pair<uint32_t, uint32_t>> nested;
+};
+struct ReplayProbe {
+  std::unordered_map<uint64_t, ReplayProbeIb> ibs;
+  // Buffers being captured, outermost first; `capturing` is whether any is.
+  std::vector<ReplayProbeCapture> levels;
+  uint32_t active = 0;
+  bool capturing = false;
+  // Enclosing buffers that repeated: a draw counts once, in the outermost
+  // repeating buffer around it.
+  uint32_t repeat_depth = 0;
+  // Drawn draws of skipped buffers (they count in their callers' draws).
+  uint64_t replayed_draws = 0;
+  // LOAD_ALU_CONSTANT sources: the data hash at the last load and the swap
+  // count it was last used in.
+  struct ConstantSource {
+    uint64_t hash = 0;
+    uint32_t swap = UINT32_MAX;
+  };
+  std::unordered_map<uint64_t, ConstantSource> constant_sources;
+};
+ReplayProbe replay_probe;
+
+void ReplayProbeMarkUnskippable() {
+  for (uint32_t level = 0; level < replay_probe.active; ++level) {
+    replay_probe.levels[level].skippable = false;
+  }
+}
+
+void ReplayProbeTouch(uint32_t start_index, uint32_t count) {
+  if (uint64_t(start_index) + count > RegisterFile::kRegisterCount) {
+    ReplayProbeMarkUnskippable();
+    return;
+  }
+  for (uint32_t level = 0; level < replay_probe.active; ++level) {
+    ReplayProbeCapture& capture = replay_probe.levels[level];
+    if (capture.touched_generation.empty()) {
+      capture.touched_generation.resize(RegisterFile::kRegisterCount);
+    }
+    uint32_t* generations = capture.touched_generation.data();
+    for (uint32_t i = start_index; i < start_index + count; ++i) {
+      if (generations[i] != capture.generation) {
+        generations[i] = capture.generation;
+        capture.touched.push_back(i);
+      }
+    }
+  }
+}
+
+// Returns the new capture's level; levels may move when a nested one starts.
+uint32_t ReplayProbeBegin() {
+  if (replay_probe.levels.size() <= replay_probe.active) {
+    replay_probe.levels.emplace_back();
+  }
+  const uint32_t level = replay_probe.active++;
+  ReplayProbeCapture& capture = replay_probe.levels[level];
+  replay_probe.capturing = true;
+  capture.skippable = true;
+  if (!++capture.generation) {
+    std::fill(capture.touched_generation.begin(), capture.touched_generation.end(), 0);
+    capture.generation = 1;
+  }
+  capture.touched.clear();
+  capture.nested.clear();
+  return level;
+}
+
+uint64_t ReplayProbeHash(memory::Memory* memory, uint32_t ptr, uint32_t count,
+                         const std::vector<std::pair<uint32_t, uint32_t>>& nested) {
+  uint64_t hash = XXH3_64bits(memory->TranslatePhysical(ptr), size_t(count) * sizeof(uint32_t));
+  for (const auto& [nested_ptr, nested_count] : nested) {
+    hash = XXH3_64bits_withSeed(memory->TranslatePhysical(nested_ptr),
+                                size_t(nested_count) * sizeof(uint32_t), hash);
+  }
+  return hash;
+}
+
+// gpu_trace_ib_writers: buffers watched, by page; the callback runs on the
+// writing guest thread.
+struct IbWriterTrace {
+  std::mutex mutex;
+  // Page -> (buffer address << 32 | bytes), depth in the top bit of bytes.
+  std::unordered_map<uint32_t, uint64_t> pages;
+  std::unordered_map<uint64_t, bool> watched;
+  uint32_t watched_lists = 0, watched_outer = 0;
+  std::unordered_map<uint64_t, uint32_t> logged;
+  std::atomic<uint32_t> logs{0};
+  std::atomic<uint32_t> swaps{0};
+};
+IbWriterTrace ib_writer_trace;
+
+void LogIbWrite(void*, uint32_t physical_address, uint32_t length, bool is_write) {
+  if (!is_write) {
+    return;
+  }
+  const auto* thread_state = runtime::ThreadState::Get();
+  const PPCContext* context = thread_state ? thread_state->context() : nullptr;
+  const uint32_t lr = context ? uint32_t(context->lr) : 0u;
+  uint64_t buffer = 0;
+  uint32_t count = 0;
+  {
+    std::lock_guard<std::mutex> lock(ib_writer_trace.mutex);
+    auto it = ib_writer_trace.pages.find(physical_address >> 12);
+    if (it != ib_writer_trace.pages.end()) {
+      buffer = it->second;
+    }
+    // Each writer once per buffer, then every 64th write.
+    count = ib_writer_trace.logged[(uint64_t(lr) << 32) ^ buffer]++;
+  }
+  if ((count && count % 64) ||
+      ib_writer_trace.logs.fetch_add(1, std::memory_order_relaxed) >= 4000) {
+    return;
+  }
+  REXGPU_INFO(
+      "IB writer: {} {:08X}+{:X} page {:08X}+{:X} written at {:08X} (write {}) in swap {} by "
+      "thread 0x{:X}, guest lr {:08X} r3 {:08X} r4 {:08X} r31 {:08X}",
+      (buffer & 0x80000000u) ? "list" : "outer", uint32_t(buffer >> 32),
+      uint32_t(buffer) & 0x7FFFFFFFu, physical_address, length,
+      memory::CurrentAccessFaultVirtualAddress(), count + 1,
+      ib_writer_trace.swaps.load(std::memory_order_relaxed), rex::thread::current_thread_id(), lr,
+      context ? context->r3.u32 : 0u, context ? context->r4.u32 : 0u,
+      context ? context->r31.u32 : 0u);
+}
+
+int64_t ReplayProbeNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
 void CommandProcessor::PacketWriteRegister(uint32_t index, uint32_t value) {
+  if (replay_probe.capturing) {
+    ReplayProbeTouch(index, 1);
+  }
   if (!record_split_) {
     WriteRegister(index, value);
     return;
@@ -813,6 +988,9 @@ void CommandProcessor::PacketWriteRegistersFromMem(uint32_t start_index, const u
                                                    uint32_t num_registers) {
   if (!num_registers) {
     return;
+  }
+  if (replay_probe.capturing) {
+    ReplayProbeTouch(start_index, num_registers);
   }
   if (!record_split_) {
     WriteRegistersFromMem(start_index, const_cast<uint32_t*>(base), num_registers);
@@ -1519,6 +1697,7 @@ struct IbIdentityStats {
            repeat_draws = 0;
 };
 IbIdentityStats ib_stats;
+
 }  // namespace
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
@@ -1528,6 +1707,104 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     uint32_t& depth;
     ~DepthGuard() { --depth; }
   } depth_guard{trace_ib_depth_};
+
+  for (uint32_t level = 0; level < replay_probe.active; ++level) {
+    replay_probe.levels[level].nested.emplace_back(ptr, count);
+  }
+  if (const int32_t trace_writers = REXCVAR_GET(gpu_trace_ib_writers)) {
+    static void* const callback =
+        memory_->RegisterPhysicalMemoryAccessCallback(LogIbWrite, nullptr);
+    (void)callback;
+    ib_writer_trace.swaps.store(trace_swaps_, std::memory_order_relaxed);
+    const bool list = trace_ib_depth_ >= 2;
+    const uint32_t physical = ptr & 0x1FFFFFFF;
+    const uint32_t bytes = count * uint32_t(sizeof(uint32_t));
+    const uint64_t buffer = (uint64_t(physical) << 32) | bytes | (list ? 0x80000000u : 0u);
+    bool watch = false;
+    {
+      std::lock_guard<std::mutex> lock(ib_writer_trace.mutex);
+      auto [it, inserted] = ib_writer_trace.watched.try_emplace(buffer, false);
+      if (inserted) {
+        uint32_t& watched = list ? ib_writer_trace.watched_lists : ib_writer_trace.watched_outer;
+        if (watched < uint32_t(trace_writers)) {
+          ++watched;
+          it->second = true;
+          for (uint32_t page = physical >> 12; page <= (physical + bytes - 1) >> 12; ++page) {
+            ib_writer_trace.pages[page] = buffer;
+          }
+        }
+      }
+      watch = it->second;
+    }
+    if (watch && bytes) {
+      memory_->EnablePhysicalMemoryAccessCallbacks(physical, bytes, false, false, true);
+    }
+  }
+  const int32_t probe_mode = !record_split_ ? REXCVAR_GET(gpu_replay_floor_probe) : 0;
+  ReplayProbeIb* probe_ib = nullptr;
+  bool probe_repeat = false, probe_outer_repeat = false;
+  int32_t probe_level = -1;
+  if (probe_mode) {
+    const int64_t hash_start_ns = ReplayProbeNowNs();
+    const uint64_t key = ((uint64_t(ptr) << 32) | count) ^
+                         (bin_select_ * UINT64_C(0x9E3779B97F4A7C15)) ^
+                         std::rotl(bin_mask_ * UINT64_C(0xC2B2AE3D27D4EB4F), 29) ^
+                         uint64_t(untile_select_all_);
+    probe_ib = &replay_probe.ibs[key];
+    const uint64_t hash = ReplayProbeHash(memory_, ptr, count, probe_ib->nested) | 1;
+    probe_repeat = probe_ib->hash == hash;
+    probe_ib->hash = hash;
+    const bool capture_valid = probe_ib->capture_hash == hash &&
+                               probe_ib->entry_bin_select == bin_select_ &&
+                               probe_ib->entry_bin_mask == bin_mask_ &&
+                               probe_ib->entry_select_all == untile_select_all_;
+    PERF_counter_add(kReplayProbeHashNs, ReplayProbeNowNs() - hash_start_ns);
+    PERF_counter_inc(kReplayProbeIbs);
+    if (probe_repeat) {
+      PERF_counter_inc(kReplayProbeRepeatIbs);
+    }
+    probe_outer_repeat = probe_repeat && !replay_probe.repeat_depth;
+    if (probe_repeat && capture_valid && probe_ib->skippable && probe_mode >= 2) {
+      // The floor: what is left without decoding or recording the buffer.
+      const int64_t apply_start_ns = ReplayProbeNowNs();
+      for (const auto& [index, value] : probe_ib->exit_registers) {
+        WriteRegister(index, value);
+        if (replay_probe.capturing) {
+          ReplayProbeTouch(index, 1);
+        }
+      }
+      bin_select_ = probe_ib->exit_bin_select;
+      bin_mask_ = probe_ib->exit_bin_mask;
+      active_vertex_shader_ = probe_ib->exit_vertex_shader;
+      active_pixel_shader_ = probe_ib->exit_pixel_shader;
+      replay_probe.replayed_draws += probe_ib->drawn_draws;
+      PERF_counter_add(kReplayProbeApplyNs, ReplayProbeNowNs() - apply_start_ns);
+      PERF_counter_inc(kReplayProbeSkippedIbs);
+      PERF_counter_add(kReplayProbeSkippedDrawnDraws, probe_ib->drawn_draws);
+      PERF_counter_add(kReplayProbeExitRegisters, probe_ib->exit_registers.size());
+      if (probe_outer_repeat) {
+        PERF_counter_add(kReplayProbeDrawnInRepeatIbs, probe_ib->drawn_draws);
+        PERF_counter_add(kReplayProbeDrawnInSkippableRepeatIbs, probe_ib->drawn_draws);
+      }
+      if (trace_ib_depth_ == 1) {
+        PERF_counter_add(kReplayProbeDrawnInIbs, probe_ib->drawn_draws);
+      }
+      return;
+    }
+    if (probe_repeat && !capture_valid) {
+      // Repeated without a capture to replay: capture this execution.
+      probe_ib->entry_bin_select = bin_select_;
+      probe_ib->entry_bin_mask = bin_mask_;
+      probe_ib->entry_select_all = untile_select_all_;
+      probe_level = int32_t(ReplayProbeBegin());
+    }
+    if (probe_repeat) {
+      ++replay_probe.repeat_depth;
+    }
+  }
+  const uint64_t probe_replayed_before = replay_probe.replayed_draws;
+  const uint64_t probe_decoded_before = ib_stats.decoded_draws;
+  const uint64_t probe_untile_before = untile_skipped_draws_;
 
   const bool ib_stats_enabled = REXCVAR_GET(gpu_ib_identity_stats);
   const bool template_stats = record_split_ && REXCVAR_GET(gpu_template_stats);
@@ -1567,6 +1844,44 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
   if (template_stats) {
     RecordCall([this]() { TemplateStatsIbEnd(); });
+  }
+  if (probe_ib) {
+    ReplayProbeIb& ib = *probe_ib;
+    const uint32_t drawn = uint32_t((ib_stats.decoded_draws - probe_decoded_before) -
+                                    (untile_skipped_draws_ - probe_untile_before) +
+                                    (replay_probe.replayed_draws - probe_replayed_before));
+    if (probe_level >= 0) {
+      ReplayProbeCapture& capture = replay_probe.levels[probe_level];
+      ib.skippable = capture.skippable;
+      ib.drawn_draws = drawn;
+      ib.nested.swap(capture.nested);
+      ib.exit_registers.clear();
+      ib.exit_registers.reserve(capture.touched.size());
+      for (uint32_t index : capture.touched) {
+        ib.exit_registers.emplace_back(index, register_file_->values[index]);
+      }
+      ib.exit_bin_select = bin_select_;
+      ib.exit_bin_mask = bin_mask_;
+      ib.exit_vertex_shader = active_vertex_shader_;
+      ib.exit_pixel_shader = active_pixel_shader_;
+      const int64_t hash_start_ns = ReplayProbeNowNs();
+      ib.hash = ib.capture_hash = ReplayProbeHash(memory_, ptr, count, ib.nested) | 1;
+      PERF_counter_add(kReplayProbeHashNs, ReplayProbeNowNs() - hash_start_ns);
+      replay_probe.active = uint32_t(probe_level);
+      replay_probe.capturing = replay_probe.active != 0;
+    }
+    if (probe_repeat) {
+      --replay_probe.repeat_depth;
+      if (probe_outer_repeat) {
+        PERF_counter_add(kReplayProbeDrawnInRepeatIbs, drawn);
+        if (ib.capture_hash == ib.hash && ib.skippable) {
+          PERF_counter_add(kReplayProbeDrawnInSkippableRepeatIbs, drawn);
+        }
+      }
+    }
+    if (trace_ib_depth_ == 1) {
+      PERF_counter_add(kReplayProbeDrawnInIbs, drawn);
+    }
   }
   if (ib_stats_enabled) {
     // Nested buffers count in both.
@@ -1891,6 +2206,34 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
       return true;
+    }
+  }
+
+  if (replay_probe.capturing) {
+    // A buffer is skippable only if it sets state, constants and shaders and
+    // draws: anything that writes memory, signals, waits or reads back stays.
+    switch (opcode) {
+      case PM4_NOP:
+      case PM4_INDIRECT_BUFFER:
+      case PM4_INDIRECT_BUFFER_PFD:
+      case PM4_DRAW_INDX:
+      case PM4_DRAW_INDX_2:
+      case PM4_SET_CONSTANT:
+      case PM4_SET_CONSTANT2:
+      case PM4_LOAD_ALU_CONSTANT:
+      case PM4_SET_SHADER_CONSTANTS:
+      case PM4_IM_LOAD:
+      case PM4_IM_LOAD_IMMEDIATE:
+      case PM4_SET_BIN_MASK:
+      case PM4_SET_BIN_MASK_LO:
+      case PM4_SET_BIN_MASK_HI:
+      case PM4_SET_BIN_SELECT:
+      case PM4_SET_BIN_SELECT_LO:
+      case PM4_SET_BIN_SELECT_HI:
+        break;
+      default:
+        ReplayProbeMarkUnskippable();
+        break;
     }
   }
 
@@ -2846,6 +3189,11 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
   ++ib_stats.decoded_draws;
+  PERF_counter_inc(kGpuDecodedDraws);
+  if (replay_probe.capturing &&
+      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+    ReplayProbeMarkUnskippable();
+  }
   // "initiate fetch of index buffer and draw"
   // Generally used by Xbox 360 Direct3D 9 for kDMA and kAutoIndex sources.
   // With a viz query token as the first one.
@@ -2864,6 +3212,11 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet,
                                                       uint32_t count) {
   ++ib_stats.decoded_draws;
+  PERF_counter_inc(kGpuDecodedDraws);
+  if (replay_probe.capturing &&
+      register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+    ReplayProbeMarkUnskippable();
+  }
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
@@ -2922,6 +3275,22 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
+  if (REXCVAR_GET(gpu_replay_floor_probe)) {
+    PERF_counter_inc(kLoadAluConstantPackets);
+    PERF_counter_add(kLoadAluConstantDwords, size_dwords);
+    auto& source =
+        replay_probe.constant_sources[(uint64_t(address) << 20) | (uint64_t(type) << 12) |
+                                      size_dwords];
+    const uint64_t hash = XXH3_64bits(xlat_address, size_t(size_dwords) * sizeof(uint32_t));
+    if (source.swap != trace_swaps_) {
+      source.swap = trace_swaps_;
+      PERF_counter_inc(kLoadAluConstantSources);
+    }
+    if (source.hash && source.hash != (hash | 1)) {
+      PERF_counter_inc(kLoadAluConstantChanged);
+    }
+    source.hash = hash | 1;
+  }
   switch (type) {
     case 0:  // ALU
       WriteALURangeFromMem(index, xlat_address, size_dwords);

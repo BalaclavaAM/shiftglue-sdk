@@ -16,6 +16,7 @@
 #include <atomic>
 #include <string>
 
+#include <rex/perf/counter.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -378,6 +379,7 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  PERF_counter_inc(kRtlCriticalSectionThreadLookups);
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   // The title's spin counts (up to 255 * 256) were tuned for the Xenon; cap
   // them, and read before each compare-exchange with a pause so waiters do

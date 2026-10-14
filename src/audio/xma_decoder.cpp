@@ -311,6 +311,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         }
       }
     }
+    PERF_counter_inc(kXmaWorkEventSets);
     work_event_->Set();
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/perf/counter.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -150,6 +151,7 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
       REXFS_ERROR("ResolvePath({}) failed - device not found", path);
     }
+    PERF_counter_inc(kHostPathLookupMisses);
     return nullptr;
   }
 
@@ -166,6 +168,7 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
                   entry->absolute_path());
     }
   } else {
+    PERF_counter_inc(kHostPathLookupMisses);
     if (had_symlink) {
       REXFS_DEBUG("VFS: entry not found for '{}' (via symlink '{}') on device '{}'", path,
                   normalized_path, device->mount_path());

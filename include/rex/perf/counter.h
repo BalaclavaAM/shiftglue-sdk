@@ -171,6 +171,52 @@ enum class CounterId : uint16_t {
   kTextureCacheMb,
   kProcessResidentMb,
 
+  // Near-native stage 0 (NN-0.3, NN-0.5); append to preserve existing IDs.
+  // The A/A harness: the value of perf_aa_toggle this frame (a no-op cvar a
+  // route flips to mark windows), the CPU time perf_inject_cpu_us spent on
+  // purpose, and the whole process's CPU time this frame.
+  kAaToggle,
+  kInjectedCpuNs,
+  kProcessCpuNs,
+  // Event counts the near-native items report before and after: the XMA
+  // worker wake-ups a kick sets, draws the FH1 executor skipped for a later
+  // untile pass, kernel-object notifies and those that had no waiter,
+  // guest-range readability checks, guest RTL critical sections that looked
+  // up the current thread, and host path lookups that found nothing.
+  kXmaWorkEventSets,
+  kFh1UntileSkippedDraws,
+  kKernelObjectNotifies,
+  kKernelObjectNotifiesNoWaiter,
+  kGuestRangeReadableChecks,
+  kRtlCriticalSectionThreadLookups,
+  kHostPathLookupMisses,
+
+  // The G0 replay-floor probe (NN-0.10, gpu_replay_floor_probe): draws the
+  // decoder met, outermost indirect buffers, those whose bytes (and their
+  // nested buffers') matched the last execution, and those the probe skipped;
+  // drawn draws (decoded minus untile-skipped) in all, repeating and
+  // skippable repeating buffers, and in skipped ones (from their capture);
+  // the hashing and exit-state time, and the exit registers written.
+  kGpuDecodedDraws,
+  kReplayProbeIbs,
+  kReplayProbeRepeatIbs,
+  kReplayProbeSkippedIbs,
+  kReplayProbeDrawnInIbs,
+  kReplayProbeDrawnInRepeatIbs,
+  kReplayProbeDrawnInSkippableRepeatIbs,
+  kReplayProbeSkippedDrawnDraws,
+  kReplayProbeHashNs,
+  kReplayProbeApplyNs,
+  kReplayProbeExitRegisters,
+  // With gpu_replay_floor_probe (NN-0.10's constant-source question):
+  // LOAD_ALU_CONSTANT packets and the dwords they load, the distinct
+  // (address, size) sources used this frame, and the loads whose source
+  // held other data than at its previous load.
+  kLoadAluConstantPackets,
+  kLoadAluConstantDwords,
+  kLoadAluConstantSources,
+  kLoadAluConstantChanged,
+
   kCount  // sentinel -- must be last
 };
 
@@ -200,6 +246,11 @@ uint64_t ProcessResidentBytes();
 // Snapshot current values into the read buffer and zero the live counters.
 // Called once per frame by Profiler::Flip().
 void ResetFrameCounters();
+
+// Spins on the calling thread for perf_inject_cpu_us of CPU time: a known
+// cost the A/A harness must be able to detect (NN-0.3). Called once per frame
+// by Profiler::Flip().
+void InjectFrameCost();
 
 // Read a counter from the last-frame snapshot (stable between frames).
 int64_t GetSnapshotCounter(CounterId id);
@@ -247,6 +298,7 @@ class Profiler {
     }
 #endif
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+    InjectFrameCost();
     ResetFrameCounters();
     WriteCsvFrame();
 #endif

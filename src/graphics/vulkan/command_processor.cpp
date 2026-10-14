@@ -5724,6 +5724,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             !(REXCVAR_GET(fh1_debug_untile) & 2)) {
           // The first tile drew these objects over the whole height.
           fh1_native_executor_->CountEvent("untile_skipped_draw");
+          PERF_counter_inc(kFh1UntileSkippedDraws);
+          ++untile_skipped_draws_;
           return true;
         }
         if (!window_offset.window_x_offset && !window_offset.window_y_offset) {

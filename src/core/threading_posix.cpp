@@ -44,6 +44,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/thread/timer_queue.h>
 
 #include <sched.h>
@@ -435,12 +436,14 @@ class PosixConditionBase {
     if (predicate()) {
       executed = true;
     } else {
+      ++cond_waiters_;
       if (timeout == std::chrono::milliseconds::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
       } else {
         executed = cond_.wait_for(lock, timeout, predicate);
       }
+      --cond_waiters_;
     }
     if (executed) {
       post_execution();
@@ -612,6 +615,10 @@ class PosixConditionBase {
   // Wakes single waits and the waiters of multi-object and alertable waits.
   // Called with mutex_ held, after the state change.
   void NotifyAllLocked() {
+    PERF_counter_inc(kKernelObjectNotifies);
+    if (!cond_waiters_ && waiters_.empty()) {
+      PERF_counter_inc(kKernelObjectNotifiesNoWaiter);
+    }
     cond_.notify_all();
     for (auto* waiter : waiters_) {
       waiter->Notify();
@@ -620,6 +627,9 @@ class PosixConditionBase {
 
   std::condition_variable cond_;
   std::mutex mutex_;
+  // Single-object waits blocked on cond_ (under mutex_), so a notify can tell
+  // whether anyone was waiting (kKernelObjectNotifiesNoWaiter, NN-3.3).
+  uint32_t cond_waiters_ = 0;
 
  private:
   std::unique_lock<std::mutex> Lock() {

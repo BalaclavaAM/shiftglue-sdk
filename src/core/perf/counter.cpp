@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #if REX_PLATFORM_WIN32
 #include <share.h>
@@ -41,6 +43,20 @@ REXCVAR_DEFINE_INT32(perf_log_max_mb, 0, "Perf",
 REXCVAR_DEFINE_BOOL(perf_critical_path_trace, false, "Perf",
                     "Log source-frame critical-path events")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(perf_aa_toggle, 0, "Perf",
+                     "A/A harness: a no-op value recorded in the perf CSV each frame, which "
+                     "a route flips to mark comparison windows")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(perf_inject_cpu_us, 0, "Perf",
+                     "A/A harness: spin this many microseconds of CPU time once a frame, a "
+                     "known cost the comparison must detect")
+    .range(0, 20000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(perf_inject_cpu_thread, true, "Perf",
+                    "A/A harness: spin perf_inject_cpu_us on a thread of its own, woken once "
+                    "a frame, rather than on the GPU commands thread, whose idle yield loop "
+                    "already burns CPU that the spin would only replace")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::perf {
 
@@ -205,6 +221,31 @@ constexpr const char* kCounterNames[] = {
     "fh1_surface_mb",
     "texture_cache_mb",
     "process_resident_mb",
+    "aa_toggle",
+    "injected_cpu_ns",
+    "process_cpu_ns",
+    "xma_work_event_sets",
+    "fh1_untile_skipped_draws",
+    "kernel_object_notifies",
+    "kernel_object_notifies_no_waiter",
+    "guest_range_readable_checks",
+    "rtl_critical_section_thread_lookups",
+    "host_path_lookup_misses",
+    "gpu_decoded_draws",
+    "replay_probe_ibs",
+    "replay_probe_repeat_ibs",
+    "replay_probe_skipped_ibs",
+    "replay_probe_drawn_in_ibs",
+    "replay_probe_drawn_in_repeat_ibs",
+    "replay_probe_drawn_in_skippable_repeat_ibs",
+    "replay_probe_skipped_drawn_draws",
+    "replay_probe_hash_ns",
+    "replay_probe_apply_ns",
+    "replay_probe_exit_registers",
+    "load_alu_constant_packets",
+    "load_alu_constant_dwords",
+    "load_alu_constant_sources",
+    "load_alu_constant_changed",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -303,6 +344,31 @@ constexpr bool kIsGauge[] = {
     true,   // kFh1SurfaceMb
     true,   // kTextureCacheMb
     true,   // kProcessResidentMb
+    false,  // kAaToggle (set each frame)
+    false,  // kInjectedCpuNs
+    false,  // kProcessCpuNs (set each frame)
+    false,  // kXmaWorkEventSets
+    false,  // kFh1UntileSkippedDraws
+    false,  // kKernelObjectNotifies
+    false,  // kKernelObjectNotifiesNoWaiter
+    false,  // kGuestRangeReadableChecks
+    false,  // kRtlCriticalSectionThreadLookups
+    false,  // kHostPathLookupMisses
+    false,  // kGpuDecodedDraws
+    false,  // kReplayProbeIbs
+    false,  // kReplayProbeRepeatIbs
+    false,  // kReplayProbeSkippedIbs
+    false,  // kReplayProbeDrawnInIbs
+    false,  // kReplayProbeDrawnInRepeatIbs
+    false,  // kReplayProbeDrawnInSkippableRepeatIbs
+    false,  // kReplayProbeSkippedDrawnDraws
+    false,  // kReplayProbeHashNs
+    false,  // kReplayProbeApplyNs
+    false,  // kReplayProbeExitRegisters
+    false,  // kLoadAluConstantPackets
+    false,  // kLoadAluConstantDwords
+    false,  // kLoadAluConstantSources
+    false,  // kLoadAluConstantChanged
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -342,7 +408,84 @@ int64_t GetTotalCounter(CounterId id) {
   return SumThreadTotals(index) - g_init_totals[index].load(std::memory_order_relaxed);
 }
 
+namespace {
+int64_t ProcessCpuTimeNs() {
+#if REX_PLATFORM_WIN32
+  FILETIME created, exited, kernel, user;
+  if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+  ULARGE_INTEGER kernel_time{}, user_time{};
+  kernel_time.LowPart = kernel.dwLowDateTime;
+  kernel_time.HighPart = kernel.dwHighDateTime;
+  user_time.LowPart = user.dwLowDateTime;
+  user_time.HighPart = user.dwHighDateTime;
+  return int64_t(kernel_time.QuadPart + user_time.QuadPart) * 100;
+#else
+  timespec time = {};
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time)) return 0;
+  return int64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+#endif
+}
+std::atomic<int64_t> g_last_process_cpu_ns{0};
+}  // namespace
+
+namespace {
+void SpinCpu(int64_t target_ns) {
+  const int64_t start = CurrentThreadCpuTimeNs();
+  int64_t spent = 0;
+  volatile uint64_t sink = 0;
+  while (spent < target_ns) {
+    for (int i = 0; i < 256; ++i) sink = sink * 6364136223846793005ull + 1442695040888963407ull;
+    spent = CurrentThreadCpuTimeNs() - start;
+  }
+  IncrementCounter(CounterId::kInjectedCpuNs, spent);
+}
+
+// perf_inject_cpu_thread: one spin per frame on a thread that otherwise sleeps.
+struct InjectWorker {
+  std::mutex mutex;
+  std::condition_variable wake;
+  int64_t pending_ns = 0;
+  InjectWorker() {
+    std::thread([this]() {
+      for (;;) {
+        int64_t target_ns;
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          wake.wait(lock, [this]() { return pending_ns > 0; });
+          target_ns = pending_ns;
+          pending_ns = 0;
+        }
+        SpinCpu(target_ns);
+      }
+    }).detach();
+  }
+};
+}  // namespace
+
+void InjectFrameCost() {
+  const int32_t inject_us = REXCVAR_GET(perf_inject_cpu_us);
+  if (inject_us <= 0) return;
+  const int64_t target_ns = int64_t(inject_us) * 1000;
+  if (!REXCVAR_GET(perf_inject_cpu_thread)) {
+    SpinCpu(target_ns);
+    return;
+  }
+  static InjectWorker* const worker = new InjectWorker();
+  {
+    std::lock_guard<std::mutex> lock(worker->mutex);
+    // A frame the worker has not caught up with adds no more.
+    worker->pending_ns = target_ns;
+  }
+  worker->wake.notify_one();
+}
+
 void ResetFrameCounters() {
+  SetCounter(CounterId::kAaToggle, REXCVAR_GET(perf_aa_toggle));
+  {
+    const int64_t now = ProcessCpuTimeNs();
+    const int64_t last = g_last_process_cpu_ns.exchange(now, std::memory_order_relaxed);
+    SetCounter(CounterId::kProcessCpuNs, last ? now - last : 0);
+  }
   for (size_t i = 0; i < kNumCounters; ++i) {
     const int64_t totals = SumThreadTotals(i);
     if (kIsGauge[i]) {

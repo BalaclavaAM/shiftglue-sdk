@@ -505,6 +505,9 @@ class CommandProcessor {
   // predicated packets run as if every tile's bins were selected.
   bool untile_tiling_ = false;
   bool untile_select_all_ = false;
+  // Draws the backend skipped for a later untile pass (gpu_replay_floor_probe
+  // counts drawn draws as the decoded ones minus these).
+  uint64_t untile_skipped_draws_ = 0;
   // A bin select of a predicated tiling pass: 0 the first tile (bins 0-1),
   // 1 and up the later ones, -1 not a tiling pass.
   int32_t TilingPassOfSelect() const {
