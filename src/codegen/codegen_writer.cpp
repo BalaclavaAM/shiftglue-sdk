@@ -123,6 +123,9 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"non_volatile_reload_after_call", cfg.nonVolatileReloadAfterCall},
       {"abi_poison_checks", cfg.abiPoisonChecks},
       {"interior_resume", cfg.interiorResume},
+      {"register_locals_functions", cfg.registerLocalsFunctions.size()},
+      {"fixed_fp_mode_functions", cfg.fixedFpModeFunctions.size()},
+      {"single_precision_functions", cfg.singlePrecisionFunctions.size()},
   };
 
   return {
@@ -139,6 +142,85 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"functions", functionsJson},
       {"recomp_files", nlohmann::json::array()},
   };
+}
+
+/// A store statement with `ctx.` dropped and any trailing comment removed, so
+/// the reference copy's `REX_STACK_STORE_U64(ctx.r1.u32 + -16, ctx.r31.u64)`
+/// and a localized body's `REX_STACK_STORE_U64(r1.u32 + -16, r31.u64)` match.
+std::string NormalizedStore(std::string_view line) {
+  const size_t first = line.find_first_not_of('\t');
+  if (first == std::string_view::npos)
+    return {};
+  std::string_view code = line.substr(first);
+  const size_t comment = code.find("  //");
+  if (comment != std::string_view::npos)
+    code = code.substr(0, comment);
+  if (!code.starts_with("REX_STACK_STORE_") && !code.starts_with("REX_STORE_"))
+    return {};
+  std::string out;
+  out.reserve(code.size());
+  for (size_t i = 0; i < code.size(); ++i) {
+    if (code.compare(i, 4, "ctx.") == 0) {
+      i += 3;
+      continue;
+    }
+    out += code[i];
+  }
+  return out;
+}
+
+/// Lockstep verify: the reference copy inlines the save/restore helpers and
+/// keeps the link-register slot store, but the optimized function may keep
+/// those registers in host locals instead (host_local_register_saves,
+/// host_local_lr, register_locals_functions) and never write those frame
+/// slots, which nothing else reads (the plans keep the slots in memory
+/// wherever something might). Every save-area store of the copy (an inlined
+/// helper line, or the LR slot) that the optimized body does not contain is
+/// emitted as REX_REF_STORE_UNCHECKED_*: logged and rolled back, never
+/// compared. Data stores are not touched, so they are all still compared.
+size_t UncheckSaveAreaStores(std::string& reference, const std::string& optimized) {
+  std::unordered_set<std::string> present;
+  for (size_t pos = 0; pos < optimized.size();) {
+    size_t end = optimized.find('\n', pos);
+    if (end == std::string::npos)
+      end = optimized.size();
+    std::string store = NormalizedStore(std::string_view(optimized).substr(pos, end - pos));
+    if (!store.empty())
+      present.insert(std::move(store));
+    pos = end + 1;
+  }
+  size_t unchecked = 0;
+  std::string out;
+  out.reserve(reference.size() + 256);
+  for (size_t pos = 0; pos < reference.size();) {
+    size_t end = reference.find('\n', pos);
+    const bool last = end == std::string::npos;
+    if (last)
+      end = reference.size();
+    std::string line = reference.substr(pos, end - pos);
+    pos = end + 1;
+    const bool saveArea = line.ends_with("// nv-helper") ||
+                          line.find("(ctx.r1.u32 + -8, ctx.r12.u32);") != std::string::npos;
+    const std::string store = saveArea ? NormalizedStore(line) : std::string();
+    if (!store.empty() && !present.count(store)) {
+      for (std::string_view macro : {"REX_STACK_STORE_U32(", "REX_STACK_STORE_U64(",
+                                     "REX_STORE_U32(", "REX_STORE_U64("}) {
+        const size_t at = line.find(macro);
+        if (at == std::string::npos)
+          continue;
+        const bool wide = macro.find("U64") != std::string_view::npos;
+        line.replace(at, macro.size(),
+                     wide ? "REX_REF_STORE_UNCHECKED_U64(" : "REX_REF_STORE_UNCHECKED_U32(");
+        ++unchecked;
+        break;
+      }
+    }
+    out += line;
+    if (!last)
+      out += '\n';
+  }
+  reference = std::move(out);
+  return unchecked;
 }
 
 }  // namespace
@@ -333,6 +415,10 @@ bool CodegenWriter::write(bool force) {
   referenceConfig.skipLr = false;
   referenceConfig.foldRodataLoads = false;
   referenceConfig.hostLocalRegisterSaves = false;
+  referenceConfig.hostLocalLr = false;
+  referenceConfig.registerLocalsFunctions.clear();
+  referenceConfig.fixedFpModeFunctions.clear();
+  referenceConfig.singlePrecisionFunctions.clear();
   referenceConfig.directCallsBypassThunk = false;
   referenceConfig.callProbes = false;
   referenceConfig.abiPoisonChecks = false;
@@ -341,6 +427,7 @@ bool CodegenWriter::write(bool force) {
   referenceCtx.referenced = &referenced;
   referenceCtx.namePrefix = "ref_";
   std::vector<std::pair<uint32_t, std::string>> referenceCopies;
+  size_t uncheckedReferenceStores = 0;
   static const char* const kStoreMacros[] = {
       "REX_STORE_U8",       "REX_STORE_U16",       "REX_STORE_U32",       "REX_STORE_U64",
       "REX_STACK_STORE_U8", "REX_STACK_STORE_U16", "REX_STACK_STORE_U32", "REX_STACK_STORE_U64"};
@@ -361,6 +448,13 @@ bool CodegenWriter::write(bool force) {
         REXCODEGEN_DEBUG("Reference copy of 0x{:08X} dropped: an instruction the verifier cannot "
                          "roll back", fn->base());
       } else {
+        // Under host_local_lr the optimized function keeps the link register
+        // in a local and leaves the caller's LR slot unwritten, which nothing
+        // reads (the plan keeps the slot wherever something might). The copy
+        // still writes it; compare everything else.
+        // The same holds for the GPR save area under host_local_register_saves
+        // and register_locals_functions: see UncheckSaveAreaStores.
+        uncheckedReferenceStores += UncheckSaveAreaStores(reference, code);
         std::string wrapped = "\n// Reference copy for the lockstep verifier (rex/ppc/reference.h)\n";
         for (size_t i = 0; i < 8; ++i)
           wrapped += fmt::format("#pragma push_macro(\"{}\")\n#undef {}\n#define {}(x, y) {}(x, y)\n",
@@ -384,6 +478,11 @@ bool CodegenWriter::write(bool force) {
   emitCtx.foldedRanges = nullptr;
   if (config().hostLocalRegisterSaves)
     rex::codegen::LogHostLocalSaveStats();
+  if (config().hostLocalLr)
+    rex::codegen::LogHostLocalLrStats();
+  if (!config().registerLocalsFunctions.empty() || !config().fixedFpModeFunctions.empty() ||
+      !config().singlePrecisionFunctions.empty())
+    rex::codegen::LogSpecializedFunctionStats();
 
   // The reference functions, for the host verifier: one macro line each.
   {
@@ -395,6 +494,10 @@ bool CodegenWriter::write(bool force) {
       println("REX_REFERENCE_FUNCTION(0x{:08X}, {})", address, name);
     SaveCurrentOutData(fmt::format("{}_reference.h", projectName));
     REXCODEGEN_TRACE("Emitted {} reference copies", referenceCopies.size());
+    if (uncheckedReferenceStores)
+      REXCODEGEN_INFO("reference copies: {} register save-area stores the optimized functions "
+                      "keep in host locals are rolled back but not compared",
+                      uncheckedReferenceStores);
   }
 
   // The read-only bytes folded into literals, with their FNV-1a 64 hash for the

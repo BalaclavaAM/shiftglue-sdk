@@ -217,4 +217,13 @@ class FunctionGraph {
 /// kept the save/restore helper calls (one line per reason).
 void LogHostLocalSaveStats();
 
+/// Log how many functions host_local_lr changed (LR slot in a host local) and
+/// why the others kept the slot in guest memory (one line per reason).
+void LogHostLocalLrStats();
+
+/// Log what the NN-5.1 per-function lists (register_locals_functions,
+/// fixed_fp_mode_functions, single_precision_functions) changed, and why a
+/// listed function was left alone.
+void LogSpecializedFunctionStats();
+
 }  // namespace rex::codegen

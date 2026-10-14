@@ -197,6 +197,25 @@ bool build_fdivs(BuilderContext& ctx) {
 // Fused Multiply-Add
 //=============================================================================
 
+//=============================================================================
+// Single-precision fused multiply-add (single_precision_functions, NN-5.1)
+//=============================================================================
+
+// fmadds and its kin round a*c+b once, to single precision. The double form
+// (std::fma, then float()) rounds twice. When all three operands are known
+// single-precision values, one float fma gives the guest's single rounding and
+// keeps the operands in single registers. `negate_b` and `negate` select
+// fmsubs, fnmadds and fnmsubs.
+static bool emit_single_fma(BuilderContext& ctx, bool negate, bool negate_b) {
+  const auto& ops = ctx.insn.operands;
+  if (!ctx.locals.isSingle(ops[1]) || !ctx.locals.isSingle(ops[2]) || !ctx.locals.isSingle(ops[3]))
+    return false;
+  ctx.println("	{}.f64 = double({}std::fma(float({}.f64), float({}.f64), {}float({}.f64)));",
+              ctx.f(ops[0]), negate ? "-" : "", ctx.f(ops[1]), ctx.f(ops[2]), negate_b ? "-" : "",
+              ctx.f(ops[3]));
+  return true;
+}
+
 bool build_fmadd(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println("\t{}.f64 = std::fma({}.f64, {}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
@@ -207,6 +226,8 @@ bool build_fmadd(BuilderContext& ctx) {
 
 bool build_fmadds(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emit_single_fma(ctx, false, false))
+    return true;
   ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, {}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -223,6 +244,8 @@ bool build_fmsub(BuilderContext& ctx) {
 
 bool build_fmsubs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emit_single_fma(ctx, false, true))
+    return true;
   ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, -{}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -239,6 +262,8 @@ bool build_fnmadd(BuilderContext& ctx) {
 
 bool build_fnmadds(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emit_single_fma(ctx, true, false))
+    return true;
   ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, {}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));
@@ -255,6 +280,8 @@ bool build_fnmsub(BuilderContext& ctx) {
 
 bool build_fnmsubs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (emit_single_fma(ctx, true, true))
+    return true;
   ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, -{}.f64)));",
               ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
               ctx.f(ctx.insn.operands[3]));

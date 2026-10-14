@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -119,6 +120,40 @@ inline bool AbiPoisonLooksPoisoned(uint64_t value) {
 
 inline std::atomic<uint64_t> g_abi_poison_dead_reads{0};
 
+// REX_ABI_POISON_VOLATILES=0 keeps the non-volatile and LR slot checks but
+// leaves the volatile registers alone after a call: FH1 reads a volatile
+// register a callee left (sub_823F3048 passes r6 from its previous call), so
+// with the poison on the race crashes within seconds (NL-0.1).
+inline bool AbiPoisonVolatilesEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("REX_ABI_POISON_VOLATILES");
+    return !(value && value[0] == '0');
+  }();
+  return enabled;
+}
+
+// host_local_lr (NEAR_NATIVE_RESEARCH.md NN-1.3): a function that keeps its LR
+// save slot in the `rex_saved_lr` local writes this value to the guest slot
+// instead of the return address, so a reader the generator's LR-slot scan
+// missed (a tail-called epilogue, a stack walk) sees a poison, and every
+// reload checks that the slot still holds it (a writer the scan missed).
+inline std::atomic<uint64_t> g_abi_poison_lr_slot_mismatches{0};
+
+inline uint32_t AbiPoisonLrSlotValue(uint32_t function) {
+  return AbiPoisonValue(15, function);
+}
+
+inline void AbiPoisonLrSlotCheck(uint32_t function, uint32_t site, uint32_t value) {
+  if (value == AbiPoisonLrSlotValue(function)) {
+    return;
+  }
+  const uint64_t count = ++g_abi_poison_lr_slot_mismatches;
+  if (count <= 500) {
+    REXCPU_ERROR("ABI_POISON lr slot: {:08X} reload at {:08X} read {:08X}, not the poison {:08X}",
+                 function, site, value, AbiPoisonLrSlotValue(function));
+  }
+}
+
 inline void AbiPoisonPreCall(::PPCContext& ctx, uint32_t site) {
   // An argument that still holds a poison was read from a register the ABI
   // says is dead after an earlier call: the caller of this call site relies
@@ -186,12 +221,16 @@ inline void AbiPoisonPostCall(::PPCContext& ctx, uint32_t site) {
   }
   const uint64_t calls = ++g_abi_poison_calls;
   if ((calls & ((uint64_t(1) << 24) - 1)) == 0) {
-    REXCPU_WARN("ABI_POISON summary calls={} mismatches={} dead_reads={} dropped={}", calls,
-                g_abi_poison_mismatches.load(), g_abi_poison_dead_reads.load(),
-                g_abi_poison_dropped.load());
+    REXCPU_WARN("ABI_POISON summary calls={} mismatches={} dead_reads={} dropped={} "
+                "lr_slot_mismatches={}",
+                calls, g_abi_poison_mismatches.load(), g_abi_poison_dead_reads.load(),
+                g_abi_poison_dropped.load(), g_abi_poison_lr_slot_mismatches.load());
   }
 
   // Poison the volatile registers the ABI leaves dead at a return.
+  if (!AbiPoisonVolatilesEnabled()) {
+    return;
+  }
   auto poison_for = [site](int reg) -> uint32_t { return AbiPoisonValue(reg, site); };
   PPCRegister* f = &ctx.f0;
   PPCVRegister* v = &ctx.v0;

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <atomic>
 #include <iterator>
 #include <cassert>
@@ -1138,7 +1139,1090 @@ HostSavePlan ScanHostLocalSaves(const FunctionNode& fn, const EmitContext& ctx) 
   return {R::kTransformed, first, saveAddress};
 }
 
+//=============================================================================
+// host_local_lr: the LR-slot scan (NEAR_NATIVE_RESEARCH.md NN-1.3)
+//=============================================================================
+// The LR save slot is the word at entry_sp - 8. A function may keep it in the
+// `rex_saved_lr` local (BuilderContext::emitHostLocalSaveRestore, build_stw,
+// build_lwz) only if the slot's single write is the prologue's (the
+// __savegprlr_N call that host_local_register_saves already inlines, or one
+// explicit `stw rS,-8(r1)`) in the straight-line code from the entry, and
+// every other access is a whole-word reload after it (an `lwz` the emitter
+// rewrites, or a __restgprlr_N epilogue). Nothing else may reach the slot: no
+// pointer to it, no r1 the tracking loses, no dynamic frame, no unwinder
+// (exception info), no hook, no call at the entry stack pointer (the callee's
+// slot would be the same word), and no tail branch, fall-through or indirect
+// jump into code that may read the slot before writing it (a split function
+// or an out-of-line epilogue). The tracking follows ScanHostLocalSaves.
+
+enum class HostLrReason : uint8_t {
+  kTransformed,
+  kNoSlot,
+  kKeepList,
+  kLocalized,
+  kInteriorResume,
+  kSharesRegisters,
+  kExceptionInfo,
+  kMidAsmHook,
+  kHelpersKept,
+  kHelperRestore,
+  kNotAtEntry,
+  kMultipleStores,
+  kStoreNotAtEntry,
+  kLoadBeforeStore,
+  kSlotAccess,
+  kSlotAddress,
+  kCallAtEntrySp,
+  kSetJmp,
+  kTailBranch,
+  kIndirectBranch,
+  kFallthrough,
+  kDynamicFrame,
+  kR1Write,
+  kSpStored,
+  kSpArithmetic,
+  kSpIndexedUnknown,
+  kLabelFrame,
+  kUndecoded,
+  kCount,
+};
+
+constexpr const char* kHostLrReasonNames[] = {
+    "transformed",        "no_slot",           "keep_list",        "non_volatile_as_local",
+    "interior_resume",    "shares_registers",  "exception_info",   "mid_asm_hook",
+    "helpers_kept",       "helper_restore",    "not_at_entry",     "multiple_stores",
+    "store_not_at_entry", "load_before_store", "slot_access",      "slot_address",
+    "call_at_entry_sp",   "setjmp_longjmp",    "tail_branch",      "indirect_branch",
+    "fallthrough",        "dynamic_frame",     "r1_write",         "sp_stored",
+    "sp_arithmetic",      "sp_indexed_unknown", "label_frame",      "undecoded",
+};
+static_assert(std::size(kHostLrReasonNames) == static_cast<size_t>(HostLrReason::kCount));
+
+std::array<std::atomic<uint64_t>, static_cast<size_t>(HostLrReason::kCount)> gHostLrStats{};
+std::atomic<uint64_t> gHostLrHelperForm{0};
+std::atomic<uint64_t> gHostLrExplicitForm{0};
+std::atomic<uint64_t> gHostLrLoadsRewritten{0};
+
+/// What one walk of a function found about its LR slot.
+struct LrSlotScan {
+  HostLrReason refusal = HostLrReason::kTransformed;  ///< the walk lost track of r1
+  uint32_t refusalAddress = 0;
+  bool readsLr = false;        ///< an mflr anywhere
+  bool savesLr = false;        ///< a __savegprlr_N call or a `stw rS,-8(r1)` anywhere
+  bool helperSave = false;     ///< a `bl __savegprlr_N` at the entry stack pointer
+  uint32_t store = 0;          ///< the explicit whole-word slot store
+  bool writeFirst = false;     ///< the first slot access is a write, in the entry code
+  bool otherAccess = false;    ///< a slot access that is neither the write nor a reload
+  uint32_t otherAddress = 0;
+  bool readBeforeWrite = false;
+  uint32_t readBeforeWriteAddress = 0;
+  bool multipleWrites = false;
+  uint32_t multipleWritesAddress = 0;
+  bool helperRestore = false;  ///< a __restgprlr_N call or tail (reads the slot)
+  bool callAtEntrySp = false;  ///< a non-helper call with r1 at the entry value
+  uint32_t callAtEntrySpAddress = 0;
+  bool indirect = false;       ///< a bcctr that is not a switch
+  uint32_t indirectAddress = 0;
+  bool fallthrough = false;
+  std::vector<uint32_t> loads;                       ///< `lwz` reloads of the slot
+  std::vector<std::pair<uint32_t, uint32_t>> tails;  ///< (site, target) of tail branches
+
+  bool touchesSlot() const {
+    return helperSave || helperRestore || store || !loads.empty() || otherAccess ||
+           readBeforeWrite || multipleWrites;
+  }
+};
+
+LrSlotScan WalkLrSlot(const FunctionNode& fn, const EmitContext& ctx) {
+  using R = HostLrReason;
+  const auto& cfg = ctx.config;
+  LrSlotScan scan;
+  auto refuse = [&](R reason, uint32_t address) {
+    scan.refusal = reason;
+    scan.refusalAddress = address;
+    return scan;
+  };
+  struct Word {
+    uint32_t address;
+    uint32_t raw;
+    const uint8_t* data;
+  };
+  std::vector<Word> words;
+  for (const auto& block : fn.blocks()) {
+    const uint8_t* data = ctx.binary.translate(block.base);
+    if (!data)
+      continue;
+    for (uint32_t address = block.base; address < block.end(); address += 4) {
+      const uint8_t* at = data + (address - block.base);
+      words.push_back({address, load_and_swap<uint32_t>(at), at});
+    }
+  }
+  auto calleeName = [&](uint32_t target) -> std::string_view {
+    const FunctionNode* callee = ctx.graph.getFunction(target);
+    return callee ? std::string_view(callee->name()) : std::string_view{};
+  };
+  auto branchTarget = [](const Word& w) {
+    return PPC_OP(w.raw) == PPC_OP_B ? w.address + PPC_BI(w.raw) : w.address + PPC_BD(w.raw);
+  };
+  // Whether the function saves LR at all, before any tracking: an mflr and
+  // the helper call or the prologue's `stw rS,-8(r1)`. A leaf that only uses
+  // the red zone word as scratch has no LR slot to move.
+  for (const Word& w : words) {
+    if ((w.raw & 0xFC1FFFFFu) == 0x7C0802A6u)  // mflr rD
+      scan.readsLr = true;
+    if ((w.raw & 0xFC1FFFFFu) == 0x9001FFF8u ||  // stw rS,-8(r1)
+        (PPC_OP(w.raw) == PPC_OP_B && PPC_BL(w.raw) &&
+         SaveRestoreHelperFirstRegister(calleeName(branchTarget(w)), "__savegprlr_") >= 0))
+      scan.savesLr = true;
+  }
+  if (words.empty() || words.front().address != fn.base())
+    return refuse(R::kNotAtEntry, fn.base());
+  auto isHelper = [](std::string_view name) {
+    return name.starts_with("__save") || name.starts_with("__rest");
+  };
+
+  // Labels: internal branch targets and switch cases.
+  std::unordered_set<uint32_t> labels;
+  std::unordered_set<uint32_t> switchBctrs;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> switchTargets;  // bctr -> cases
+  for (const auto& jt : fn.jumpTables()) {
+    switchBctrs.insert(jt.bctrAddress);
+    labels.insert(jt.targets.begin(), jt.targets.end());
+    auto& cases = switchTargets[jt.bctrAddress];
+    cases.insert(cases.end(), jt.targets.begin(), jt.targets.end());
+  }
+  for (const Word& w : words) {
+    const uint32_t op = PPC_OP(w.raw);
+    if ((op == PPC_OP_B || op == PPC_OP_BC) && fn.containsAddress(branchTarget(w)) &&
+        !(PPC_BL(w.raw) && branchTarget(w) == fn.base()))
+      labels.insert(branchTarget(w));
+    auto st = cfg.switchTables.find(w.address);
+    if (st != cfg.switchTables.end()) {
+      switchBctrs.insert(w.address);
+      labels.insert(st->second.targets.begin(), st->second.targets.end());
+      auto& cases = switchTargets[w.address];
+      cases.insert(cases.end(), st->second.targets.begin(), st->second.targets.end());
+    }
+    if (op == PPC_OP_CTR && PPC_XOP(w.raw) == 528 && !PPC_BL(w.raw) &&
+        !switchBctrs.count(w.address)) {
+      FunctionScanner scanner(ctx.binary);
+      if (auto jt = scanner.detect_jump_table(w.address)) {
+        switchBctrs.insert(w.address);
+        labels.insert(jt->targets.begin(), jt->targets.end());
+        auto& cases = switchTargets[w.address];
+        cases.insert(cases.end(), jt->targets.begin(), jt->targets.end());
+      }
+    }
+  }
+
+  // The slot, relative to the entry stack pointer.
+  constexpr int64_t kSlotLo = -8;
+  constexpr int64_t kSlotHi = -4;
+  bool written = false;
+  bool accessed = false;
+  auto noteWrite = [&](uint32_t address, bool inEntryCode) {
+    if (written) {
+      if (!scan.multipleWrites) {
+        scan.multipleWrites = true;
+        scan.multipleWritesAddress = address;
+      }
+      return false;
+    }
+    written = true;
+    // First means before any other slot access and before anything that could
+    // run other code on this stack pointer.
+    if (!accessed && inEntryCode && !scan.callAtEntrySp && scan.tails.empty() && !scan.indirect)
+      scan.writeFirst = true;
+    accessed = true;
+    return true;
+  };
+  auto noteRead = [&](uint32_t address) {
+    if (!written && !scan.readBeforeWrite) {
+      scan.readBeforeWrite = true;
+      scan.readBeforeWriteAddress = address;
+    }
+    accessed = true;
+  };
+  auto noteOther = [&](uint32_t address) {
+    if (!scan.otherAccess) {
+      scan.otherAccess = true;
+      scan.otherAddress = address;
+    }
+    accessed = true;
+  };
+  auto noteCallAtEntrySp = [&](uint32_t address) {
+    if (!scan.callAtEntrySp) {
+      scan.callAtEntrySp = true;
+      scan.callAtEntrySpAddress = address;
+    }
+  };
+
+  int64_t spOff = 0;  // r1 minus the entry stack pointer
+  std::optional<int64_t> bodyOff;
+  bool controlFlowSeen = false;  // a label or internal branch since entry
+  std::unordered_map<uint32_t, int64_t> spRel;  // GPR -> entry-relative stack address
+  std::unordered_map<uint32_t, int64_t> konst;  // GPR -> known constant
+  auto regOff = [&](uint32_t reg) -> std::optional<int64_t> {
+    if (reg == 1)
+      return spOff;
+    auto it = spRel.find(reg);
+    return it == spRel.end() ? std::nullopt : std::optional<int64_t>(it->second);
+  };
+  auto forget = [&](uint32_t reg) {
+    spRel.erase(reg);
+    konst.erase(reg);
+  };
+  auto clobberVolatiles = [&]() {
+    for (auto* map : {&spRel, &konst})
+      for (auto it = map->begin(); it != map->end();)
+        it = it->first < 14 ? map->erase(it) : std::next(it);
+  };
+  // A pointer into the slot escapes the tracking. r12 = the slot address is
+  // the frame pointer the FPR and VMX helpers take when no GPR is saved (they
+  // store below it); it may reach only those helpers.
+  auto pointerOk = [&](uint32_t rd, int64_t value) {
+    if (value > kSlotLo && value < kSlotHi)
+      return false;
+    return value != kSlotLo || rd == 12;
+  };
+  auto slotPointerLive = [&]() {
+    auto it = spRel.find(12);
+    return it != spRel.end() && it->second == kSlotLo;
+  };
+
+  // The walk assumes r1 at a label is the body's stack pointer (the entry's
+  // when no frame is allocated yet); every way into the label must agree, or
+  // a reload of the slot after an epilogue could be placed at the wrong word.
+  std::unordered_map<uint32_t, int64_t> labelSp;                // label -> assumed r1
+  std::vector<std::pair<uint32_t, int64_t>> edges;              // (target, r1 at the branch)
+  bool mayFallThrough = false;
+  auto noteEdge = [&](uint32_t target) { edges.emplace_back(target, spOff); };
+  auto alwaysBranches = [](uint32_t raw) {
+    const uint32_t bo = (raw >> 21) & 31;
+    return (bo & 0x14) == 0x14;
+  };
+
+  ppc_insn insn;
+  for (size_t i = 0; i < words.size(); ++i) {
+    const Word& w = words[i];
+    if (labels.count(w.address)) {
+      controlFlowSeen = true;
+      spRel.clear();
+      konst.clear();
+      const int64_t assumed = bodyOff ? *bodyOff : spOff;
+      if (mayFallThrough && i > 0 && spOff != assumed)
+        return refuse(R::kLabelFrame, w.address);
+      spOff = assumed;
+      labelSp[w.address] = assumed;
+    }
+    mayFallThrough = true;
+    Disassemble(w.data, 4, w.address, insn);
+    if (!insn.opcode) {
+      if (w.raw != 0)
+        return refuse(R::kUndecoded, w.address);
+      continue;
+    }
+    const std::string_view name = insn.opcode->name;
+    const auto& ops = insn.operands;
+    const uint32_t op = PPC_OP(w.raw);
+
+    // --- Branches ---
+    if (op == PPC_OP_B || op == PPC_OP_BC) {
+      const uint32_t target = branchTarget(w);
+      const bool linked = PPC_BL(w.raw);
+      if (fn.containsAddress(target) && !(linked && target == fn.base())) {
+        controlFlowSeen = true;
+        noteEdge(target);
+        if (op == PPC_OP_B || alwaysBranches(w.raw))
+          mayFallThrough = linked;
+        continue;
+      }
+      const std::string_view callee = calleeName(target);
+      if (!linked && (op == PPC_OP_B || alwaysBranches(w.raw)))
+        mayFallThrough = false;
+      if (linked) {
+        if (SaveRestoreHelperFirstRegister(callee, "__savegprlr_") >= 0) {
+          // The helper stores r12 at r1 - 8: the slot only at the entry r1.
+          if (spOff == 0) {
+            scan.helperSave = true;
+            noteWrite(w.address, !controlFlowSeen);
+          } else {
+            noteOther(w.address);
+          }
+        } else if (SaveRestoreHelperFirstRegister(callee, "__restgprlr_") >= 0) {
+          scan.helperRestore = true;
+          if (spOff == 0)
+            noteRead(w.address);
+          else
+            noteOther(w.address);
+        } else if ((cfg.longJmpAddress && target == cfg.longJmpAddress) ||
+                   (cfg.setJmpAddress && target == cfg.setJmpAddress)) {
+          return refuse(R::kSetJmp, w.address);
+        } else if (!isHelper(callee)) {
+          if (slotPointerLive())
+            return refuse(R::kSlotAddress, w.address);
+          if (spOff == 0)
+            noteCallAtEntrySp(w.address);
+        }
+        clobberVolatiles();
+        continue;
+      }
+      if (SaveRestoreHelperFirstRegister(callee, "__restgprlr_") >= 0) {
+        scan.helperRestore = true;
+        if (spOff == 0)
+          noteRead(w.address);
+        else
+          noteOther(w.address);
+        continue;
+      }
+      if (!isHelper(callee) && slotPointerLive())
+        return refuse(R::kSlotAddress, w.address);
+      scan.tails.emplace_back(w.address, target);
+      continue;
+    }
+    if (op == PPC_OP_CTR) {
+      const uint32_t xop = PPC_XOP(w.raw);
+      if (xop == 528 || xop == 16) {  // bcctr, bclr
+        if (PPC_BL(w.raw)) {          // bctrl, blrl: a call to an unknown target
+          if (slotPointerLive())
+            return refuse(R::kSlotAddress, w.address);
+          if (spOff == 0)
+            noteCallAtEntrySp(w.address);
+          clobberVolatiles();
+          continue;
+        }
+        if (alwaysBranches(w.raw))
+          mayFallThrough = false;
+        if (xop == 16)
+          continue;  // a return
+        if (!switchBctrs.count(w.address)) {
+          if (slotPointerLive())
+            return refuse(R::kSlotAddress, w.address);
+          if (!scan.indirect) {
+            scan.indirect = true;
+            scan.indirectAddress = w.address;
+          }
+          continue;
+        }
+        controlFlowSeen = true;
+        if (auto cases = switchTargets.find(w.address); cases != switchTargets.end())
+          for (uint32_t target : cases->second)
+            noteEdge(target);
+        continue;
+      }
+    }
+
+    // --- Loads, stores and cache operations ---
+    const bool isStore = name.starts_with("st");
+    const bool isCache = name.starts_with("dcb") || name.starts_with("icb");
+    const bool isLoad = name.starts_with("l") && !name.starts_with("li") &&
+                        !name.starts_with("lvsl") && !name.starts_with("lvsr");
+    if (isLoad || isStore || isCache) {
+      bool indexed = isCache || name.find('x') != std::string_view::npos;
+      uint32_t ra = 0, rb = 0;
+      int64_t disp = 0;
+      if (isCache) {
+        ra = ops[0];
+        rb = ops[1];
+      } else if (indexed) {
+        ra = ops[1];
+        rb = ops[2];
+      } else {
+        ra = ops[2];
+        disp = static_cast<int32_t>(ops[1]);
+      }
+      const bool update = !isCache && (name.ends_with("u") || name.ends_with("ux"));
+      const bool gprData = !isCache && !name.starts_with("lf") && !name.starts_with("stf") &&
+                           !name.starts_with("lv") && !name.starts_with("stv");
+
+      // The prologue's frame allocation and its back chain.
+      if (name == "stwu" && ops[0] == 1 && ra == 1) {
+        if (bodyOff)
+          return refuse(R::kDynamicFrame, w.address);
+        if (spOff + disp < kSlotHi && spOff + disp + 4 > kSlotLo)
+          noteOther(w.address);
+        bodyOff = spOff + disp;
+        spOff = *bodyOff;
+        continue;
+      }
+      if (update && ra == 1)
+        return refuse(R::kDynamicFrame, w.address);
+      if (isStore && gprData && ops[0] == 1)
+        return refuse(R::kSpStored, w.address);
+
+      std::optional<int64_t> e;
+      if (indexed) {
+        const std::optional<int64_t> a = ra == 0 ? std::nullopt : regOff(ra);
+        const std::optional<int64_t> b = regOff(rb);
+        if (a && b)
+          return refuse(R::kSpArithmetic, w.address);
+        if (a || b) {
+          const uint32_t other = a ? rb : ra;
+          int64_t k = 0;
+          if (other != 0 || a) {
+            auto it = konst.find(other);
+            if (it == konst.end())
+              return refuse(R::kSpIndexedUnknown, w.address);
+            k = it->second;
+          }
+          e = (a ? *a : *b) + k;
+        }
+      } else if (ra != 0) {
+        e = regOff(ra);
+        if (e)
+          *e += disp;
+      }
+      if (e) {
+        int64_t lo = *e;
+        int64_t hi = lo + AccessSize(name);
+        if (name.starts_with("lmw") || name.starts_with("stmw"))
+          hi = lo + 4 * (32 - static_cast<int64_t>(ops[0]));
+        if (name.starts_with("lv") || name.starts_with("stv")) {
+          lo &= ~int64_t{15};
+          hi = lo + 16;
+        }
+        if (isCache) {
+          lo &= ~int64_t{127};
+          hi = lo + 128;
+        }
+        if (lo < kSlotHi && hi > kSlotLo) {
+          if (name == "stw" && lo == kSlotLo) {
+            if (noteWrite(w.address, !controlFlowSeen))
+              scan.store = w.address;
+          } else if (name == "lwz" && lo == kSlotLo && ops[0] != 1) {
+            noteRead(w.address);
+            scan.loads.push_back(w.address);
+          } else {
+            noteOther(w.address);
+          }
+        }
+      }
+
+      if (isLoad && gprData) {
+        const uint32_t rd = ops[0];
+        if (name.starts_with("lmw")) {
+          if (rd <= 1)
+            return refuse(R::kR1Write, w.address);
+          for (uint32_t r = rd; r < 32; ++r)
+            forget(r);
+        } else if (rd == 1) {
+          // The back chain reload: r1 takes the entry stack pointer back.
+          if (name == "lwz" && ra == 1 && disp == 0 && bodyOff && spOff == *bodyOff)
+            spOff = 0;
+          else
+            return refuse(R::kR1Write, w.address);
+        } else if (name == "lwz" && e && bodyOff && *e == *bodyOff && spOff == *bodyOff) {
+          // A copy of the back chain is the entry stack pointer.
+          konst.erase(rd);
+          spRel[rd] = 0;
+        } else {
+          forget(rd);
+        }
+      }
+      if (update)
+        forget(ra);
+      continue;
+    }
+
+    // --- Integer operations on r1 and the registers derived from it ---
+    if (name == "addi" || name == "mr") {
+      const uint32_t rd = ops[0];
+      const uint32_t ra = ops[1];
+      const int64_t imm = name == "addi" ? static_cast<int32_t>(ops[2]) : 0;
+      if (rd == 1) {
+        if (name == "addi" && ra == 1 && bodyOff && spOff == *bodyOff && spOff + imm == 0) {
+          spOff = 0;
+          continue;
+        }
+        return refuse(R::kR1Write, w.address);
+      }
+      if (auto a = regOff(ra)) {
+        const int64_t value = *a + imm;
+        if (!pointerOk(rd, value))
+          return refuse(R::kSlotAddress, w.address);
+        konst.erase(rd);
+        spRel[rd] = value;
+        continue;
+      }
+      auto k = konst.find(ra);
+      const std::optional<int64_t> known =
+          k == konst.end() ? std::nullopt : std::optional<int64_t>(k->second + imm);
+      forget(rd);
+      if (known)
+        konst[rd] = *known;
+      continue;
+    }
+    if (name == "li" || name == "lis") {
+      const uint32_t rd = ops[0];
+      if (rd == 1)
+        return refuse(R::kR1Write, w.address);
+      forget(rd);
+      const int64_t imm = static_cast<int32_t>(ops[1]);
+      konst[rd] = name == "li" ? imm : static_cast<int64_t>(static_cast<int32_t>(
+                                           static_cast<uint32_t>(imm) << 16));
+      continue;
+    }
+    if (FirstOperandNotGprDest(name))
+      continue;
+    const uint32_t rd = ops[0];
+    if (rd == 1)
+      return refuse(R::kR1Write, w.address);
+    if (!name.starts_with("mf") && (ops[1] == 1 || spRel.count(ops[1])))
+      return refuse(R::kSpArithmetic, w.address);
+    if (ThirdOperandIsGpr(name) && (ops[2] == 1 || spRel.count(ops[2])))
+      return refuse(R::kSpArithmetic, w.address);
+    forget(rd);
+  }
+
+  for (const auto& [target, sp] : edges) {
+    auto it = labelSp.find(target);
+    if (it != labelSp.end() && it->second != sp)
+      return refuse(R::kLabelFrame, target);
+  }
+
+  // A split function that falls through into the next entry continues in
+  // another function on this frame (emitCpp's fall-through tail call).
+  if (!fn.blocks().empty() && fn.blocks().back().end() == fn.end()) {
+    const auto* next = ctx.graph.getFunction(fn.end());
+    const auto* last = ctx.binary.translate(fn.end() - 4);
+    if (next && next != &fn && last) {
+      const uint32_t raw = load_and_swap<uint32_t>(last);
+      const uint32_t op = PPC_OP(raw);
+      if (!((op == PPC_OP_B || op == PPC_OP_CTR) && !PPC_BL(raw)))
+        scan.fallthrough = true;
+    }
+  }
+  return scan;
+}
+
+/// Whether code reached by a tail branch to `target` may read the slot the
+/// branching function wrote before writing it itself: a split function, an
+/// out-of-line epilogue, or anything the walk cannot follow. A function that
+/// writes its own slot first is safe, and so is one that never touches it,
+/// calls nothing at the entry stack pointer and branches nowhere else.
+/// Imports are host code, which never reads the guest LR slot.
+bool MayReadCallerLrSlot(uint32_t target, const EmitContext& ctx) {
+  const FunctionNode* callee = ctx.graph.getFunction(target);
+  if (!callee || callee->base() != target)
+    return true;
+  if (callee->isImport())
+    return false;
+  if (callee->blocks().empty() || callee->hasExceptionInfo() || callee->sharesRegisters())
+    return true;
+  const LrSlotScan scan = WalkLrSlot(*callee, ctx);
+  if (scan.writeFirst)
+    return false;
+  if (scan.refusal != HostLrReason::kTransformed)
+    return true;
+  return scan.touchesSlot() || scan.callAtEntrySp || scan.indirect || scan.fallthrough ||
+         !scan.tails.empty();
+}
+
+struct HostLrPlan {
+  HostLrReason reason = HostLrReason::kNoSlot;
+  uint32_t address = 0;
+  uint32_t store = 0;
+  std::vector<uint32_t> loads;
+};
+
+HostLrPlan ScanHostLocalLr(const FunctionNode& fn, const EmitContext& ctx,
+                           const HostSavePlan& savePlan) {
+  using R = HostLrReason;
+  const auto& cfg = ctx.config;
+  const LrSlotScan scan = WalkLrSlot(fn, ctx);
+  if (!scan.readsLr || !(scan.savesLr || scan.store || scan.helperSave))
+    return {R::kNoSlot};
+  const uint32_t at = fn.base();
+  if (std::binary_search(cfg.hostLocalLrKeep.begin(), cfg.hostLocalLrKeep.end(), at))
+    return {R::kKeepList, at};
+  if (cfg.nonVolatileRegistersAsLocalVariables)
+    return {R::kLocalized, at};
+  if (cfg.interiorResume)
+    return {R::kInteriorResume, at};
+  if (fn.sharesRegisters())
+    return {R::kSharesRegisters, at};
+  if (fn.hasExceptionInfo())
+    return {R::kExceptionInfo, at};
+  for (const auto& block : fn.blocks())
+    for (uint32_t address = block.base; address < block.end(); address += 4)
+      if (cfg.midAsmHooks.count(address))
+        return {R::kMidAsmHook, address};
+  if (scan.refusal != R::kTransformed)
+    return {scan.refusal, scan.refusalAddress};
+  // The save helper writes the slot itself unless host_local_register_saves
+  // inlined it; the restore helper reads it unless the same plan covers it.
+  const bool helperForm = savePlan.reason == HostSaveReason::kTransformed;
+  if (!helperForm && (scan.helperSave || scan.helperRestore))
+    return {scan.helperSave ? R::kHelpersKept : R::kHelperRestore, at};
+  if (helperForm && !scan.helperSave)
+    return {R::kHelpersKept, at};
+  if (scan.multipleWrites)
+    return {R::kMultipleStores, scan.multipleWritesAddress};
+  if (scan.readBeforeWrite)
+    return {R::kLoadBeforeStore, scan.readBeforeWriteAddress};
+  if (scan.otherAccess)
+    return {R::kSlotAccess, scan.otherAddress};
+  if (!scan.writeFirst)
+    return {R::kStoreNotAtEntry, scan.store ? scan.store : at};
+  if (scan.callAtEntrySp)
+    return {R::kCallAtEntrySp, scan.callAtEntrySpAddress};
+  if (scan.indirect)
+    return {R::kIndirectBranch, scan.indirectAddress};
+  if (scan.fallthrough)
+    return {R::kFallthrough, fn.end() - 4};
+  for (const auto& [site, target] : scan.tails)
+    if (MayReadCallerLrSlot(target, ctx))
+      return {R::kTailBranch, site};
+  HostLrPlan plan{R::kTransformed, at, scan.store, scan.loads};
+  std::sort(plan.loads.begin(), plan.loads.end());
+  return plan;
+}
+
+//=============================================================================
+// NN-5.1 per-function specialisation (register_locals_functions,
+// fixed_fp_mode_functions, single_precision_functions)
+//=============================================================================
+
+enum class SpecializeReason : uint8_t {
+  kApplied,
+  kSharesRegisters,
+  kExceptionInfo,
+  kInteriorResume,
+  kMidAsmHook,
+  kAbiPoisonChecks,
+  kSetJmpOrSeh,
+  kCount,
+};
+
+constexpr const char* kSpecializeReasonNames[] = {
+    "applied",           "shares_registers", "exception_info", "interior_resume",
+    "mid_asm_hook",      "abi_poison_checks", "setjmp_longjmp_or_seh",
+};
+static_assert(std::size(kSpecializeReasonNames) == static_cast<size_t>(SpecializeReason::kCount));
+
+std::array<std::atomic<uint64_t>, static_cast<size_t>(SpecializeReason::kCount)> gRegisterLocalsStats{};
+std::atomic<uint64_t> gFixedFpFunctions{0};
+std::atomic<uint64_t> gFixedFpSites{0};
+std::atomic<uint64_t> gIeeeFallbacks{0};
+std::atomic<uint64_t> gSingleFunctions{0};
+std::atomic<uint64_t> gSingleFmas{0};
+
+/// Why a function listed in register_locals_functions keeps its registers in
+/// ctx, from what is known before emission (kApplied when nothing).
+SpecializeReason RegisterLocalsRefusal(const FunctionNode& fn, const EmitContext& ctx,
+                                       bool hasResumeSwitch) {
+  using R = SpecializeReason;
+  // A funclet reads its owner's registers through ctx.
+  if (fn.sharesRegisters())
+    return R::kSharesRegisters;
+  // An unwinder or SEH handler sees ctx, not the locals.
+  if (fn.hasExceptionInfo())
+    return R::kExceptionInfo;
+  // A resume entry would start from ctx with the locals unset.
+  if (hasResumeSwitch)
+    return R::kInteriorResume;
+  // Hooks take registers by reference or ctx itself.
+  for (const auto& [address, hook] : ctx.config.midAsmHooks) {
+    (void)hook;
+    if (fn.containsAddress(address))
+      return R::kMidAsmHook;
+  }
+  // The poison checks snapshot ctx before the publish at a call.
+  if (ctx.config.abiPoisonChecks)
+    return R::kAbiPoisonChecks;
+  return R::kApplied;
+}
+
+/// A body form register_locals cannot carry, found after emission: the
+/// setjmp context copy, longjmp and SEH (they copy or restore all of ctx).
+bool HasWholeContextForms(const std::string& body) {
+  return body.find("ppc_setjmp") != std::string::npos ||
+         body.find("ppc_longjmp") != std::string::npos ||
+         body.find("SEH_") != std::string::npos || body.find("ctx = env") != std::string::npos ||
+         body.find("env = ctx") != std::string::npos;
+}
+
+/// register_locals_functions: every register local a body assigns, volatile
+/// ones included. A line that starts with a register local assigns it
+/// (`rN.u64 = `, `vN.u32[i] |= `, ...), and so does a vector store whose
+/// destination is the local. Registers an inlined restore helper (`//
+/// nv-helper`) assigns count too: the publish pass decides whether ctx still
+/// holds the value they get back.
+std::vector<std::string> WrittenAllRegisters(const std::string& body) {
+  std::set<std::string> written;
+  auto parseRegister = [](std::string_view text, size_t at, std::string& out, bool& nonVolatile) {
+    if (at >= text.size())
+      return false;
+    char kind = text[at];
+    if (kind != 'r' && kind != 'f' && kind != 'v')
+      return false;
+    size_t q = at + 1;
+    while (q < text.size() && std::isdigit(static_cast<unsigned char>(text[q])))
+      q++;
+    if (q == at + 1 || q >= text.size() || (text[q] != '.' && text[q] != '[' && text[q] != ' '))
+      return false;
+    unsigned index = static_cast<unsigned>(std::stoul(std::string(text.substr(at + 1, q - at - 1))));
+    if ((kind == 'v' && index >= 128) || (kind != 'v' && index >= 32))
+      return false;
+    nonVolatile = kind == 'v' ? ((index >= 14 && index < 32) || index >= 64) : index >= 14;
+    out = std::string(text.substr(at, q - at));
+    return true;
+  };
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos)
+      end = body.size();
+    std::string_view line(body.data() + pos, end - pos);
+    pos = end + 1;
+    size_t first = line.find_first_not_of('\t');
+    if (first == std::string_view::npos)
+      continue;
+    std::string_view code = line.substr(first);
+    std::string reg;
+    bool nonVolatile = false;
+    if (code.starts_with("simde_mm_store")) {
+      size_t open = code.find('(');
+      size_t comma = code.find(',');
+      if (open != std::string_view::npos && comma != std::string_view::npos) {
+        size_t cast = code.rfind(')', comma);
+        size_t start = (cast != std::string_view::npos && cast > open) ? cast + 1 : open + 1;
+        if (parseRegister(code, start, reg, nonVolatile))
+          written.insert(reg);
+      }
+      continue;
+    }
+    if (parseRegister(code, 0, reg, nonVolatile))
+      written.insert(reg);
+  }
+  return std::vector<std::string>(written.begin(), written.end());
+}
+
+/// The register local a generated line assigns, if any: a line that starts
+/// with a register local (`rN.u64 = `, `vN.u32[i] |= `, ...) or a vector
+/// store whose destination operand is one. `nonVolatile` tells the class.
+bool AssignedRegister(std::string_view code, std::string& reg, bool& nonVolatile) {
+  auto parse = [&](size_t at) {
+    if (at >= code.size())
+      return false;
+    char kind = code[at];
+    if (kind != 'r' && kind != 'f' && kind != 'v')
+      return false;
+    size_t q = at + 1;
+    while (q < code.size() && std::isdigit(static_cast<unsigned char>(code[q])))
+      q++;
+    if (q == at + 1 || q >= code.size() || (code[q] != '.' && code[q] != '[' && code[q] != ' '))
+      return false;
+    unsigned index = static_cast<unsigned>(std::stoul(std::string(code.substr(at + 1, q - at - 1))));
+    if ((kind == 'v' && index >= 128) || (kind != 'v' && index >= 32))
+      return false;
+    nonVolatile = kind == 'v' ? ((index >= 14 && index < 32) || index >= 64) : index >= 14;
+    reg = std::string(code.substr(at, q - at));
+    return true;
+  };
+  if (code.starts_with("simde_mm_store")) {
+    size_t open = code.find('(');
+    size_t comma = code.find(',');
+    if (open == std::string_view::npos || comma == std::string_view::npos)
+      return false;
+    size_t cast = code.rfind(')', comma);
+    size_t start = (cast != std::string_view::npos && cast > open) ? cast + 1 : open + 1;
+    return parse(start);
+  }
+  return parse(0);
+}
+
+/// register_locals_functions (NN-5.1): synchronize a body whose registers are
+/// all locals with ctx. Invariant: a local not in the dirty set equals its ctx
+/// field. Entry is clean (every local is loaded from ctx), an assignment makes
+/// its register dirty, and a label's set is the union over every path into it
+/// (fall-through, gotos, switch cases), iterated to a fixed point for loops.
+/// Before a call, tail call or return the dirty registers and the
+/// non-volatile CR fields go to ctx; after a call the volatile locals come
+/// back (`reloadAfterCall`). A publish at the top level of the body leaves
+/// everything clean; one inside a nested block may not run, so it clears
+/// nothing. Lines the pass does not recognize change nothing, which can only
+/// leave a register dirty for longer (an extra store), never clean too soon.
+///
+/// An inlined restore helper (`// nv-helper`) gives a non-volatile its entry
+/// value back. That leaves it clean only while ctx still holds the entry
+/// value, so a second set tracks the registers whose ctx field may have been
+/// overwritten by a publish since entry ("moved"); a restore of a moved
+/// register is a write like any other. (The offline equivalence check caught
+/// the first version, which treated every restore as clean: a non-volatile
+/// published before a call kept its computed value in ctx at the return.)
+std::string SyncAllRegisterLocals(const std::string& body, const std::vector<std::string>& written,
+                                  const std::string& crSpill, const std::string& reloadAfterCall,
+                                  size_t& publishedStores) {
+  using Set = std::bitset<256>;
+  auto contains = [](std::string_view line, std::string_view what) {
+    return line.find(what) != std::string_view::npos;
+  };
+  std::unordered_map<std::string, size_t> slot;
+  for (size_t i = 0; i < written.size() && i < 256; ++i)
+    slot.emplace(written[i], i);
+
+  enum class Kind : uint8_t { kOther, kComment, kLabel, kPublish, kWrite, kRestore };
+  struct Line {
+    std::string_view text;
+    Kind kind = Kind::kOther;
+    bool topLevel = false;
+    bool calls = false;
+    bool leaves = false;
+    bool ends = false;      // control does not fall through (top-level goto, return, tail call)
+    size_t reg = SIZE_MAX;  // kWrite
+    std::string_view label; // kLabel: its name; otherwise a goto or case target
+  };
+  std::vector<Line> lines;
+  for (size_t pos = 0; pos < body.size();) {
+    size_t end = body.find('\n', pos);
+    if (end == std::string::npos)
+      end = body.size();
+    Line li;
+    li.text = std::string_view(body.data() + pos, end - pos);
+    pos = end + 1;
+    std::string_view line = li.text;
+    if (line.starts_with("loc_") && line.ends_with(":")) {
+      li.kind = Kind::kLabel;
+      li.label = line.substr(0, line.size() - 1);
+      lines.push_back(li);
+      continue;
+    }
+    size_t first = line.find_first_not_of('\t');
+    std::string_view code = first == std::string_view::npos ? std::string_view{} : line.substr(first);
+    if (code.empty() || code.starts_with("//")) {
+      li.kind = Kind::kComment;
+      lines.push_back(li);
+      continue;
+    }
+    li.topLevel = first == 1;
+    size_t at = code.find("loc_");
+    if (at != std::string_view::npos) {
+      size_t e = at + 4;
+      while (e < code.size() && std::isxdigit(static_cast<unsigned char>(code[e])))
+        e++;
+      li.label = code.substr(at, e - at);
+    }
+    const bool leaves = contains(code, "return") || contains(code, "REX_TAIL_CALL");
+    li.calls = contains(code, "ctx, base") || contains(code, "REX_CALL_INDIRECT_FUNC");
+    li.leaves = leaves;
+    if (leaves || li.calls) {
+      li.kind = Kind::kPublish;
+      li.ends = li.topLevel && leaves &&
+                (code.starts_with("return") || code.starts_with("REX_TAIL_CALL") ||
+                 code.starts_with("[[clang::musttail]]"));
+    } else {
+      std::string reg;
+      bool nonVolatile = false;
+      if (AssignedRegister(code, reg, nonVolatile)) {
+        auto it = slot.find(reg);
+        if (it != slot.end()) {
+          li.kind = (nonVolatile && code.ends_with("// nv-helper")) ? Kind::kRestore : Kind::kWrite;
+          li.reg = it->second;
+        }
+      }
+      if (li.topLevel && code.starts_with("goto "))
+        li.ends = true;
+    }
+    lines.push_back(li);
+  }
+
+  // Dataflow: the dirty and moved sets at every label.
+  struct State {
+    Set dirty, moved;
+    bool operator!=(const State& o) const { return dirty != o.dirty || moved != o.moved; }
+    State operator|(const State& o) const { return {dirty | o.dirty, moved | o.moved}; }
+  };
+  // A publish stores the dirty registers; a top-level one leaves them clean.
+  auto publishState = [](State& st, bool topLevel) {
+    st.moved |= st.dirty;
+    if (topLevel)
+      st.dirty.reset();
+  };
+  auto restore = [](State& st, size_t reg) {
+    if (st.moved.test(reg))
+      st.dirty.set(reg);
+    else
+      st.dirty.reset(reg);
+  };
+  // Control that does not fall through: nothing flows to the next line.
+  auto endState = [](State& st) {
+    st.dirty.reset();
+    st.moved.reset();
+  };
+  std::unordered_map<std::string_view, State> labelIn;
+  for (const Line& li : lines)
+    if (li.kind == Kind::kLabel)
+      labelIn.emplace(li.label, State{});
+  auto edge = [&](std::string_view target, const State& state, bool& changed) {
+    auto it = labelIn.find(target);
+    if (it == labelIn.end())
+      return;  // not a label of this body; nothing to propagate
+    State next = it->second | state;
+    if (next != it->second) {
+      it->second = next;
+      changed = true;
+    }
+  };
+  for (bool changed = true; changed;) {
+    changed = false;
+    State state;
+    for (const Line& li : lines) {
+      switch (li.kind) {
+        case Kind::kLabel: {
+          State next = labelIn[li.label] | state;
+          if (next != labelIn[li.label]) {
+            labelIn[li.label] = next;
+            changed = true;
+          }
+          state = next;
+          break;
+        }
+        case Kind::kPublish:
+          // A publish inside a nested branch also stores, so the edge sees
+          // the state after it.
+          publishState(state, li.topLevel);
+          if (!li.label.empty())
+            edge(li.label, state, changed);
+          break;
+        case Kind::kWrite:
+          state.dirty.set(li.reg);
+          break;
+        case Kind::kRestore:
+          restore(state, li.reg);
+          break;
+        default:
+          if (!li.label.empty())
+            edge(li.label, state, changed);
+          break;
+      }
+      if (li.ends)
+        endState(state);
+    }
+  }
+
+  std::string out;
+  out.reserve(body.size() + body.size() / 4);
+  auto emit = [&out](std::string_view text) {
+    out.append(text);
+    out += '\n';
+  };
+  State state;
+  for (const Line& li : lines) {
+    switch (li.kind) {
+      case Kind::kLabel:
+        state = labelIn[li.label];
+        break;
+      case Kind::kPublish: {
+        std::string publish = "\t" + crSpill;
+        for (size_t i = 0; i < written.size() && i < 256; ++i) {
+          if (!state.dirty.test(i))
+            continue;
+          publish += fmt::format("ctx.{0} = {0}; ", written[i]);
+          ++publishedStores;
+        }
+        if (publish.size() > 1)
+          emit(publish);
+        emit(li.text);
+        if (li.calls && !li.leaves && !reloadAfterCall.empty())
+          emit(reloadAfterCall);
+        publishState(state, li.topLevel);
+        if (li.ends)
+          endState(state);
+        continue;
+      }
+      case Kind::kWrite:
+        state.dirty.set(li.reg);
+        break;
+      case Kind::kRestore:
+        restore(state, li.reg);
+        break;
+      default:
+        break;
+    }
+    emit(li.text);
+    if (li.ends)
+      endState(state);
+  }
+  if (!body.empty() && body.back() != '\n' && !out.empty())
+    out.pop_back();
+  return out;
+}
+
+/// fixed_fp_mode_functions: guard every flush-mode toggle with the
+/// `rex_fixed_fp` local the prologue reads once, or (`remove`, a
+/// register_locals body that only runs in fixed mode) drop it. Returns the
+/// number of toggles.
+size_t HoistFixedFpMode(std::string& body, bool remove) {
+  static constexpr std::string_view kToggles[] = {
+      "ctx.fpscr.enableFlushMode();", "ctx.fpscr.disableFlushMode();",
+      "ctx.fpscr.enableFlushModeUnconditional();", "ctx.fpscr.disableFlushModeUnconditional();"};
+  std::string out;
+  out.reserve(body.size() + body.size() / 16);
+  size_t guarded = 0;
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find('\n', pos);
+    const bool last = end == std::string::npos;
+    if (last)
+      end = body.size();
+    std::string_view line(body.data() + pos, end - pos);
+    pos = end + 1;
+    size_t first = line.find_first_not_of('\t');
+    std::string_view code = first == std::string_view::npos ? std::string_view{} : line.substr(first);
+    bool toggle = false;
+    for (std::string_view t : kToggles)
+      toggle |= code == t;
+    if (toggle && remove) {
+      out.append(line.substr(0, first));
+      out += "// flush-mode toggle dropped: fixed FP mode";
+      ++guarded;
+    } else if (toggle) {
+      out.append(line.substr(0, first));
+      out += "if (!rex_fixed_fp) ";
+      out.append(code);
+      ++guarded;
+    } else {
+      out.append(line);
+    }
+    if (!last)
+      out += '\n';
+  }
+  body = std::move(out);
+  return guarded;
+}
+
 }  // namespace
+
+void LogSpecializedFunctionStats() {
+  uint64_t listed = 0;
+  for (const auto& c : gRegisterLocalsStats)
+    listed += c.load();
+  if (listed) {
+    REXCODEGEN_INFO("register_locals_functions: {} of {} listed functions keep every register in "
+                    "locals",
+                    gRegisterLocalsStats[static_cast<size_t>(SpecializeReason::kApplied)].load(),
+                    listed);
+    for (size_t i = 1; i < gRegisterLocalsStats.size(); ++i) {
+      const uint64_t count = gRegisterLocalsStats[i].load();
+      if (count)
+        REXCODEGEN_INFO("register_locals_functions:   kept in ctx {} ({})", count,
+                        kSpecializeReasonNames[i]);
+    }
+  }
+  if (gFixedFpFunctions.load())
+    REXCODEGEN_INFO("fixed_fp_mode_functions: {} functions read the fixed FP mode once, {} "
+                    "flush-mode toggles guarded or dropped",
+                    gFixedFpFunctions.load(), gFixedFpSites.load());
+  if (gIeeeFallbacks.load())
+    REXCODEGEN_INFO("register_locals_functions: {} functions with flush-mode toggles run an "
+                    "unspecialised ieee_ copy outside fixed FP mode",
+                    gIeeeFallbacks.load());
+  if (gSingleFunctions.load())
+    REXCODEGEN_INFO("single_precision_functions: {} functions, {} fused multiply-adds computed in "
+                    "single precision",
+                    gSingleFunctions.load(), gSingleFmas.load());
+}
 
 void LogHostLocalSaveStats() {
   uint64_t total = 0;
@@ -1153,6 +2237,25 @@ void LogHostLocalSaveStats() {
     if (count && i != static_cast<size_t>(HostSaveReason::kNoSave) &&
         i != static_cast<size_t>(HostSaveReason::kTransformed))
       REXCODEGEN_INFO("host_local_register_saves:   kept {} ({})", count, kHostSaveReasonNames[i]);
+  }
+}
+
+void LogHostLocalLrStats() {
+  uint64_t total = 0;
+  for (size_t i = 0; i < gHostLrStats.size(); ++i)
+    if (i != static_cast<size_t>(HostLrReason::kNoSlot))
+      total += gHostLrStats[i].load();
+  REXCODEGEN_INFO("host_local_lr: {} of {} functions that save LR keep the slot in a host "
+                  "local ({} with the inlined __savegprlr_N, {} with an explicit stw; {} reloads "
+                  "rewritten)",
+                  gHostLrStats[static_cast<size_t>(HostLrReason::kTransformed)].load(), total,
+                  gHostLrHelperForm.load(), gHostLrExplicitForm.load(),
+                  gHostLrLoadsRewritten.load());
+  for (size_t i = 0; i < gHostLrStats.size(); ++i) {
+    const uint64_t count = gHostLrStats[i].load();
+    if (count && i != static_cast<size_t>(HostLrReason::kNoSlot) &&
+        i != static_cast<size_t>(HostLrReason::kTransformed))
+      REXCODEGEN_INFO("host_local_lr:   kept {} ({})", count, kHostLrReasonNames[i]);
   }
 }
 
@@ -1190,6 +2293,10 @@ std::vector<uint32_t> FunctionNode::resumableReturnAddresses(const BinaryView& b
 }
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+  return emitCpp(ctx, true);
+}
+
+std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecialization) const {
   if (authority() == FunctionAuthority::IMPORT) {
     return "";
   }
@@ -1473,10 +2580,88 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   };
   RecompilerLocalVariables localVariables;
 
+  // NN-5.1 per-function specialisation. Reference copies and the save/restore
+  // helpers are never specialised; a listed function that cannot keep its
+  // registers in locals is emitted as usual (the reason goes to the stats).
+  const bool specialize = allowSpecialization && ctx.namePrefix.empty() && !name_.starts_with("__");
+  if (specialize && ctx.config.isRegisterLocalsFunction(static_cast<uint32_t>(base()))) {
+    const SpecializeReason why = RegisterLocalsRefusal(*this, ctx, !resumeAddresses.empty());
+    if (why == SpecializeReason::kApplied) {
+      localVariables.allRegisters = true;
+    } else {
+      gRegisterLocalsStats[static_cast<size_t>(why)]++;
+      REXCODEGEN_WARN("register_locals_functions: 0x{:08X} keeps its registers in ctx ({})",
+                      base(), kSpecializeReasonNames[static_cast<size_t>(why)]);
+    }
+  }
+  if (specialize) {
+    localVariables.fixedFpHoist = ctx.config.isFixedFpModeFunction(static_cast<uint32_t>(base()));
+    localVariables.singlePrecision =
+        ctx.config.isSinglePrecisionFunction(static_cast<uint32_t>(base()));
+  }
+  // single_precision_functions: which FPRs hold a single-precision value,
+  // along the straight-line path (cleared at labels, calls and hooks).
+  auto trackSingles = [&](const ppc_insn& insn) {
+    std::string_view name = insn.opcode->name;
+    if (!name.empty() && name.back() == '.')
+      name.remove_suffix(1);
+    uint32_t& singles = localVariables.singleFprs;
+    auto set = [&](uint32_t reg, bool single) {
+      if (reg >= 32)
+        return;
+      if (single)
+        singles |= 1u << reg;
+      else
+        singles &= ~(1u << reg);
+    };
+    auto isSingle = [&](uint32_t reg) { return reg < 32 && ((singles >> reg) & 1); };
+    const uint32_t word = insn.instruction;
+    const uint32_t op = word >> 26;
+    // Any linked branch (a call) or system call may change any FPR.
+    if (((op == 16 || op == 18 || op == 19) && (word & 1)) || op == 17) {
+      singles = 0;
+      return;
+    }
+    if (name == "lfs" || name == "lfsx" || name == "lfsu" || name == "lfsux" || name == "fadds" ||
+        name == "fsubs" || name == "fmuls" || name == "fdivs" || name == "fmadds" ||
+        name == "fmsubs" || name == "fnmadds" || name == "fnmsubs" || name == "fres" ||
+        name == "frsp" || name == "fsqrts") {
+      set(insn.operands[0], true);
+    } else if (name == "fmr" || name == "fneg" || name == "fabs" || name == "fnabs") {
+      set(insn.operands[0], isSingle(insn.operands[1]));
+    } else if (name == "fsel") {
+      set(insn.operands[0], isSingle(insn.operands[2]) && isSingle(insn.operands[3]));
+    } else if ((name.starts_with("f") && !name.starts_with("fcmp")) || name.starts_with("lfd") ||
+               name == "mffs") {
+      set(insn.operands[0], false);
+    }
+  };
+
   // host_local_register_saves: keep the prologue's saved GPRs in host locals
   // when the save-area scan finds nothing else that needs the stack slots.
   if (ctx.config.hostLocalRegisterSaves && !name_.starts_with("__")) {
     const HostSavePlan plan = ScanHostLocalSaves(*this, ctx);
+    // host_local_lr: keep the LR save slot in a host local as well when the
+    // LR-slot scan finds nothing else that reads or writes it.
+    if (ctx.config.hostLocalLr) {
+      HostLrPlan lrPlan = ScanHostLocalLr(*this, ctx, plan);
+      if (lrPlan.reason != HostLrReason::kNoSlot && ctx.namePrefix.empty()) {
+        gHostLrStats[static_cast<size_t>(lrPlan.reason)]++;
+        if (lrPlan.reason == HostLrReason::kTransformed) {
+          (lrPlan.store ? gHostLrExplicitForm : gHostLrHelperForm)++;
+          gHostLrLoadsRewritten += lrPlan.loads.size();
+        } else {
+          REXCODEGEN_DEBUG("host_local_lr: 0x{:08X} keeps the LR slot ({} at 0x{:08X})", base(),
+                           kHostLrReasonNames[static_cast<size_t>(lrPlan.reason)],
+                           lrPlan.address);
+        }
+      }
+      if (lrPlan.reason == HostLrReason::kTransformed) {
+        localVariables.hostLr = true;
+        localVariables.hostLrStore = lrPlan.store;
+        localVariables.hostLrLoads = std::move(lrPlan.loads);
+      }
+    }
     if (plan.reason != HostSaveReason::kNoSave && ctx.namePrefix.empty()) {
       gHostSaveStats[static_cast<size_t>(plan.reason)]++;
       if (plan.reason != HostSaveReason::kTransformed)
@@ -1528,6 +2713,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         emit_println(body, "loc_{:X}:", blockBase);
         csrState = CSRState::Unknown;
         knownRegs.clear();
+        localVariables.singleFprs = 0;
       }
 
       // Look up switch table for this address
@@ -1613,22 +2799,26 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();
           knownRegs.clear();  // a hook may write any register
+          localVariables.singleFprs = 0;
         }
 
         const size_t bodyBefore = body.size();
-        bool folded = ctx.config.foldRodataLoads && tryFoldRodataLoad(insn, blockBase, body, builderCtx);
+        bool folded = ctx.config.foldRodataLoads && !localVariables.isHostLrLoad(blockBase) &&
+                      tryFoldRodataLoad(insn, blockBase, body, builderCtx);
         if (!folded && !DispatchInstruction(id, builderCtx)) {
           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
           allRecompiled = false;
         }
         if (ctx.config.foldRodataLoads)
           trackRegisters(insn);
+        if (localVariables.singlePrecision)
+          trackSingles(insn);
         if (ctx.referenceBlocked) {
           // A reference copy must be rolled back by its store log alone: no
           // stores outside the macros, no atomics, no calls, no global state.
           const std::string_view mnemonic = insn.opcode->name;
           const std::string_view added(body.data() + bodyBefore, body.size() - bodyBefore);
-          if (mnemonic.starts_with("stv") || mnemonic.starts_with("stwcx") ||
+          if (mnemonic.starts_with("stwcx") ||
               mnemonic.starts_with("stdcx") || mnemonic.starts_with("dcbz") || mnemonic == "sc" ||
               mnemonic.starts_with("mtmsr") || added.find("REX_MM_STORE") != std::string_view::npos ||
               added.find("(ctx, base);") != std::string_view::npos ||
@@ -1637,7 +2827,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
               added.find("GLOBAL_LOCK") != std::string_view::npos ||
               added.find("ppc_setjmp") != std::string_view::npos ||
               added.find("ppc_longjmp") != std::string_view::npos ||
-              added.find("REX_RAW_ADDR") != std::string_view::npos ||
+              added.find("simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR") !=
+                  std::string_view::npos ||
               added.find("memset(") != std::string_view::npos) {
             *ctx.referenceBlocked = true;
           }
@@ -1646,6 +2837,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         // Check for mid-asm hook AFTER instruction
         if (hookIt != ctx.config.midAsmHooks.end() && hookIt->second.afterInstruction) {
           builderCtx.emit_mid_asm_hook();
+          localVariables.singleFprs = 0;
         }
       }
 
@@ -1710,6 +2902,47 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   body = PropagateFlushMode(body);
 
+  // register_locals_functions: a form that copies or restores all of ctx
+  // (setjmp, longjmp, SEH) cannot see the locals; emit this one as usual.
+  if (localVariables.allRegisters && HasWholeContextForms(body)) {
+    gRegisterLocalsStats[static_cast<size_t>(SpecializeReason::kSetJmpOrSeh)]++;
+    REXCODEGEN_WARN("register_locals_functions: 0x{:08X} keeps its registers in ctx ({})", base(),
+                    kSpecializeReasonNames[static_cast<size_t>(SpecializeReason::kSetJmpOrSeh)]);
+    return emitCpp(ctx, false);
+  }
+  if (localVariables.allRegisters)
+    gRegisterLocalsStats[static_cast<size_t>(SpecializeReason::kApplied)]++;
+
+  // register_locals_functions with flush-mode toggles: with the guest's FP
+  // values in locals, clang may move arithmetic across a host FP control
+  // write (it does not model the FP environment), so a scalar operation can
+  // run with flush-to-zero on and lose a denormal that the ctx-backed body
+  // keeps. Only fixed FP mode, where the toggles do nothing, is safe; in the
+  // other mode the function runs an unspecialised copy (`ieee_sub_X`),
+  // emitted just before it. The offline equivalence check found this
+  // (denormals flushed in IEEE-toggle mode, bit-exact in fixed mode).
+  std::string ieeeCopy;
+  std::string ieeeName;
+  if (localVariables.allRegisters &&
+      (body.find("ctx.fpscr.enableFlushMode") != std::string::npos ||
+       body.find("ctx.fpscr.disableFlushMode") != std::string::npos)) {
+    EmitContext ieeeCtx = ctx;
+    ieeeCtx.namePrefix = "ieee_";
+    ieeeCtx.referenceBlocked = nullptr;
+    ieeeCopy = emitCpp(ieeeCtx, false);
+    ieeeName = "ieee_" + name;
+    gIeeeFallbacks++;
+  }
+  if (localVariables.singlePrecision) {
+    size_t fmas = 0;
+    for (std::string_view form : {"double(std::fma(float(", "double(-std::fma(float("}) {
+      for (size_t at = body.find(form); at != std::string::npos; at = body.find(form, at + 1))
+        ++fmas;
+    }
+    gSingleFunctions++;
+    gSingleFmas += fmas;
+  }
+
   // CR fields kept in locals are synchronized with ctx at every boundary.
   // Non-volatile GPR, FPR and VR locals (non_volatile_as_local) join the full
   // synchronization (a hook given ctx, the setjmp copy, longjmp and the SEH
@@ -1723,6 +2956,19 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     anyNvLocal |= localVariables.r[i] || localVariables.f[i] || localVariables.v[i];
   for (size_t i = 64; i < 128; i++)
     anyNvLocal |= localVariables.v[i];
+  // register_locals_functions (NN-5.1): every register is a local, so the
+  // synchronization covers the volatile ones as well: all locals in the full
+  // spill and reload, every written one published at calls, tail calls and
+  // returns, and the volatile ones read back after each call, where a callee
+  // may have left new values (callers in this title read some, NL-0.1).
+  const bool all = localVariables.allRegisters;
+  const size_t firstGpr = all ? 0 : 14;
+  auto vectorInSync = [&](size_t i) {
+    return all || !(i < 14 || (i >= 32 && i < 64));
+  };
+  if (all)
+    anyNvLocal = true;
+  std::string fallOffPublish;
   if (anyCrLocal || anyNvLocal) {
     std::string spill = "\t";
     std::string spill_nv;
@@ -1736,7 +2982,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         spill_nv += fmt::format("ctx.cr{0} = cr{0}; ", i);
       }
     }
-    for (size_t i = 14; i < 32; i++) {
+    for (size_t i = firstGpr; i < 32; i++) {
       if (localVariables.r[i]) {
         spill += fmt::format("ctx.r{0} = r{0}; ", i);
         reload += fmt::format("r{0} = ctx.r{0}; ", i);
@@ -1746,8 +2992,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         reload += fmt::format("f{0} = ctx.f{0}; ", i);
       }
     }
-    for (size_t i = 14; i < 128; i++) {
-      if (i >= 32 && i < 64)
+    for (size_t i = 0; i < 128; i++) {
+      if (!vectorInSync(i))
         continue;
       if (localVariables.v[i]) {
         spill += fmt::format("ctx.v{0} = v{0}; ", i);
@@ -1761,7 +3007,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     // inlined restore the publish at return hands the caller its values back.
     // Locals the function never writes keep their entry value, which ctx still
     // holds, since every callee restores what it publishes.
-    for (const std::string& reg : WrittenLocalRegisters(body)) {
+    const std::string crSpill = spill_nv;
+    const std::vector<std::string> writtenRegisters =
+        all ? WrittenAllRegisters(body) : WrittenLocalRegisters(body);
+    for (const std::string& reg : writtenRegisters) {
       spill_nv += fmt::format("ctx.{0} = {0}; ", reg);
     }
     if (!spill_nv.empty()) {
@@ -1783,10 +3032,59 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         continue;
       reload_nv += fmt::format("v{0} = ctx.v{0}; ", i);
     }
+    // register_locals_functions: the volatile locals (r0, r2-r12, f0-f13,
+    // v0-v13, v32-v63) come back from ctx after every call. r1 and r13 are
+    // preserved by every callee.
+    for (size_t i = 0; all && i < 14; i++) {
+      if (localVariables.r[i] && i != 1 && i != 13)
+        reload_nv += fmt::format("r{0} = ctx.r{0}; ", i);
+      if (localVariables.f[i])
+        reload_nv += fmt::format("f{0} = ctx.f{0}; ", i);
+    }
+    for (size_t i = 0; all && i < 64; i++) {
+      if (localVariables.v[i] && (i < 14 || i >= 32))
+        reload_nv += fmt::format("v{0} = ctx.v{0}; ", i);
+    }
     if (!reload_nv.empty()) {
       reload_nv = "\t" + reload_nv;
     }
-    body = SyncLocalCrRegisters(body, spill, spill_nv, reload, reload_nv);
+    if (all) {
+      size_t stores = 0;
+      body = SyncAllRegisterLocals(body, writtenRegisters, crSpill, reload_nv, stores);
+      fallOffPublish = spill_nv;
+    } else {
+      body = SyncLocalCrRegisters(body, spill, spill_nv, reload, reload_nv);
+    }
+  }
+  // A body that runs off its end (no return) publishes too; one whose last
+  // statement leaves the function needs nothing there.
+  if (!fallOffPublish.empty()) {
+    const size_t close = body.rfind("}\n");
+    if (close != std::string::npos) {
+      std::string_view before(body.data(), close);
+      while (!before.empty() && (before.back() == '\n' || before.back() == '\t'))
+        before.remove_suffix(1);
+      const size_t lineStart = before.rfind('\n');
+      std::string_view last = before.substr(lineStart == std::string_view::npos ? 0 : lineStart + 1);
+      last.remove_prefix(std::min(last.find_first_not_of('\t'), last.size()));
+      const bool leaves = last == "return;" || last.starts_with("REX_TAIL_CALL(") ||
+                          last.starts_with("[[clang::musttail]]");
+      if (!leaves)
+        body.insert(close, fallOffPublish + "\n");
+    }
+  }
+  // fixed_fp_mode_functions: every toggle tests the mode read at entry.
+  size_t fixedFpSites = 0;
+  if (!ieeeName.empty()) {
+    fixedFpSites = HoistFixedFpMode(body, true);
+    gFixedFpFunctions++;
+    gFixedFpSites += fixedFpSites;
+  } else if (localVariables.fixedFpHoist) {
+    fixedFpSites = HoistFixedFpMode(body, false);
+    if (fixedFpSites) {
+      gFixedFpFunctions++;
+      gFixedFpSites += fixedFpSites;
+    }
   }
 
   // --- Emit local variable declarations, then body ---
@@ -1808,10 +3106,12 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   // works, and the locals a function publishes before calling a
   // share_registers function are always the right values. A non-argument
   // volatile local is dead on entry and starts at zero.
+  // With register_locals_functions every local starts from ctx: an argument
+  // or a value a caller left in a volatile is read before it is written.
   for (size_t i = 0; i < 32; i++) {
     if (!localVariables.r[i])
       continue;
-    if (i >= 14)
+    if (i >= 14 || all)
       emit_println(out, "\tPPCRegister r{0} = ctx.r{0};", i);
     else
       emit_println(out, "\tPPCRegister r{}{{}};", i);
@@ -1820,7 +3120,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   for (size_t i = 0; i < 32; i++) {
     if (!localVariables.f[i])
       continue;
-    if (i >= 14)
+    if (i >= 14 || all)
       emit_println(out, "\tPPCRegister f{0} = ctx.f{0};", i);
     else
       emit_println(out, "\tPPCRegister f{}{{}};", i);
@@ -1829,7 +3129,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   for (size_t i = 0; i < 128; i++) {
     if (!localVariables.v[i])
       continue;
-    if ((i >= 14 && i < 32) || i >= 64)
+    if ((i >= 14 && i < 32) || i >= 64 || all)
       emit_println(out, "\tPPCVRegister v{0} = ctx.v{0};", i);
     else
       emit_println(out, "\tPPCVRegister v{}{{}};", i);
@@ -1845,6 +3145,24 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(out, "\tuint32_t ea{{}};");
   for (int i = localVariables.hostSaveFirst ? localVariables.hostSaveFirst : 32; i < 32; ++i)
     emit_println(out, "\tuint64_t rex_save_r{}{{}};", i);
+  if (localVariables.hostLr)
+    emit_println(out, "\tuint32_t rex_saved_lr{{}};");
+  // fixed_fp_mode_functions: the fixed FP mode switch, read once. In fixed
+  // mode nothing sets flush-to-zero, so one clear of a bit left from before
+  // the switch was turned on makes every toggle here a no-op.
+  if (!ieeeName.empty()) {
+    // Before the locals are read, so the IEEE copy starts from ctx alone.
+    std::string dispatch = fmt::format(
+        "\tif (!PPCFPSCRRegister::FixedMode()) [[unlikely]] {{ REX_TAIL_CALL({}); }}\n"
+        "\tctx.fpscr.disableFlushMode();\n",
+        ieeeName);
+    const size_t prologue = out.find("\tREX_FUNC_PROLOGUE();\n");
+    if (prologue != std::string::npos)
+      out.insert(prologue + std::string_view("\tREX_FUNC_PROLOGUE();\n").size(), dispatch);
+  } else if (fixedFpSites) {
+    emit_println(out, "\tconst bool rex_fixed_fp = PPCFPSCRRegister::FixedMode();");
+    emit_println(out, "\tif (rex_fixed_fp) ctx.fpscr.disableFlushMode();");
+  }
 
   // If SEH, emit SEH_TRY and indent body
   if (generateSeh) {
@@ -1862,6 +3180,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     out += body;
   }
 
+  if (!ieeeCopy.empty())
+    return ieeeCopy + "\n" + out;
   return out;
 }
 

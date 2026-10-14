@@ -29,6 +29,8 @@ add_executable(unit_tests
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    codegen/host_local_lr_test.cpp
+    codegen/register_locals_test.cpp
     filesystem/cache_mount_test.cpp
     graphics/native_guest_output_test.cpp
     graphics/vulkan_shader_overrides_test.cpp

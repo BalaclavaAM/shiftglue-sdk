@@ -97,6 +97,10 @@ class FunctionNode {
   /// For imports: emits REX_IMPORT macro
   /// For normal functions: emits REX_FUNC with blocks and instructions
   std::string emitCpp(const EmitContext& ctx) const;
+  /// emitCpp with the NN-5.1 per-function specialisations (register locals,
+  /// hoisted FP mode, single-precision fma) allowed or not; emitCpp retries
+  /// without them when the specialised body holds a form they do not cover.
+  std::string emitCpp(const EmitContext& ctx, bool allowSpecialization) const;
 
   /// Return PCs immediately following linked branches that can safely resume
   /// inside this function's emitted blocks.

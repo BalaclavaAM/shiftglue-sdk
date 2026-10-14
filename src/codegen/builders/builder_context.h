@@ -10,9 +10,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/core.h>
 
@@ -56,6 +58,29 @@ struct RecompilerLocalVariables {
   /// saves into the `rex_save_rN` locals instead of calling __savegprlr_N, or
   /// 0 when the function keeps the helper calls.
   uint8_t hostSaveFirst{};
+  /// host_local_lr: the LR save slot (entry r1 - 8) lives in the
+  /// `rex_saved_lr` local. hostLrStore is the explicit `stw` that fills it (0
+  /// when the `__savegprlr_N` save does), hostLrLoads the sorted `lwz` reloads
+  /// that read it (the `__restgprlr_N` restores read it too).
+  bool hostLr{};
+  uint32_t hostLrStore{};
+  std::vector<uint32_t> hostLrLoads;
+  bool isHostLrLoad(uint32_t address) const {
+    return hostLr && std::binary_search(hostLrLoads.begin(), hostLrLoads.end(), address);
+  }
+
+  /// register_locals_functions (NN-5.1): every GPR, FPR and VR this function
+  /// names is a local, synchronized with ctx at calls, tail calls and returns.
+  bool allRegisters{};
+  /// fixed_fp_mode_functions (NN-5.1): flush-mode toggles test the
+  /// `rex_fixed_fp` local, read once at entry.
+  bool fixedFpHoist{};
+  /// single_precision_functions (NN-5.1): bit N set when fN is known to hold a
+  /// single-precision value at the current instruction (straight-line only:
+  /// cleared at labels, calls and hooks). Kept up to date by emitCpp.
+  bool singlePrecision{};
+  uint32_t singleFprs{};
+  bool isSingle(size_t index) const { return singlePrecision && index < 32 && (singleFprs >> index) & 1; }
 
   /// Tracks which GPRs contain MMIO base addresses (bit N = rN is MMIO base)
   /// Set when lis loads a value with upper 16 bits >= 0x7F00 (address >= 0x7F000000)
@@ -132,6 +157,8 @@ struct BuilderContext {
    * False when the function shares registers with an intra-function bl partner.
    */
   bool localizeNonVolatiles() const;
+  /// True while emitting a `ref_` reference copy for the lockstep verifier.
+  bool isReferenceCopy() const;
   /// `__savegprlr_N`, `__restfpr_N` and the other register save/restore helpers.
   static bool isSaveRestoreHelper(std::string_view name);
   /// Write the localized non-volatile GPRs, FPRs and VRs referenced so far to

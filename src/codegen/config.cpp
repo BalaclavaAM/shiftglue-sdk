@@ -139,6 +139,26 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
         cfg.hostLocalRegisterSavesKeep.push_back(static_cast<uint32_t>(*val));
     }
   }
+  MergeBool(cfg.hostLocalLr, toml["host_local_lr"].value_or(false), hasBool("host_local_lr"),
+            "host_local_lr");
+  if (auto keep = toml["host_local_lr_keep"].as_array()) {
+    for (const auto& elem : *keep) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostLocalLrKeep.push_back(static_cast<uint32_t>(*val));
+    }
+  }
+  // NN-5.1 per-function specialisation lists (additive across includes).
+  auto addressList = [&](const char* key, std::vector<uint32_t>& list) {
+    if (auto arr = toml[key].as_array()) {
+      for (const auto& elem : *arr) {
+        if (auto val = elem.value<int64_t>())
+          list.push_back(static_cast<uint32_t>(*val));
+      }
+    }
+  };
+  addressList("register_locals_functions", cfg.registerLocalsFunctions);
+  addressList("fixed_fp_mode_functions", cfg.fixedFpModeFunctions);
+  addressList("single_precision_functions", cfg.singlePrecisionFunctions);
   MergeBool(cfg.guestLineDirectives, toml["guest_line_directives"].value_or(false),
             hasBool("guest_line_directives"), "guest_line_directives");
   MergeBool(cfg.disassemblyComments, toml["disassembly_comments"].value_or(true),
@@ -523,6 +543,20 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     cfg.hostLocalRegisterSavesKeep.erase(
         std::unique(cfg.hostLocalRegisterSavesKeep.begin(), cfg.hostLocalRegisterSavesKeep.end()),
         cfg.hostLocalRegisterSavesKeep.end());
+  }
+  if (!cfg.hostLocalLrKeep.empty()) {
+    std::sort(cfg.hostLocalLrKeep.begin(), cfg.hostLocalLrKeep.end());
+    cfg.hostLocalLrKeep.erase(std::unique(cfg.hostLocalLrKeep.begin(), cfg.hostLocalLrKeep.end()),
+                              cfg.hostLocalLrKeep.end());
+  }
+  for (auto* list : {&cfg.registerLocalsFunctions, &cfg.fixedFpModeFunctions,
+                     &cfg.singlePrecisionFunctions}) {
+    std::sort(list->begin(), list->end());
+    list->erase(std::unique(list->begin(), list->end()), list->end());
+  }
+  if (cfg.hostLocalLr && !cfg.hostLocalRegisterSaves) {
+    REXCODEGEN_WARN("host_local_lr needs host_local_register_saves; leaving the LR slot in memory");
+    cfg.hostLocalLr = false;
   }
   if (!cfg.exceptionHandlerFuncHints.empty()) {
     std::sort(cfg.exceptionHandlerFuncHints.begin(), cfg.exceptionHandlerFuncHints.end());

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -140,6 +141,53 @@ struct RecompilerConfig {
   /// Functions that keep the helper calls with host_local_register_saves on
   /// (a host or hook reader of their save slots).
   std::vector<uint32_t> hostLocalRegisterSavesKeep;
+  /// With hostLocalRegisterSaves: keep the LR save slot (entry r1 - 8) in a
+  /// host local, `rex_saved_lr`, instead of guest stack memory. The prologue's
+  /// slot store (the `__savegprlr_N` helper's, or an explicit `stw rS,-8(r1)`)
+  /// becomes a copy into the local and every reload of the slot (the
+  /// `__restgprlr_N` epilogue's, or `lwz rD,-8(r1)`) a copy back, so r12 and
+  /// ctx.lr take exactly the values they took from memory. Only functions
+  /// whose LR-slot scan proves that the store and those reloads are the only
+  /// accesses to the slot are changed: no other access, no pointer to it, no
+  /// dynamic frame, no exception info, no hook, no tail branch to code that
+  /// may read the slot before storing it. The back chain is left alone.
+  bool hostLocalLr = false;
+  /// Functions that keep the LR slot in guest memory with host_local_lr on
+  /// (a host or hook reader of the slot, such as a stack walker diagnostic).
+  std::vector<uint32_t> hostLocalLrKeep;
+  /// Per-function specialisation (Pinyon Shift NEAR_NATIVE_RESEARCH.md NN-5.1),
+  /// sorted function entry addresses. register_locals_functions: every GPR,
+  /// FPR and VR the function names lives in a C++ local inside it. ctx is
+  /// written back before every call, tail call and return (the registers the
+  /// function wrote) and the volatile locals are read back after every call,
+  /// so ctx holds at each boundary exactly what the translation with the
+  /// registers in ctx leaves there, callee-left volatiles included. Functions
+  /// with a mid-asm hook, exception info, setjmp/longjmp, a resume switch or
+  /// shared registers keep the registers in ctx.
+  std::vector<uint32_t> registerLocalsFunctions;
+  /// fixed_fp_mode_functions: the flush-mode toggles read the fixed IEEE FP
+  /// mode switch (rex::ppc::g_fixed_fp_mode) once at entry instead of at every
+  /// site; with fixed mode on, the function clears a leftover flush bit once
+  /// and skips every toggle.
+  std::vector<uint32_t> fixedFpModeFunctions;
+  /// single_precision_functions: fmadds, fmsubs, fnmadds and fnmsubs whose
+  /// three operands are known single-precision values (from lfs or another
+  /// single-precision result along the straight-line path) are computed as one
+  /// single-precision fused multiply-add, as the guest does, instead of a
+  /// double fma rounded to single. Results can differ from the double form by
+  /// its double-rounding error (one single-precision ulp, rarely).
+  std::vector<uint32_t> singlePrecisionFunctions;
+  bool isRegisterLocalsFunction(uint32_t address) const {
+    return std::binary_search(registerLocalsFunctions.begin(), registerLocalsFunctions.end(),
+                              address);
+  }
+  bool isFixedFpModeFunction(uint32_t address) const {
+    return std::binary_search(fixedFpModeFunctions.begin(), fixedFpModeFunctions.end(), address);
+  }
+  bool isSinglePrecisionFunction(uint32_t address) const {
+    return std::binary_search(singlePrecisionFunctions.begin(), singlePrecisionFunctions.end(),
+                              address);
+  }
   /// Emit `#line <guest offset> "<project>.guest"` before each instruction's
   /// code, so debug line tables (and sample profiles built from them) name
   /// guest addresses and survive changes to the generated C++.

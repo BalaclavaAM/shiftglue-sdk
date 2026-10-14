@@ -149,6 +149,15 @@ bool build_lwax(BuilderContext& ctx) {
 }
 
 bool build_lwz(BuilderContext& ctx) {
+  // host_local_lr (NN-1.3): a reload of the LR save slot reads the local.
+  if (ctx.locals.isHostLrLoad(ctx.base)) {
+    if (ctx.config().abiPoisonChecks)
+      ctx.println("\tREX_LR_SLOT_CHECK(0x{:08X}, 0x{:08X}, REX_{}LOAD_U32({}.u32 + {}));",
+                  ctx.fn.base(), ctx.base, ctx.insn.operands[2] == 1 ? "STACK_" : "",
+                  ctx.r(ctx.insn.operands[2]), static_cast<int32_t>(ctx.insn.operands[1]));
+    ctx.println("\t{}.u64 = rex_saved_lr;", ctx.r(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.emit_load_d_form("REX_LOAD_U32", "u64");
   return true;
 }
@@ -364,6 +373,15 @@ bool build_sthux(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_stw(BuilderContext& ctx) {
+  // host_local_lr (NN-1.3): the prologue's LR slot store fills the local.
+  if (ctx.locals.hostLr && ctx.locals.hostLrStore == ctx.base) {
+    ctx.println("\trex_saved_lr = {}.u32;", ctx.r(ctx.insn.operands[0]));
+    if (ctx.config().abiPoisonChecks)
+      ctx.println("\tREX_{}STORE_U32({}.u32 + {}, REX_LR_SLOT_POISON(0x{:08X}));",
+                  ctx.insn.operands[2] == 1 ? "STACK_" : "", ctx.r(ctx.insn.operands[2]),
+                  static_cast<int32_t>(ctx.insn.operands[1]), ctx.fn.base());
+    return true;
+  }
   ctx.emit_store_d_form("REX_STORE_U32", "u32", true);
   return true;
 }
@@ -652,6 +670,14 @@ bool build_stvrx(BuilderContext& ctx) {
 
 bool build_stvx(BuilderContext& ctx) {
   emitVectorEA(ctx, "0xF");
+  // A reference copy logs the store for the verifier's rollback (NN-5.1).
+  if (ctx.isReferenceCopy()) {
+    ctx.println(
+        "\tREX_REF_STORE_V128({},simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
+        "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
+        ctx.ea(), ctx.v(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*)REX_RAW_ADDR({}), "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "

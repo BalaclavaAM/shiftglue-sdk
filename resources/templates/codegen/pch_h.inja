@@ -198,6 +198,13 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 #define REX_REF_STORE_U8(x, y)   ::rex::ppc::RefStore<u8>((volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), (u8)(y))
 #define REX_REF_STORE_U16(x, y)                                                                ::rex::ppc::RefStore<u16>((volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap16(y))
 #define REX_REF_STORE_U32(x, y)                                                                ::rex::ppc::RefStore<u32>((volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap32(y))
+// A whole aligned vector store (stvx, stvx128): `v` is the simde__m128i the
+// optimized code would store, already in guest byte order.
+#define REX_REF_STORE_V128(x, v) do { const simde__m128i rex_ref_v = (v); ::rex::ppc::RefStoreBytes((void*)REX_RAW_ADDR(x), (u32)(x), &rex_ref_v, 16); } while (0)
+// A save-area store (the link-register slot, a GPR save) that the optimized form
+// keeps in a host local instead: logged for the rollback, not compared.
+#define REX_REF_STORE_UNCHECKED_U32(x, y) ::rex::ppc::RefStore<u32>((volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), __builtin_bswap32(y), false)
+#define REX_REF_STORE_UNCHECKED_U64(x, y) ::rex::ppc::RefStore<u64>((volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), __builtin_bswap64(y), false)
 #define REX_REF_STORE_U64(x, y)                                                                ::rex::ppc::RefStore<u64>((volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap64(y))
 
 #define REX_MEMORY_SIZE 0x100000000ull
@@ -336,6 +343,11 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 // poison, so a caller that still reads one changes the route results.
 #define REX_ABI_POISON_PRE(site) ::rex::ppc::AbiPoisonPreCall(ctx, (site))
 #define REX_ABI_POISON_POST(site) ::rex::ppc::AbiPoisonPostCall(ctx, (site))
+// host_local_lr under abi_poison_checks: the guest LR slot holds a poison that
+// names the function, and every reload of the local checks it is still there.
+#define REX_LR_SLOT_POISON(function) ::rex::ppc::AbiPoisonLrSlotValue(function)
+#define REX_LR_SLOT_CHECK(function, site, value) \
+  ::rex::ppc::AbiPoisonLrSlotCheck((function), (site), (value))
 
 // Probe build (call_probes): a counter per function entry and the targets of
 // every indirect call site, written to probe.json at shutdown (rex/ppc/probe.h).
