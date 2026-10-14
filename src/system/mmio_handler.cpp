@@ -28,6 +28,9 @@ using namespace rex::arch;
 
 namespace rex::runtime {
 
+// critical_region_census (NN-3.10): the access-violation handler's lock.
+constexpr auto kMmioFaultLockSource = rex::thread::LockSource::kWriteWatchFault;
+
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
 MMIOHandler* MMIOHandler::global_handler() {
@@ -408,7 +411,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // Recheck if the pages are still protected (race condition - another thread
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
-    auto lock = global_critical_region_.Acquire();
+    auto lock = global_critical_region_.Acquire(kMmioFaultLockSource);
 #if REX_PLATFORM_LINUX
     // QueryProtect parses /proc/self/maps as text on Linux and Android, and on
     // a phone that took three quarters of the title's busiest thread at every
@@ -420,7 +423,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
                                      fault_host_address, is_write)) {
         return true;
       }
-      lock = global_critical_region_.Acquire();
+      lock = global_critical_region_.Acquire(kMmioFaultLockSource);
     }
     {
       memory::PageAccess unhandled_access;

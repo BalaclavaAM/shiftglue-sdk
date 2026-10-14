@@ -187,6 +187,9 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 
 namespace rex::graphics {
 
+// critical_region_census (NN-3.10): this file's global lock acquisitions.
+constexpr auto kTextureCacheLockSource = rex::thread::LockSource::kTextureCache;
+
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
     {3, 4, 1, 4},
@@ -449,7 +452,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -497,7 +500,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   bool mips_outdated = false;
   bool resolve_sourced = false;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
     if (outdated_mask & Texture::kOutdatedBitBase) {
       base_outdated = texture.base_outdated(global_lock);
     }
@@ -533,7 +536,8 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
         texture.guest_layout().packed_level, uint32_t(key.dimension));
   }
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated, resolve_sourced)) {
-    texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
+    texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource), base_outdated,
+                         mips_outdated);
     texture.LogAction("Loaded from CPU");
     return false;
   }
@@ -592,14 +596,14 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   if (pending_load.resolve_sourced && REXCVAR_GET(fh1_debug_skip_resolve_reloads) &&
       (!REXCVAR_GET(fh1_debug_skip_resolve_reloads_format) ||
        uint32_t(texture.key().format) == uint32_t(REXCVAR_GET(fh1_debug_skip_resolve_reloads_format)))) {
-    texture.CompleteLoad(global_critical_region_.Acquire(), pending_load.load_base,
-                         pending_load.load_mips);
+    texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource),
+                         pending_load.load_base, pending_load.load_mips);
     return true;
   }
   loading_resolve_sourced_ = pending_load.resolve_sourced;
   uint64_t write_log_count;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
     write_log_count = write_log_count_;
     loading_rows_first_ = loading_rows_end_ = 0;
     loading_layers_mask_ = 0;
@@ -635,8 +639,8 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   // Only clear loaded ranges whose watches survived the entire upload. A write
   // during RequestRanges or the backend load must remain dirty for the next draw.
-  texture.CompleteLoad(global_critical_region_.Acquire(), pending_load.load_base,
-                       pending_load.load_mips);
+  texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource),
+                       pending_load.load_base, pending_load.load_mips);
   texture.LogAction("Loaded");
 
   return true;
@@ -1421,7 +1425,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
   if (require_all) {
     for (uint32_t block = block_first; block <= block_last; ++block) {
       const uint32_t first_bit = block == block_first ? page_first & 31 : 0;
@@ -1640,7 +1644,7 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
     return;
   }
   const uint32_t pitch_aligned = (pitch_texels + 31) & ~UINT32_C(31);
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
   static std::map<std::string, uint64_t> reasons;
   static uint64_t calls = 0;
   const bool trace = REXCVAR_GET(fh1_trace_direct_resolves);
@@ -1744,7 +1748,7 @@ void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_
 }
 
 void TextureCache::CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
   for (const DirectResolveTarget& target : targets) {
     Texture& texture = *target.texture;
     texture.WatchPendingLoad(global_lock, true, false);

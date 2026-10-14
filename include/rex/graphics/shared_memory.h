@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -217,8 +218,14 @@ class SharedMemory {
   uint64_t upload_request_count_ = 0;
   uint32_t upload_frame_ = 1;
   std::vector<uint32_t> page_upload_frame_;
+  // write_watch_fault_trace (NN-3.12): per page, the UploadKind that last made
+  // it valid (census::kPageKindGpuWritten for GPU writes, kPageKindNone before
+  // any), allocated when the census first runs. Read by the fault path.
+  std::atomic<std::atomic<uint8_t>*> page_upload_kind_{nullptr};
+  void NotePageUploadKind(uint32_t page_first, uint32_t page_last, bool written_by_gpu);
   // RequestRanges scratch for the merged request list.
   std::vector<std::pair<uint32_t, uint32_t>> request_ranges_scratch_;
+
 
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing

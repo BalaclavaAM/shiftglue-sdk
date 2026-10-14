@@ -150,7 +150,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   PROFILE_INTERRUPT_DISPATCHED();
 
   // Hold the global lock during interrupt dispatch.
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kInterrupt);
 
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);

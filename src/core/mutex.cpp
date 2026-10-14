@@ -19,6 +19,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
+#include <rex/thread/sync_census.h>
 
 #if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>
@@ -98,6 +99,25 @@ void global_critical_region::LockContended() {
   }
 }
 
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void global_critical_region::LockCensus(LockSource source) {
+  if (mutex().try_lock()) {
+    census::NoteLock(source, false, 0);
+    return;
+  }
+  // As LockContended, without the wait log (its call-site depth is fixed).
+  PROFILE_CRITICAL_REGION_CONTENTION();
+  const auto start = std::chrono::steady_clock::now();
+  mutex().lock();
+  const int64_t waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+  PERF_counter_add(kCriticalRegionBlockedNs, waited_ns);
+  census::NoteLock(source, true, waited_ns);
+}
+
 #if defined(__ANDROID__) && defined(__LP64__)
 namespace {
 // Logs every hold by any thread (host code included) at least log_ms long,
@@ -136,6 +156,7 @@ void HoldWatchdog(int32_t log_ms) {
 
 int32_t global_critical_region::guest_hold_log_ms_ = -1;
 std::atomic<bool> global_critical_region::reservation_sections_unlocked_{true};
+std::atomic<bool> global_critical_region::census_enabled_{false};
 
 void global_critical_region::GuestHoldLogInit() {
   static std::once_flag once;
@@ -157,6 +178,9 @@ void global_critical_region::GuestHoldLogInit() {
 
 void global_critical_region::CountReservationSection() {
   PERF_counter_inc(kCriticalRegionUnlockedSections);
+  if (census_enabled_.load(std::memory_order_relaxed)) {
+    census::NoteUnlockedReservation();
+  }
 }
 
 #if defined(__clang__) || defined(__GNUC__)

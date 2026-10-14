@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/thread/sync_census.h>
 #include <rex/types.h>
 
 REXCVAR_DEFINE_BOOL(force_convert_line_loops_to_strips, false, "GPU",
@@ -1370,6 +1371,8 @@ PrimitiveProcessor::CacheTransaction::CacheTransaction(PrimitiveProcessor& proce
           processor_.memory_.RegisterPhysicalMemoryInvalidationCallback(
               MemoryInvalidationCallbackThunk, &processor_);
     }
+    rex::thread::census::ProtectOwnerScope owner(
+        rex::thread::census::ProtectOwner::kArmPrimitive);
     processor_.memory_.EnablePhysicalMemoryAccessCallbacks(key_.base, size_bytes, true, false);
   }
 }

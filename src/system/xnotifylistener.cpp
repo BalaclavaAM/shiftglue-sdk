@@ -42,13 +42,13 @@ void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
   if (key.version > max_version_) {
     return;
   }
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kNotify);
   notifications_.push_back(std::pair<XNotificationID, uint32_t>(id, data));
   wait_handle_->Set();
 }
 
 bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out_data) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kNotify);
   bool dequeued = false;
   if (notifications_.size()) {
     dequeued = true;
@@ -64,7 +64,7 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out
 }
 
 bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kNotify);
   if (!notifications_.size()) {
     return false;
   }

@@ -20,12 +20,16 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/thread/sync_census.h>
 
 REXCVAR_DEFINE_BOOL(fh1_narrow_cpu_invalidation, false, "GPU/D3D12",
                     "Limit speculative CPU invalidation to 64 KiB windows")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
+
+// critical_region_census (NN-3.10): this file's global lock acquisitions.
+constexpr auto kSharedMemoryLockSource = rex::thread::LockSource::kSharedMemory;
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -69,6 +73,7 @@ void SharedMemory::ShutdownCommon() {
     delete[] pool;
   }
   watch_range_pools_.clear();
+  delete[] page_upload_kind_.exchange(nullptr, std::memory_order_acq_rel);
 
   if (memory_invalidation_callback_handle_ != nullptr) {
     memory_.UnregisterPhysicalMemoryInvalidationCallback(memory_invalidation_callback_handle_);
@@ -95,7 +100,7 @@ void SharedMemory::ShutdownCommon() {
 }
 
 void SharedMemory::InvalidateAllPages() {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
 
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
@@ -103,7 +108,7 @@ void SharedMemory::InvalidateAllPages() {
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
 
   // Pages that are valid only because the CPU uploaded them lose their valid
   // bit here, so the next frame re-reads them from guest memory.
@@ -136,7 +141,7 @@ SharedMemory::GlobalWatchHandle SharedMemory::RegisterGlobalWatch(GlobalWatchCal
   watch->callback = callback;
   watch->callback_context = callback_context;
 
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
   global_watches_.push_back(watch);
 
   return reinterpret_cast<GlobalWatchHandle>(watch);
@@ -146,7 +151,7 @@ void SharedMemory::UnregisterGlobalWatch(GlobalWatchHandle handle) {
   auto watch = reinterpret_cast<GlobalWatch*>(handle);
 
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
     auto it = std::find(global_watches_.begin(), global_watches_.end(), watch);
     assert_false(it == global_watches_.end());
     if (it != global_watches_.end()) {
@@ -171,7 +176,7 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   uint32_t bucket_first = watch_page_first << page_size_log2_ >> kWatchBucketSizeLog2;
   uint32_t bucket_last = watch_page_last << page_size_log2_ >> kWatchBucketSizeLog2;
 
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
 
   // Allocate the range.
   WatchRange* range = watch_range_first_free_;
@@ -224,7 +229,7 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
 }
 
 void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
   UnlinkWatchRange(reinterpret_cast<WatchRange*>(handle));
 }
 
@@ -234,7 +239,7 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   uint32_t bucket_first = address_first >> kWatchBucketSizeLog2;
   uint32_t bucket_last = address_last >> kWatchBucketSizeLog2;
 
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
 
   // Fire global watches.
   for (const auto global_watch : global_watches_) {
@@ -282,10 +287,14 @@ bool SharedMemory::CopyCpuRange(uint32_t start, std::span<uint8_t> destination) 
   }
   if (!memory_invalidation_callback_handle_) return false;
   // Protect before reading, outside the global lock (memory heaps have their own locks).
-  memory().EnablePhysicalMemoryAccessCallbacks(start, uint32_t(destination.size()), true, false);
+  {
+    rex::thread::census::ProtectOwnerScope owner(rex::thread::census::ProtectOwner::kArmCopyCpu);
+    memory().EnablePhysicalMemoryAccessCallbacks(start, uint32_t(destination.size()), true,
+                                                 false);
+  }
   const uint32_t first = start >> page_size_log2_;
   const uint32_t last = (start + uint32_t(destination.size()) - 1) >> page_size_log2_;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
   if ((last >> 6) >= system_page_flags_valid_and_gpu_written_.size()) {
     return false;
   }
@@ -306,7 +315,7 @@ bool SharedMemory::CopyCpuSnapshot(uint32_t start, std::span<uint8_t> destinatio
   if (destination.empty()) return true;
   WatchHandle watch = nullptr;
   {
-    auto lock = global_critical_region_.Acquire();
+    auto lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
     watch = WatchMemoryRange(start, uint32_t(destination.size()),
         [](const auto&, void*, void* data, uint64_t, bool) {
           *static_cast<WatchHandle*>(data) = nullptr;
@@ -316,7 +325,7 @@ bool SharedMemory::CopyCpuSnapshot(uint32_t start, std::span<uint8_t> destinatio
   // CopyCpuRange takes heap locks before the global lock. Do not retain the
   // global lock across it, even though the critical region is recursive.
   const bool copied = CopyCpuRange(start, destination);
-  auto lock = global_critical_region_.Acquire();
+  auto lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
   const bool unchanged = watch != nullptr;
   if (watch) UnwatchMemoryRange(watch);
   return copied && unchanged;
@@ -352,7 +361,7 @@ void SharedMemory::CopyReadbackToGuest(uint32_t start, const uint8_t* source, ui
     const uint32_t page = address >> page_size_log2_;
     bool valid;
     {
-      auto global_lock = global_critical_region_.Acquire();
+      auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
       valid = (system_page_flags_valid_[page >> 6] >> (page & 63)) & 1;
     }
     // Not under the lock: the store may fault on the page's write watch.
@@ -370,7 +379,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::CountValidPages(uint32_t start, uint
   length = std::min(length, kBufferSize - start);
   const uint32_t page_first = start >> page_size_log2_;
   const uint32_t page_last = (start + length - 1) >> page_size_log2_;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
   uint32_t valid = 0, gpu_written = 0;
   for (uint32_t page = page_first; page <= page_last; ++page) {
     const uint64_t bit = uint64_t(1) << (page & 63);
@@ -400,7 +409,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_last = valid_page_last >> 6;
 
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -416,10 +425,50 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
     }
   }
 
+  if (rex::thread::census::WriteWatchEnabled()) {
+    NotePageUploadKind(valid_page_first, valid_page_last, written_by_gpu);
+  }
+
   if (memory_invalidation_callback_handle_) {
+    using rex::thread::census::ProtectOwner;
+    ProtectOwner owner = ProtectOwner::kArmUploadOther;
+    if (written_by_gpu) {
+      owner = ProtectOwner::kArmGpuWritten;
+    } else {
+      switch (upload_kind_) {
+        case UploadKind::kVertex: owner = ProtectOwner::kArmVertex; break;
+        case UploadKind::kIndex: owner = ProtectOwner::kArmIndex; break;
+        case UploadKind::kTexture: owner = ProtectOwner::kArmTexture; break;
+        case UploadKind::kMemexport: owner = ProtectOwner::kArmMemexport; break;
+        default: break;
+      }
+    }
+    rex::thread::census::ProtectOwnerScope owner_scope(owner);
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
         (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+  }
+}
+
+void SharedMemory::NotePageUploadKind(uint32_t page_first, uint32_t page_last,
+                                      bool written_by_gpu) {
+  std::atomic<uint8_t>* kinds = page_upload_kind_.load(std::memory_order_acquire);
+  if (!kinds) {
+    const size_t count = size_t(kBufferSize) >> page_size_log2_;
+    auto* fresh = new std::atomic<uint8_t>[count];
+    for (size_t i = 0; i < count; ++i) {
+      fresh[i].store(rex::thread::census::kPageKindNone, std::memory_order_relaxed);
+    }
+    if (page_upload_kind_.compare_exchange_strong(kinds, fresh, std::memory_order_acq_rel)) {
+      kinds = fresh;
+    } else {
+      delete[] fresh;
+    }
+  }
+  const uint8_t kind =
+      written_by_gpu ? rex::thread::census::kPageKindGpuWritten : uint8_t(upload_kind_);
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    kinds[page].store(kind, std::memory_order_relaxed);
   }
 }
 
@@ -654,7 +703,16 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_first = page_first >> 6;
   uint32_t block_last = page_last >> 6;
 
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
+
+  if (rex::thread::census::WriteWatchEnabled()) {
+    // A fault on this thread: what made the faulting page valid (NN-3.12).
+    const std::atomic<uint8_t>* kinds = page_upload_kind_.load(std::memory_order_acquire);
+    rex::thread::census::NoteFaultPage(
+        kinds ? kinds[page_first].load(std::memory_order_relaxed)
+              : rex::thread::census::kPageKindNone,
+        (system_page_flags_valid_[block_first] >> (page_first & 63)) & 1);
+  }
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be

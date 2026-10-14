@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/perf/counter.h>
+#include <rex/thread/sync_census.h>
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -604,6 +605,8 @@ void NoteNamedThread(int64_t tid, std::string_view name) {
 }
 
 void ResetFrameCounters() {
+  // critical_region_census and write_watch_fault_trace (NN-3.10/3.12 probes).
+  rex::thread::census::Frame();
   SetCounter(CounterId::kAaToggle, REXCVAR_GET(perf_aa_toggle));
   SampleThreadCpu();
   {

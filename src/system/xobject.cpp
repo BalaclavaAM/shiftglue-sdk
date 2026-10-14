@@ -380,7 +380,8 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   // We identify this by setting wait_list_flink to a magic value. When set,
   // wait_list_blink will hold a handle to our object.
 
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  auto global_lock =
+      rex::thread::global_critical_region::AcquireDirect(rex::thread::LockSource::kNativeObject);
 
   auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
 

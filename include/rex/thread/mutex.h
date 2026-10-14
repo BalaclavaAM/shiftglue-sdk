@@ -19,6 +19,24 @@
 
 namespace rex::thread {
 
+// Who takes the global critical region, for critical_region_census (NN-3.10,
+// rex/thread/sync_census.h). Untagged acquisitions count as kOther.
+enum class LockSource : uint8_t {
+  kOther,
+  kGuestSection,      // recompiled interrupts-off sections (mtmsrd r13)
+  kGuestReservation,  // single-reservation sections that took the mutex
+  kObjectLookup,      // ObjectTable::LookupObject (handle imports)
+  kNativeObject,      // XObject::GetNativeObject (pointer imports)
+  kWriteWatchArm,     // PhysicalHeap::EnableAccessCallbacks
+  kWriteWatchFault,   // the access-violation handler
+  kWriteWatchAnnounced,  // guest Protect/Decommit/Release, host-announced writes
+  kSharedMemory,      // GPU shared memory validity and watches
+  kTextureCache,
+  kInterrupt,         // FunctionDispatcher::ExecuteInterrupt
+  kNotify,            // XNotifyListener
+  kCount
+};
+
 // The global critical region mutex singleton.
 // This must guard any operation that may suspend threads or be sensitive to
 // being suspended such as global table locks and such.
@@ -62,8 +80,13 @@ class global_critical_region {
   static std::recursive_mutex& mutex();
 
   // Locks the global mutex, counting the acquisitions that had to wait
-  // (the kCriticalRegionContentions performance counter).
-  static void LockCounted() {
+  // (the kCriticalRegionContentions performance counter). With
+  // critical_region_census on, every acquisition is also counted by source.
+  static void LockCounted(LockSource source = LockSource::kOther) {
+    if (census_enabled_.load(std::memory_order_relaxed)) {
+      LockCensus(source);
+      return;
+    }
     if (!mutex().try_lock()) {
       LockContended();
     }
@@ -72,12 +95,7 @@ class global_critical_region {
   // Recompiled guest code: sections with interrupts disabled (mtmsrd r13 to
   // enter, any other register to leave) hold the region, and mfmsr reads
   // whether this thread is in one (0, or 0x8000 with interrupts enabled).
-  static void GuestEnter() {
-    LockCounted();
-    if (guest_depth_++ == 0 && GuestHoldLogEnabled()) {
-      GuestHoldBegin();
-    }
-  }
+  static void GuestEnter() { GuestEnterFrom(LockSource::kGuestSection); }
   // NN-3.1: a section the code generator found to hold one load-reserve/
   // store-conditional pair and nothing else. Its store-conditional is a host
   // compare-exchange, so with guest_reservation_sections_unlocked it runs
@@ -89,7 +107,7 @@ class global_critical_region {
       GuestHoldLogInit();  // also reads the cvar
     }
     if (!reservation_sections_unlocked_.load(std::memory_order_relaxed)) {
-      GuestEnter();
+      GuestEnterFrom(LockSource::kGuestReservation);
       return;
     }
     ++unlocked_depth_;
@@ -113,13 +131,16 @@ class global_critical_region {
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
-  static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    LockCounted();
+  static std::unique_lock<std::recursive_mutex> AcquireDirect(
+      LockSource source = LockSource::kOther) {
+    LockCounted(source);
     return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
   }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() { return AcquireDirect(); }
+  inline std::unique_lock<std::recursive_mutex> Acquire(LockSource source = LockSource::kOther) {
+    return AcquireDirect(source);
+  }
 
   // Acquires a deferred lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {
@@ -135,6 +156,14 @@ class global_critical_region {
  private:
   // Counts the contention and the time blocked (kCriticalRegionBlockedNs).
   static void LockContended();
+  // LockCounted with critical_region_census on: the same, plus the census.
+  static void LockCensus(LockSource source);
+  static void GuestEnterFrom(LockSource source) {
+    LockCounted(source);
+    if (guest_depth_++ == 0 && GuestHoldLogEnabled()) {
+      GuestHoldBegin();
+    }
+  }
   static inline thread_local int32_t guest_depth_ = 0;
 
   // critical_region_hold_log_ms: guest sections held at least that long are
@@ -162,6 +191,8 @@ class global_critical_region {
  public:
   // guest_reservation_sections_unlocked (NN-3.1), mirrored for generated code.
   static REX_RUNTIME_DATA std::atomic<bool> reservation_sections_unlocked_;
+  // critical_region_census is on (set by census::Frame every frame).
+  static REX_RUNTIME_DATA std::atomic<bool> census_enabled_;
 
  private:
   static inline thread_local int32_t unlocked_depth_ = 0;

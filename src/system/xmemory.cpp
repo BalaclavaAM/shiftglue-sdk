@@ -34,6 +34,7 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/thread.h>
+#include <rex/thread/sync_census.h>
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
@@ -644,9 +645,26 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   // Will be rounded to physical page boundaries internally, so just pass 1 as
   // the length - guranteed not to cross page boundaries also.
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
-  if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
-                                      is_write, false, true,
-                                      runtime::ThreadState::Get() != nullptr)) {
+  // write_watch_fault_trace (NN-3.12): the fault, its time and its writer.
+  const bool census = rex::thread::census::WriteWatchEnabled();
+  std::chrono::steady_clock::time_point census_start;
+  if (census) {
+    const auto* thread_state = runtime::ThreadState::Get();
+    const PPCContext* context = thread_state ? thread_state->context() : nullptr;
+    rex::thread::census::BeginFault(physical_heap->GetPhysicalAddress(virtual_address),
+                                    context ? uint32_t(context->lr) : 0u);
+    census_start = std::chrono::steady_clock::now();
+  }
+  const bool triggered = physical_heap->TriggerCallbacks(
+      std::move(global_lock_locked_once), virtual_address, 1, is_write, false, true,
+      runtime::ThreadState::Get() != nullptr);
+  if (census) {
+    rex::thread::census::EndFault(
+        triggered, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - census_start)
+                       .count());
+  }
+  if (triggered) {
     return true;
   }
 
@@ -2162,7 +2180,7 @@ bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t a
 }
 
 bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kWriteWatchAnnounced);
 
   uint32_t parent_address = GetPhysicalAddress(address);
   if (!parent_heap_->Decommit(parent_address, size)) {
@@ -2177,7 +2195,7 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
 }
 
 bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kWriteWatchAnnounced);
 
   uint32_t parent_base_address = GetPhysicalAddress(base_address);
   if (!parent_heap_->Release(parent_base_address, out_region_size)) {
@@ -2204,7 +2222,7 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
 bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
                            uint32_t* old_protect) {
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kWriteWatchAnnounced);
 
   // Only invalidate if making writable again, for simplicity - not when simply
   // marking some range as immutable, for instance. The guest is announcing a
@@ -2227,8 +2245,10 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
 
 namespace {
 // A write-watch protection change, timed: with thousands of mappings one
-// mprotect can take milliseconds under the global lock (NN-2.4).
-void WatchProtect(void* base, size_t length, rex::memory::PageAccess access) {
+// mprotect can take milliseconds under the global lock (NN-2.4). `restore`
+// for TriggerCallbacks, an arm otherwise (write_watch_fault_trace splits them).
+void WatchProtect(void* base, size_t length, rex::memory::PageAccess access,
+                  bool restore = false) {
   const auto start = std::chrono::steady_clock::now();
   rex::memory::Protect(base, length, access);
   const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2236,6 +2256,10 @@ void WatchProtect(void* base, size_t length, rex::memory::PageAccess access) {
                          .count();
   PERF_counter_add(kWriteWatchProtectNs, ns);
   if (ns > 2000000) PERF_counter_inc(kWriteWatchSlowProtects);
+  if (rex::thread::census::WriteWatchEnabled()) {
+    rex::thread::census::NoteProtect(restore, ns,
+                                     uint32_t(length / rex::memory::page_size()));
+  }
 }
 }  // namespace
 
@@ -2280,7 +2304,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kWriteWatchArm);
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
     //
@@ -2425,6 +2449,9 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     any_access_watched |= access_block != 0;
     any_invalidation_watched |= invalidation_block != 0;
   }
+  if (rex::thread::census::WriteWatchEnabled()) {
+    rex::thread::census::NoteTrigger(any_watched || (invalidate_unwatched && is_write));
+  }
   if (!any_watched) {
     if (!invalidate_unwatched || !is_write) {
       return false;
@@ -2552,14 +2579,14 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       }
       if (i != restore_page_first && page_access != run_access) {
         WatchProtect(protect_base + run_first * system_page_size_,
-                             (i - run_first) * system_page_size_, run_access);
+                     (i - run_first) * system_page_size_, run_access, true);
         PERF_counter_inc(kWriteWatchProtectCalls);
         run_first = i;
       }
       run_access = page_access;
     }
     WatchProtect(protect_base + run_first * system_page_size_,
-                         (restore_page_last + 1 - run_first) * system_page_size_, run_access);
+                 (restore_page_last + 1 - run_first) * system_page_size_, run_access, true);
     PERF_counter_inc(kWriteWatchProtectCalls);
     PERF_counter_add(kWriteWatchProtectPages, restore_page_last + 1 - restore_page_first);
   }
