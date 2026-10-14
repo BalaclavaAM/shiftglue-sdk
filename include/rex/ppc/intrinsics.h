@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include <simde/x86/avx.h>
 #include <simde/x86/avx2.h>
@@ -121,48 +122,168 @@ inline uint8_t VectorShiftTableR[] = {
 // Xenon vmsum3fp128/vmsum4fp128 return QNaN when a dot product of finite
 // inputs overflows its single-precision result. simde_mm_dp_ps instead returns
 // +/-infinity, which changes ordered comparisons in guest collision code.
+//
+// Finite overflow (an infinite result from a finite accumulator) selects the
+// canonical QNaN, and a zero exponent keeps only the sign, which flushes
+// denormals and leaves +/-0 unchanged. The vmsum forms below use a vector copy
+// of this narrowing; this scalar one is the documented reference for it.
 inline float simde_mm_vmsum_narrow_result(double accumulator) noexcept {
   const float result = static_cast<float>(accumulator);
-  if (std::isinf(result) && !std::isinf(accumulator)) {
-    return std::bit_cast<float>(uint32_t{0x7FC00000});
-  }
-
-  // The generated instruction path runs with FTZ/DAZ enabled. Keep the same
-  // output behavior when the scalar-double implementation produces a denormal.
   const uint32_t result_bits = std::bit_cast<uint32_t>(result);
-  if ((result_bits & 0x7FFFFFFFu) != 0 && (result_bits & 0x7F800000u) == 0) {
-    return std::bit_cast<float>(result_bits & 0x80000000u);
-  }
-  return result;
+  const uint64_t accumulator_bits = std::bit_cast<uint64_t>(accumulator);
+
+  const bool result_infinite = (result_bits & 0x7FFFFFFFu) == 0x7F800000u;
+  const bool accumulator_infinite =
+      (accumulator_bits & 0x7FFFFFFFFFFFFFFFull) == 0x7FF0000000000000ull;
+  // The generated instruction path runs with FTZ/DAZ enabled. Keep the same
+  // output behavior when the double accumulator narrows to a denormal.
+  const uint32_t keep = (result_bits & 0x7F800000u) == 0 ? 0x80000000u : 0xFFFFFFFFu;
+  const uint32_t bits =
+      (result_infinite && !accumulator_infinite) ? 0x7FC00000u : (result_bits & keep);
+  return std::bit_cast<float>(bits);
 }
 
-// Guest vector elements are reversed relative to host lanes. Accumulate exact
-// float products in double and preserve Xenia's hardware-verified reduction
-// order: (x + z) + y for vmsum3fp128.
+// Guest vector elements are reversed relative to host lanes, so guest x, y, z
+// and w are host lanes 3, 2, 1 and 0. Each product of two floats is exact in
+// double, and the reductions keep Xenia's hardware-verified order,
+// (x + z) + y for vmsum3fp128 and (x + z) + (y + w) for vmsum4fp128, with one
+// double rounding per step and one final narrowing, so the vector forms give
+// the bits of the scalar-double code they replaced (NEAR_NATIVE_RESEARCH
+// NN-1.7, tests/unit/ppc/vmsum_differential.h). The one open choice is which
+// NaN comes out of a step with two NaN operands: IEEE 754 leaves it open and
+// the compiler treats adds and multiplies as commutative, so the scalar code
+// already picked either one depending on the call site.
+//
+// Both forms compute the lane pair sums (y + w, x + z) in one vector add; the
+// vmsum3 form then discards y + w and adds y alone. Spare lanes can raise host
+// FP exception flags the scalar code did not, which is harmless: the flags are
+// masked and the guest FPSCR does not read them.
+namespace detail {
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+// {products of host lanes 0 and 1 (w, z)} and {lanes 2 and 3 (y, x)}.
+struct VmsumProducts {
+  float64x2_t low;
+  float64x2_t high;
+};
+
+inline VmsumProducts vmsum_products(simde__m128 a, simde__m128 b) noexcept {
+  const float32x4_t va = simde__m128_to_neon_f32(a);
+  const float32x4_t vb = simde__m128_to_neon_f32(b);
+  return {vmulq_f64(vcvt_f64_f32(vget_low_f32(va)), vcvt_f64_f32(vget_low_f32(vb))),
+          vmulq_f64(vcvt_high_f64_f32(va), vcvt_high_f64_f32(vb))};
+}
+
+// The accumulator is lane 0 of the result.
+inline float64x2_t vmsum3_accumulate_vector(simde__m128 a, simde__m128 b) noexcept {
+  const VmsumProducts p = vmsum_products(a, b);
+  const float64x2_t pairs = vaddq_f64(p.high, p.low);    // (y + w, x + z)
+  return vaddq_f64(vextq_f64(pairs, pairs, 1), p.high);  // lane 0: (x + z) + y
+}
+
+inline float64x2_t vmsum4_accumulate_vector(simde__m128 a, simde__m128 b) noexcept {
+  const VmsumProducts p = vmsum_products(a, b);
+  const float64x2_t pairs = vaddq_f64(p.high, p.low);   // (y + w, x + z)
+  return vaddq_f64(vextq_f64(pairs, pairs, 1), pairs);  // lane 0: (x + z) + (y + w)
+}
+
+inline double vmsum_accumulator(float64x2_t accumulator) noexcept {
+  return vgetq_lane_f64(accumulator, 0);
+}
+
+// simde_mm_vmsum_narrow_result on lane 0, broadcast to all four lanes.
+// The constants are chosen to be MOVI immediates, so most need no load.
+inline simde__m128 vmsum_narrow_broadcast(float64x2_t accumulator) noexcept {
+  const float32x2_t narrowed = vcvt_f32_f64(accumulator);
+  const uint32x2_t result = vreinterpret_u32_f32(narrowed);
+  // +/-infinity is the only value whose bits shifted left once are FF000000.
+  const uint32x2_t result_infinite = vceq_u32(vshl_n_u32(result, 1), vdup_n_u32(0xFF000000u));
+  // accumulator - accumulator is 0 when finite and NaN when infinite.
+  const uint32x2_t accumulator_finite = vmovn_u64(vceqzq_f64(vsubq_f64(accumulator, accumulator)));
+  // |result| < FLT_MIN for zeros and denormals (FZ flushes the operand, with
+  // the same answer); shifted right once the mask clears all but the sign.
+  const uint32x2_t tiny = vcalt_f32(narrowed, vreinterpret_f32_u32(vdup_n_u32(0x00800000u)));
+  const uint32x2_t flushed = vbic_u32(result, vshr_n_u32(tiny, 1));
+  const uint32x2_t bits = vbsl_u32(vand_u32(result_infinite, accumulator_finite),
+                                   vdup_n_u32(0x7FC00000u), flushed);
+  return simde__m128_from_neon_f32(vreinterpretq_f32_u32(vdupq_lane_u32(bits, 0)));
+}
+#else
+// {products of host lanes 0 and 1 (w, z)} and {lanes 2 and 3 (y, x)}.
+struct VmsumProducts {
+  simde__m128d low;
+  simde__m128d high;
+};
+
+inline VmsumProducts vmsum_products(simde__m128 a, simde__m128 b) noexcept {
+#if defined(__AVX__)
+  const simde__m256d product =
+      simde_mm256_mul_pd(simde_mm256_cvtps_pd(a), simde_mm256_cvtps_pd(b));
+  return {simde_mm256_castpd256_pd128(product), simde_mm256_extractf128_pd(product, 1)};
+#else
+  return {simde_mm_mul_pd(simde_mm_cvtps_pd(a), simde_mm_cvtps_pd(b)),
+          simde_mm_mul_pd(simde_mm_cvtps_pd(simde_mm_movehl_ps(a, a)),
+                          simde_mm_cvtps_pd(simde_mm_movehl_ps(b, b)))};
+#endif
+}
+
+// The accumulator is lane 0 of the result.
+inline simde__m128d vmsum3_accumulate_vector(simde__m128 a, simde__m128 b) noexcept {
+  const VmsumProducts p = vmsum_products(a, b);
+  const simde__m128d pairs = simde_mm_add_pd(p.high, p.low);           // (y + w, x + z)
+  return simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), p.high);  // (x + z) + y
+}
+
+inline simde__m128d vmsum4_accumulate_vector(simde__m128 a, simde__m128 b) noexcept {
+  const VmsumProducts p = vmsum_products(a, b);
+  const simde__m128d pairs = simde_mm_add_pd(p.high, p.low);          // (y + w, x + z)
+  return simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs);  // (x + z) + (y + w)
+}
+
+inline double vmsum_accumulator(simde__m128d accumulator) noexcept {
+  return simde_mm_cvtsd_f64(accumulator);
+}
+
+// simde_mm_vmsum_narrow_result on lane 0, broadcast to all four lanes.
+inline simde__m128 vmsum_narrow_broadcast(simde__m128d accumulator) noexcept {
+  const simde__m128i result =
+      simde_mm_castps_si128(simde_mm_cvtsd_ss(simde_mm_castpd_ps(accumulator), accumulator));
+  const simde__m128i magnitude = simde_mm_set1_epi32(0x7FFFFFFF);
+  const simde__m128i exponent = simde_mm_set1_epi32(0x7F800000);
+  const simde__m128i result_infinite =
+      simde_mm_cmpeq_epi32(simde_mm_and_si128(result, magnitude), exponent);
+  const simde__m128d accumulator_magnitude = simde_mm_and_pd(
+      accumulator, simde_mm_castsi128_pd(simde_mm_set1_epi64x(0x7FFFFFFFFFFFFFFFll)));
+  // The low 32 bits of the 64-bit lane 0 mask line up with float lane 0.
+  const simde__m128i accumulator_finite = simde_mm_castpd_si128(simde_mm_cmplt_pd(
+      accumulator_magnitude, simde_mm_set1_pd(std::numeric_limits<double>::infinity())));
+  const simde__m128i exponent_zero =
+      simde_mm_cmpeq_epi32(simde_mm_and_si128(result, exponent), simde_mm_setzero_si128());
+  const simde__m128i flushed =
+      simde_mm_andnot_si128(simde_mm_and_si128(exponent_zero, magnitude), result);
+  const simde__m128i bits =
+      simde_mm_blendv_epi8(flushed, simde_mm_set1_epi32(0x7FC00000),
+                           simde_mm_and_si128(result_infinite, accumulator_finite));
+  return simde_mm_castsi128_ps(simde_mm_shuffle_epi32(bits, 0));
+}
+#endif
+
+inline double vmsum3_accumulate(simde__m128 a, simde__m128 b) noexcept {
+  return vmsum_accumulator(vmsum3_accumulate_vector(a, b));
+}
+
+inline double vmsum4_accumulate(simde__m128 a, simde__m128 b) noexcept {
+  return vmsum_accumulator(vmsum4_accumulate_vector(a, b));
+}
+
+}  // namespace detail
+
 inline simde__m128 simde_mm_vmsum3fp128(simde__m128 a, simde__m128 b) noexcept {
-  alignas(16) float a_lanes[4];
-  alignas(16) float b_lanes[4];
-  simde_mm_store_ps(a_lanes, a);
-  simde_mm_store_ps(b_lanes, b);
-
-  const double x = static_cast<double>(a_lanes[3]) * static_cast<double>(b_lanes[3]);
-  const double y = static_cast<double>(a_lanes[2]) * static_cast<double>(b_lanes[2]);
-  const double z = static_cast<double>(a_lanes[1]) * static_cast<double>(b_lanes[1]);
-  return simde_mm_set1_ps(simde_mm_vmsum_narrow_result((x + z) + y));
+  return detail::vmsum_narrow_broadcast(detail::vmsum3_accumulate_vector(a, b));
 }
 
-// vmsum4fp128 uses the pairwise reduction (x + z) + (y + w).
 inline simde__m128 simde_mm_vmsum4fp128(simde__m128 a, simde__m128 b) noexcept {
-  alignas(16) float a_lanes[4];
-  alignas(16) float b_lanes[4];
-  simde_mm_store_ps(a_lanes, a);
-  simde_mm_store_ps(b_lanes, b);
-
-  const double x = static_cast<double>(a_lanes[3]) * static_cast<double>(b_lanes[3]);
-  const double y = static_cast<double>(a_lanes[2]) * static_cast<double>(b_lanes[2]);
-  const double z = static_cast<double>(a_lanes[1]) * static_cast<double>(b_lanes[1]);
-  const double w = static_cast<double>(a_lanes[0]) * static_cast<double>(b_lanes[0]);
-  return simde_mm_set1_ps(simde_mm_vmsum_narrow_result((x + z) + (y + w)));
+  return detail::vmsum_narrow_broadcast(detail::vmsum4_accumulate_vector(a, b));
 }
 
 // Unsigned 32-bit saturating add

@@ -12,6 +12,8 @@
 
 #include <rex/ppc/intrinsics.h>
 
+#include "vmsum_differential.h"
+
 namespace {
 
 uint32_t lane_bits(simde__m128 value, size_t lane = 0) {
@@ -82,4 +84,21 @@ TEST_CASE("vmsum uses the guest reduction order", "[ppc][vector][vmsum]") {
   check_broadcast(rex::ppc::simde_mm_vmsum3fp128(ones, terms), 0x40400000u);
   // vmsum4 reduces (x + z) + (y + w): 0 + (3 + 4).
   check_broadcast(rex::ppc::simde_mm_vmsum4fp128(ones, terms), 0x40E00000u);
+}
+
+TEST_CASE("vmsum SIMD forms match the scalar-double reference bit for bit",
+          "[ppc][vector][vmsum]") {
+  // Random vectors plus a sweep of special values and NaN pairs, under every
+  // rounding mode with flushing off and on (NEAR_NATIVE_RESEARCH NN-1.7).
+  const auto result = rex::ppc::test::run_vmsum_differential(0x4E4E2D312E37ull, 250000);
+  INFO("cases " << result.cases << ", NaN outputs " << result.nan_outputs
+                << ", overflow QNaN outputs " << result.overflow_qnan_outputs
+                << ", flushed outputs " << result.flushed_outputs << ", first bad form "
+                << result.first_bad_form << " csr " << result.first_bad_csr << " a3 "
+                << result.first_bad_a[3] << " b3 " << result.first_bad_b[3]);
+  CHECK(result.cases > 2000000);
+  CHECK(result.overflow_qnan_outputs > 0);
+  CHECK(result.flushed_outputs > 0);
+  CHECK(result.output_mismatches == 0);
+  CHECK(result.accumulator_mismatches == 0);
 }
