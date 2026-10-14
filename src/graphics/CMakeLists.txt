@@ -17,6 +17,7 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    d3d_census_decoder.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
     fh1_frame_dump.cpp

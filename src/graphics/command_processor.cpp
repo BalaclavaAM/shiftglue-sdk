@@ -39,6 +39,7 @@
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
+#include <rex/system/d3d_census.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -49,6 +50,8 @@
 #elif REX_ARCH_ARM64
 #include <arm_neon.h>
 #endif
+
+#include "d3d_census_decoder.h"
 
 REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
@@ -130,6 +133,11 @@ REXCVAR_DEFINE_INT32(gpu_trace_ib_writers, 0, "GPU",
                      "their link register) that write them")
     .range(0, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_trace_ib_writers_rearm, false, "GPU",
+                    "Diagnostics (DL-0.1): with gpu_trace_ib_writers, watch a written page again "
+                    "at the decoder's next indirect buffer instead of at that buffer's next "
+                    "execution, so later writes between two runs are seen too (one fault each)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_trace_wait_reg_mem_writers, false, "GPU",
                     "Diagnostics: while WAIT_REG_MEM waits on a guest memory word, watch its "
                     "page and log the guest threads (and their link register) that write it")
@@ -894,6 +902,9 @@ struct IbWriterTrace {
   std::unordered_map<uint64_t, uint32_t> logged;
   std::atomic<uint32_t> logs{0};
   std::atomic<uint32_t> swaps{0};
+  // gpu_trace_ib_writers_rearm: written watched pages to watch again.
+  std::vector<uint32_t> rearm_pages;
+  std::atomic<bool> rearm_pending{false};
 };
 IbWriterTrace ib_writer_trace;
 
@@ -906,14 +917,26 @@ void LogIbWrite(void*, uint32_t physical_address, uint32_t length, bool is_write
   const uint32_t lr = context ? uint32_t(context->lr) : 0u;
   uint64_t buffer = 0;
   uint32_t count = 0;
+  const bool rearm = REXCVAR_GET(gpu_trace_ib_writers_rearm);
   {
     std::lock_guard<std::mutex> lock(ib_writer_trace.mutex);
     auto it = ib_writer_trace.pages.find(physical_address >> 12);
     if (it != ib_writer_trace.pages.end()) {
       buffer = it->second;
+      if (rearm && ib_writer_trace.rearm_pages.size() < 65536) {
+        ib_writer_trace.rearm_pages.push_back(physical_address >> 12);
+        ib_writer_trace.rearm_pending.store(true, std::memory_order_release);
+      }
     }
     // Each writer once per buffer, then every 64th write.
     count = ib_writer_trace.logged[(uint64_t(lr) << 32) ^ buffer]++;
+  }
+  // DL-0.1: the writer's class by the guest code its lr is in (fixup, stream
+  // load, clone or other), counted per window by the D3D census.
+  if (buffer && rex::system::d3d_census::Enabled()) {
+    rex::system::d3d_census::NoteBufferWrite(uint32_t(buffer >> 32),
+                                             (buffer & 0x80000000u) != 0,
+                                             rex::system::d3d_census::ClassifyWriter(lr), lr);
   }
   if ((count && count % 64) ||
       ib_writer_trace.logs.fetch_add(1, std::memory_order_relaxed) >= 4000) {
@@ -1707,6 +1730,14 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     uint32_t& depth;
     ~DepthGuard() { --depth; }
   } depth_guard{trace_ib_depth_};
+  // DL-0.1 D3D source census (one flag check while it is off).
+  d3d_census_decoder::IbBegin(ptr, count, trace_ib_depth_);
+  struct CensusGuard {
+    uint32_t depth;
+    ~CensusGuard() {
+      if (d3d_census_decoder::Active()) d3d_census_decoder::IbEnd(depth);
+    }
+  } census_guard{trace_ib_depth_};
 
   for (uint32_t level = 0; level < replay_probe.active; ++level) {
     replay_probe.levels[level].nested.emplace_back(ptr, count);
@@ -1716,6 +1747,17 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
         memory_->RegisterPhysicalMemoryAccessCallback(LogIbWrite, nullptr);
     (void)callback;
     ib_writer_trace.swaps.store(trace_swaps_, std::memory_order_relaxed);
+    if (ib_writer_trace.rearm_pending.load(std::memory_order_acquire)) {
+      std::vector<uint32_t> pages;
+      {
+        std::lock_guard<std::mutex> lock(ib_writer_trace.mutex);
+        pages.swap(ib_writer_trace.rearm_pages);
+        ib_writer_trace.rearm_pending.store(false, std::memory_order_relaxed);
+      }
+      for (uint32_t page : pages) {
+        memory_->EnablePhysicalMemoryAccessCallbacks(page << 12, 4096, false, false, true);
+      }
+    }
     const bool list = trace_ib_depth_ >= 2;
     const uint32_t physical = ptr & 0x1FFFFFFF;
     const uint32_t bytes = count * uint32_t(sizeof(uint32_t));
@@ -2064,6 +2106,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   if (packet == 0) {
     return true;
   }
+  if (d3d_census_decoder::Active()) {
+    d3d_census_decoder::Packet(packet_offset);
+  }
   if (packet_recorder_) {
     uint32_t dword_count = 1;
     switch (packet_type) {
@@ -2175,7 +2220,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
-  if (opcode == PM4_XE_SWAP) ++trace_swaps_;
+  if (opcode == PM4_XE_SWAP) {
+    ++trace_swaps_;
+    d3d_census_decoder::Swap();
+  }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
   if (trace_bins &&
@@ -3190,6 +3238,13 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
                                                     uint32_t count) {
   ++ib_stats.decoded_draws;
   PERF_counter_inc(kGpuDecodedDraws);
+  if (d3d_census_decoder::Active()) {
+    // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
+    // of no tiling pass), the draws the untiled Android path keeps.
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 &&
+                             decode_regs().Get<reg::RB_MODECONTROL>().edram_mode !=
+                                 xenos::EdramMode::kCopy);
+  }
   if (replay_probe.capturing &&
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
     ReplayProbeMarkUnskippable();
@@ -3213,6 +3268,13 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
                                                       uint32_t count) {
   ++ib_stats.decoded_draws;
   PERF_counter_inc(kGpuDecodedDraws);
+  if (d3d_census_decoder::Active()) {
+    // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
+    // of no tiling pass), the draws the untiled Android path keeps.
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 &&
+                             decode_regs().Get<reg::RB_MODECONTROL>().edram_mode !=
+                                 xenos::EdramMode::kCopy);
+  }
   if (replay_probe.capturing &&
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
     ReplayProbeMarkUnskippable();

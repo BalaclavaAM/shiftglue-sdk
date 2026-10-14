@@ -10,6 +10,7 @@ set(REXSYSTEM_SOURCES
     xthread.cpp
     xevent.cpp
     gpu_write_signal.cpp
+    d3d_census.cpp
     xfile.cpp
     xmutant.cpp
     xsemaphore.cpp
