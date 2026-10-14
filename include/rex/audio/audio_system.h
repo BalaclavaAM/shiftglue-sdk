@@ -32,6 +32,7 @@ namespace rex::audio {
 constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
 
 class AudioDriver;
+class HostFrameSource;
 class XmaDecoder;
 
 class AudioSystem : public system::IAudioSystem {
@@ -48,6 +49,8 @@ class AudioSystem : public system::IAudioSystem {
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index);
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, uint32_t samples_ptr);
+  // Submits a frame built on the host (rex/audio/host_frame_source.h).
+  void SubmitHostFrame(size_t index, const uint32_t* frame);
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
@@ -89,6 +92,9 @@ class AudioSystem : public system::IAudioSystem {
     uint32_t callback_arg;
     uint32_t wrapped_callback_arg;
     bool in_use;
+    // Builds the client's frames on the host when it chooses to; set at
+    // registration from the process-wide source (SetHostFrameSource).
+    HostFrameSource* host_source;
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();

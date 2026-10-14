@@ -135,7 +135,10 @@ bool SDLAudioDriver::OpenDevice() {
 }
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
-  const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+  SubmitHostFrame(memory_->TranslateVirtual<const uint32_t*>(frame_ptr));
+}
+
+void SDLAudioDriver::SubmitHostFrame(const uint32_t* input_frame) {
   float* output_frame;
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
@@ -151,8 +154,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   static uint32_t sdl_submit_count = 0;
   if (sdl_submit_count < 10) {
-    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
-                 frames_queued_.size() + 1);
+    REXAPU_DEBUG("SDLAudioDriver::SubmitHostFrame: queued_count={}", frames_queued_.size() + 1);
     sdl_submit_count++;
   }
 

@@ -30,7 +30,10 @@ class SDLAudioDriver : public AudioDriver {
   ~SDLAudioDriver() override;
 
   bool Initialize();
-  void SubmitFrame(uint32_t frame_ptr) override;
+  // Translates the guest frame and passes it to SubmitHostFrame, so a
+  // subclass that overrides SubmitHostFrame sees guest and host frames alike.
+  void SubmitFrame(uint32_t frame_ptr) final;
+  void SubmitHostFrame(const uint32_t* frame) override;
   void Shutdown();
 
  protected:

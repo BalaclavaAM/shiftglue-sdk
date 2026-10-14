@@ -22,6 +22,9 @@ class AudioDriver {
   virtual ~AudioDriver();
 
   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
+  // A frame built on the host (rex/audio/host_frame_source.h): the same
+  // layout as a guest frame, kRenderFrameWords big-endian words.
+  virtual void SubmitHostFrame(const uint32_t* frame) = 0;
 
  protected:
   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {

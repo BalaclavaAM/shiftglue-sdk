@@ -13,6 +13,7 @@
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/host_frame_source.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -23,6 +24,8 @@
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
+
+#include <vector>
 
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
@@ -44,7 +47,16 @@ namespace rex::audio {
 
 namespace {
 constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+std::atomic<HostFrameSource*> g_host_frame_source{nullptr};
 }  // namespace
+
+void SetHostFrameSource(HostFrameSource* source) {
+  g_host_frame_source.store(source, std::memory_order_release);
+}
+
+HostFrameSource* GetHostFrameSource() {
+  return g_host_frame_source.load(std::memory_order_acquire);
+}
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -100,6 +112,9 @@ void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
 
+  // Frames a host frame source builds in place of the guest callback.
+  std::vector<uint32_t> host_frame(kRenderFrameWords);
+
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
@@ -136,23 +151,31 @@ void AudioSystem::WorkerThreadMain() {
 
       uint32_t client_callback = 0;
       uint32_t client_callback_arg = 0;
+      HostFrameSource* host_source = nullptr;
       {
         std::lock_guard<std::mutex> clients_lock(clients_mutex_);
         if (clients_[index].in_use) {
           client_callback = clients_[index].callback;
           client_callback_arg = clients_[index].wrapped_callback_arg;
+          host_source = clients_[index].host_source;
         }
       }
 
-      if (client_callback) {
+      if (client_callback && host_source && host_source->BuildFrame(host_frame.data())) {
+        // The source built this block itself: no guest callback, no guest pass.
+        SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->host_frame");
+        SubmitHostFrame(index, host_frame.data());
+      } else if (client_callback) {
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
                        client_callback, client_callback_arg, index);
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
+        if (host_source) host_source->GuestBlockBegin();
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        if (host_source) host_source->GuestBlockEnd();
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }
@@ -228,7 +251,7 @@ void AudioSystem::Shutdown() {
       if (clients_[i].in_use) {
         DestroyDriver(clients_[i].driver);
         wrapped_callback_args[i] = clients_[i].wrapped_callback_arg;
-        clients_[i] = {nullptr, 0, 0, 0, false};
+        clients_[i] = {nullptr, 0, 0, 0, false, nullptr};
       }
     }
   }
@@ -260,7 +283,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
                queued_frames_);
   // Reserved while the driver opens the host device without the lock: that
   // takes tens of milliseconds (an Android AAudio stream).
-  clients_[index] = {nullptr, 0, 0, 0, true};
+  clients_[index] = {nullptr, 0, 0, 0, true, nullptr};
   clients_lock.unlock();
 
   auto client_semaphore = client_semaphores_[index].get();
@@ -268,14 +291,19 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   auto result = CreateDriver(index, client_semaphore, &driver);
   clients_lock.lock();
   if (XFAILED(result)) {
-    clients_[index] = {nullptr, 0, 0, 0, false};
+    clients_[index] = {nullptr, 0, 0, 0, false, nullptr};
     clients_lock.unlock();
     memory()->SystemHeapFree(ptr);
     return result;
   }
   assert_not_null(driver);
 
-  clients_[index] = {driver, callback, callback_arg, ptr, true};
+  clients_[index] = {driver, callback, callback_arg, ptr, true, nullptr};
+  if (HostFrameSource* source = GetHostFrameSource();
+      source && source->Accepts(callback, callback_arg)) {
+    clients_[index].host_source = source;
+    REXAPU_DEBUG("AudioSystem::RegisterClient: client {} has a host frame source", index);
+  }
 
   // The worker pumps the client once per count, so only after it is complete.
   auto ret = client_semaphore->Release(queued_frames_, nullptr);
@@ -304,6 +332,18 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
     return;
   }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
+  if (HostFrameSource* source = clients_[index].host_source) {
+    source->ObserveGuestFrame(memory()->TranslateVirtual<const uint32_t*>(samples_ptr));
+  }
+}
+
+void AudioSystem::SubmitHostFrame(size_t index, const uint32_t* frame) {
+  SCOPE_profile_cpu_f("apu");
+  std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+  if (index >= kMaximumClientCount || !clients_[index].in_use || !clients_[index].driver) {
+    return;
+  }
+  clients_[index].driver->SubmitHostFrame(frame);
 }
 
 void AudioSystem::UnregisterClient(size_t index) {
@@ -319,7 +359,7 @@ void AudioSystem::UnregisterClient(size_t index) {
     std::lock_guard<std::mutex> clients_lock(clients_mutex_);
     driver = clients_[index].driver;
     wrapped_callback_arg = clients_[index].wrapped_callback_arg;
-    clients_[index] = {nullptr, 0, 0, 0, false};
+    clients_[index] = {nullptr, 0, 0, 0, false, nullptr};
   }
   // Outside clients_mutex_: the heap takes the global lock, and closing the
   // host device may block.
