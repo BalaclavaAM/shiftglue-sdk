@@ -1814,9 +1814,10 @@ void VulkanPipelineCache::ObserveTranslation(const VulkanShader& shader,
   observation.translator_version = config.translator_version;
   observation.backend = uint32_t(config.backend);
   observation.device_features = config.device_features;
-  observation.bindless_resources = SpirvShaderTranslator::Features(
-                                       command_processor_.GetVulkanDevice())
-                                       .bindless_textures;
+  // Bindless textures are part of the device feature hash on Vulkan, not a
+  // pack flag: reporting them here gave captures flag 1, which the runtime
+  // never expects, so no pack built from a bindless device ever loaded.
+  observation.bindless_resources = (config.flags & 1) != 0;
   observation.edram_rov = (config.flags & 2) != 0;
   observation.gamma_render_target_as_unorm8 = (config.flags & 4) != 0;
   observation.msaa_2x = (config.flags & 8) != 0;
