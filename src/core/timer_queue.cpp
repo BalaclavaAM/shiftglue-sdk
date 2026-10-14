@@ -63,7 +63,7 @@ class TimerQueue {
       return left->due_ < right->due_;
     };
 
-    set_current_thread_name("rex::thread::TimerQueue");
+    set_current_thread_name("rex TimerQueue");
 
     while (!stop_token.stop_requested()) {
       {
