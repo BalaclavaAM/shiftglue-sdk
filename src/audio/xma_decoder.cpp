@@ -27,7 +27,7 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
-REXCVAR_DEFINE_BOOL(xma_decode_kicks_inline, true, "Audio",
+REXCVAR_DEFINE_BOOL(xma_decode_kicks_inline, false, "Audio",
                     "Decode a kicked XMA context on the thread that wrote the kick register "
                     "instead of leaving it to the decoder thread");
 
