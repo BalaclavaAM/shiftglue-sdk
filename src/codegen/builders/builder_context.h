@@ -25,6 +25,21 @@ namespace rex::codegen {
 
 class FunctionNode;
 
+/// The first register a `<prefix>N` save/restore helper name covers (N), or -1.
+inline int SaveRestoreHelperFirstRegister(std::string_view name, std::string_view prefix) {
+  if (!name.starts_with(prefix) || name.size() == prefix.size())
+    return -1;
+  int value = 0;
+  for (char c : name.substr(prefix.size())) {
+    if (c < '0' || c > '9')
+      return -1;
+    value = value * 10 + (c - '0');
+    if (value > 31)
+      return -1;
+  }
+  return value >= 14 ? value : -1;
+}
+
 struct RecompilerLocalVariables {
   bool ctr{};
   bool xer{};
@@ -37,6 +52,10 @@ struct RecompilerLocalVariables {
   bool temp{};
   bool v_temp{};
   bool ea{};
+  /// host_local_register_saves: the first GPR (14-31) this function's prologue
+  /// saves into the `rex_save_rN` locals instead of calling __savegprlr_N, or
+  /// 0 when the function keeps the helper calls.
+  uint8_t hostSaveFirst{};
 
   /// Tracks which GPRs contain MMIO base addresses (bit N = rN is MMIO base)
   /// Set when lis loads a value with upper 16 bits >= 0x7F00 (address >= 0x7F000000)
@@ -124,6 +143,11 @@ struct BuilderContext {
   /// the registers it stores or loads (`return;` after it when tail-called).
   void inlineSaveRestoreHelper(const rex::codegen::FunctionNode& helper, std::string_view indent,
                                bool tail);
+  /// host_local_register_saves: emit a `__savegprlr_N` call as copies of
+  /// rN-r31 into the `rex_save_rN` locals plus the LR slot store, and a
+  /// `__restgprlr_N` call or tail call as the copies back plus the LR reload.
+  /// False when `name` is not a helper this function's plan covers.
+  bool emitHostLocalSaveRestore(std::string_view name, std::string_view indent, bool tail);
 
   /**
    * @brief Get expression for general-purpose register access.

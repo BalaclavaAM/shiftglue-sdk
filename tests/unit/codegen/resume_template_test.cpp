@@ -17,8 +17,11 @@ TEST_CASE("TemplateRegistry: indirect dispatch carries and clears the requested 
     "code_size": "0x100000",
     "thunk_reserve_size": "0x1000"
   })");
-  CHECK(result.find("ctx.dispatch_address = rex_indirect_target_") != std::string::npos);
-  CHECK(result.find("ctx.dispatch_address = 0") != std::string::npos);
+  // The stores compile only with interior_resume (REX_CONFIG_INTERIOR_RESUME).
+  CHECK(result.find("#define REX_SET_DISPATCH_ADDRESS(x) (ctx.dispatch_address = (x))") !=
+        std::string::npos);
+  CHECK(result.find("REX_SET_DISPATCH_ADDRESS(rex_indirect_target_)") != std::string::npos);
+  CHECK(result.find("REX_SET_DISPATCH_ADDRESS(0)") != std::string::npos);
 }
 
 TEST_CASE("TemplateRegistry: register_cpp maps resumable aliases to their owner",

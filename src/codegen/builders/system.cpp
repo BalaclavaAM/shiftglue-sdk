@@ -12,6 +12,10 @@
 #include "builder_context.h"
 #include "helpers.h"
 
+#include <vector>
+
+#include <rex/memory/utils.h>
+
 namespace rex::codegen {
 
 //=============================================================================
@@ -318,6 +322,112 @@ bool build_mtlr(BuilderContext& ctx) {
   return true;
 }
 
+namespace {
+
+// NN-3.1: whether the interrupts-off section this mtmsrd r13 opens holds
+// exactly one load-reserve/store-conditional pair and nothing the global lock
+// could matter for: no call, return, indirect branch, system call or trap, no
+// other store, no nested section, and every branch staying inside the section
+// up to its closing mtmsrd or going to another closing mtmsrd. Its store-conditional is a host compare-exchange
+// already, so the runtime may run it without taking the global mutex.
+bool IsSingleReservationSection(const BuilderContext& ctx) {
+  constexpr uint32_t kMaxScan = 64;
+  const uint32_t enter = ctx.base;
+  uint32_t leave = 0;
+  uint32_t reserves = 0, conditionals = 0;
+  std::vector<uint32_t> targets;
+  for (uint32_t i = 1; i < kMaxScan; ++i) {
+    const uint32_t address = enter + i * 4;
+    if (address >= ctx.fn.end()) {
+      return false;
+    }
+    const uint32_t word = rex::memory::load_and_swap<uint32_t>(ctx.data + i);
+    const uint32_t op = word >> 26;
+    const uint32_t xo = (word >> 1) & 0x3FF;
+    if (op == 31 && (xo == 178 || xo == 146)) {
+      if (((word >> 21) & 31) == 13) {
+        return false;  // nested section
+      }
+      leave = address;
+      break;
+    }
+    switch (op) {
+      case 18: {  // b (bl, ba and bla excluded)
+        if (word & 3) {
+          return false;
+        }
+        int32_t li = int32_t(word & 0x03FFFFFC);
+        if (li & 0x02000000) {
+          li -= 0x04000000;
+        }
+        targets.push_back(address + uint32_t(li));
+        break;
+      }
+      case 16: {  // bc (bcl and absolute forms excluded)
+        if (word & 3) {
+          return false;
+        }
+        int32_t bd = int32_t(word & 0xFFFC);
+        if (bd & 0x8000) {
+          bd -= 0x10000;
+        }
+        targets.push_back(address + uint32_t(bd));
+        break;
+      }
+      case 19:
+        if (xo == 16 || xo == 528) {
+          return false;  // bclr, bcctr
+        }
+        break;
+      case 2: case 3: case 4: case 17:  // traps, VMX, sc
+      case 36: case 37: case 38: case 39: case 44: case 45: case 47:
+      case 52: case 53: case 54: case 55: case 62:  // stores
+        return false;
+      case 31:
+        switch (xo) {
+          case 20: case 84:  // lwarx, ldarx
+            ++reserves;
+            break;
+          case 150: case 214:  // stwcx., stdcx.
+            ++conditionals;
+            break;
+          case 4:  // tw
+          case 135: case 149: case 151: case 167: case 181: case 183: case 199:
+          case 215: case 231: case 247: case 407: case 439: case 487: case 661:
+          case 662: case 663: case 695: case 725: case 727: case 759: case 918:
+          case 983: case 1014:  // stores, dcbz
+            return false;
+          default:
+            break;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  if (!leave || reserves != 1 || conditionals != 1) {
+    return false;
+  }
+  for (uint32_t target : targets) {
+    if (target > enter && target <= leave) {
+      continue;
+    }
+    // A compare-exchange that fails branches to its own closing mtmsrd.
+    if (target <= enter || target >= ctx.fn.end() || (target - enter) % 4) {
+      return false;
+    }
+    const uint32_t word =
+        rex::memory::load_and_swap<uint32_t>(ctx.data + (target - enter) / 4);
+    const uint32_t xo = (word >> 1) & 0x3FF;
+    if ((word >> 26) != 31 || (xo != 178 && xo != 146) || ((word >> 21) & 31) == 13) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 bool build_mtmsrd(BuilderContext& ctx) {
   if (!ctx.config().skipMsr) {
     // Update MSR bits
@@ -327,7 +437,9 @@ bool build_mtmsrd(BuilderContext& ctx) {
     // R13 = enter lock (disable interrupts)
     // Other = leave lock (enable interrupts)
     uint32_t src_reg = ctx.insn.operands[0];
-    if (src_reg == 13) {
+    if (src_reg == 13 && IsSingleReservationSection(ctx)) {
+      ctx.println("\tREX_ENTER_GLOBAL_LOCK_RESERVATION();");
+    } else if (src_reg == 13) {
       ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
     } else {
       ctx.println("\tREX_LEAVE_GLOBAL_LOCK();");

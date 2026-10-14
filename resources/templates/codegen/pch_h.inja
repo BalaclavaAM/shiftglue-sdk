@@ -16,6 +16,7 @@
 {% endif %}{% if config_flags.cr_as_local %}#define REX_CONFIG_CR_AS_LOCAL
 {% endif %}{% if config_flags.non_argument_as_local %}#define REX_CONFIG_NON_ARGUMENT_AS_LOCAL
 {% endif %}{% if config_flags.non_volatile_as_local %}#define REX_CONFIG_NON_VOLATILE_AS_LOCAL
+{% endif %}{% if config_flags.interior_resume %}#define REX_CONFIG_INTERIOR_RESUME
 {% endif %}
 #define REX_IMAGE_BASE {{ image_base }}ull
 #define REX_IMAGE_SIZE {{ image_size }}ull
@@ -409,4 +410,6 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // global critical region. mfmsr reports this thread's state without locking.
 #define REX_CHECK_GLOBAL_LOCK() rex::thread::global_critical_region::GuestCheck()
 #define REX_ENTER_GLOBAL_LOCK() rex::thread::global_critical_region::GuestEnter()
+#define REX_ENTER_GLOBAL_LOCK_RESERVATION() \
+  rex::thread::global_critical_region::GuestEnterReservation()
 #define REX_LEAVE_GLOBAL_LOCK() rex::thread::global_critical_region::GuestLeave()

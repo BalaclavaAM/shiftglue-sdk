@@ -213,4 +213,8 @@ class FunctionGraph {
   void notifyFunctionAdded(FunctionNode* newFunction);
 };
 
+/// Log how many functions host_local_register_saves changed and why the others
+/// kept the save/restore helper calls (one line per reason).
+void LogHostLocalSaveStats();
+
 }  // namespace rex::codegen

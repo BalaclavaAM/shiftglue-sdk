@@ -164,6 +164,43 @@ void BuilderContext::inlineSaveRestoreHelper(const rex::codegen::FunctionNode& h
     println("{}return;", indent);
 }
 
+// host_local_register_saves (Pinyon Shift NEAR_NATIVE_RESEARCH.md NN-1.2).
+// ctx is write-through: every callee leaves r14-r31 in ctx as it found them,
+// so copying rN-r31 to host locals where the prologue would call __savegprlr_N
+// and copying them back where an epilogue reaches __restgprlr_N hands the
+// caller the same registers as the helpers' stack round trip. The helper's
+// LR slot store (r12 at r1-8) and its reload into r12 and LR stay, so the
+// back chain, the LR slot and ctx.lr look as before; only the GPR slots are
+// no longer written. The scan in function_graph.cpp sets hostSaveFirst only
+// for functions that never touch those slots otherwise.
+bool BuilderContext::emitHostLocalSaveRestore(std::string_view name, std::string_view indent,
+                                              bool tail) {
+  const int first = locals.hostSaveFirst;
+  if (const int n = SaveRestoreHelperFirstRegister(name, "__savegprlr_"); n >= 0) {
+    if (n != first)
+      return false;
+    for (int i = n; i < 32; ++i)
+      println("{}rex_save_r{} = {}.u64;", indent, i, r(i));
+    println("{}REX_STACK_STORE_U32({}.u32 + -8, {}.u32);", indent, r(1), r(12));
+    if (tail)
+      println("{}return;", indent);
+    return true;
+  }
+  if (const int n = SaveRestoreHelperFirstRegister(name, "__restgprlr_"); n >= 0) {
+    if (n < first)
+      return false;
+    for (int i = n; i < 32; ++i)
+      println("{}{}.u64 = rex_save_r{};", indent, r(i), i);
+    println("{}{}.u64 = REX_STACK_LOAD_U32({}.u32 + -8);", indent, r(12), r(1));
+    if (!config().skipLr)
+      println("{}ctx.lr = {}.u64;", indent, r(12));
+    if (tail)
+      println("{}return;", indent);
+    return true;
+  }
+  return false;
+}
+
 void BuilderContext::reloadLocalNonVolatiles(std::string_view indent) {
   for (size_t i = 14; i < 32; ++i) {
     if (locals.r[i])
@@ -350,6 +387,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // cannot see, so the helper's body is inlined on them. A share_registers
       // function works in ctx and keeps the call (the helper bodies are never
       // localized).
+      // host_local_register_saves: the save-area scan cleared this function
+      // to keep its saved registers in host locals instead of the stack slots.
+      if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, "\t", false))
+        return;
+
       if (localizeNonVolatiles() && isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, "\t", false);
         return;
@@ -446,6 +488,8 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       // The strong `__imp__` definition when the host does not override the
       // function (cfg.directCallsBypassThunk), so Clang can inline it.
       const std::string callee = calleeSymbol(*targetFn);
+      if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, indent, true))
+        return;
       if (localizeNonVolatiles() && isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, indent, true);
         return;

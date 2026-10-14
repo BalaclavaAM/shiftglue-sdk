@@ -267,6 +267,7 @@ struct JumpTable {
   uint32_t bctrAddress;           // Address of bctr instruction
   uint32_t tableAddress;          // Address of jump table data
   uint8_t indexRegister;          // Register holding switch index
+  uint8_t entryBytes = 4;         // Bytes per table entry (1, 2 or 4)
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 };
 

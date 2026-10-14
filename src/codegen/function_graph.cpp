@@ -14,6 +14,9 @@
 #include "builders.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <iterator>
 #include <cassert>
 #include <cstring>
 #include <optional>
@@ -666,7 +669,492 @@ std::vector<std::string> WrittenLocalRegisters(const std::string& body) {
   return std::vector<std::string>(written.begin(), written.end());
 }
 
+//=============================================================================
+// host_local_register_saves: the save-area scan
+//=============================================================================
+// A function whose prologue calls __savegprlr_N may keep rN-r31 in host locals
+// (BuilderContext::emitHostLocalSaveRestore) only if nothing else reads or
+// writes the GPR save slots [entry_sp - 8 - 8 * (32 - N), entry_sp - 8): its
+// own code (an inlined epilogue's loads, a slot read, a pointer into the
+// area), an unwinder (exception info), a hook, or a path that skips the save.
+// The scan follows r1 and the registers derived from it in address order (the
+// tracking restarts at every label) and refuses anything it cannot place.
+
+enum class HostSaveReason : uint8_t {
+  kTransformed,
+  kNoSave,
+  kKeepList,
+  kLocalized,
+  kInteriorResume,
+  kSharesRegisters,
+  kExceptionInfo,
+  kMidAsmHook,
+  kMultipleSaves,
+  kSaveNotAtEntry,
+  kRestoreWider,
+  kRestoreFrame,
+  kSetJmp,
+  kTailBranch,
+  kIndirectBranch,
+  kFallthrough,
+  kDynamicFrame,
+  kR1Write,
+  kSaveSlotAccess,
+  kSaveAreaAddress,
+  kSpStored,
+  kSpArithmetic,
+  kSpIndexedUnknown,
+  kUndecoded,
+  kCount,
+};
+
+constexpr const char* kHostSaveReasonNames[] = {
+    "transformed",      "no_save",           "keep_list",          "non_volatile_as_local",
+    "interior_resume",  "shares_registers",  "exception_info",     "mid_asm_hook",
+    "multiple_saves",   "save_not_at_entry", "restore_wider",      "restore_frame",
+    "setjmp_longjmp",   "tail_branch",       "indirect_branch",    "fallthrough",
+    "dynamic_frame",    "r1_write",          "save_slot_access",   "save_area_address",
+    "sp_stored",        "sp_arithmetic",     "sp_indexed_unknown", "undecoded",
+};
+static_assert(std::size(kHostSaveReasonNames) == static_cast<size_t>(HostSaveReason::kCount));
+
+std::array<std::atomic<uint64_t>, static_cast<size_t>(HostSaveReason::kCount)> gHostSaveStats{};
+
+struct HostSavePlan {
+  HostSaveReason reason = HostSaveReason::kNoSave;
+  int first = 0;          ///< first saved GPR when transformed
+  uint32_t address = 0;   ///< instruction that decided a refusal
+};
+
+// The bytes a load or store touches, by mnemonic (b/h/w/d, f s/d, vectors).
+int64_t AccessSize(std::string_view name) {
+  if (name.starts_with("lv") || name.starts_with("stv"))
+    return 16;
+  const std::string_view rest = name.substr(name.starts_with("st") ? 2 : 1);
+  if (rest.empty())
+    return 8;
+  switch (rest[0]) {
+    case 'b': return 1;
+    case 'h': return 2;
+    case 'w': return 4;
+    case 'd': return 8;
+    case 'f':
+      return rest.size() > 1 && (rest[1] == 's' || rest[1] == 'i') ? 4 : 8;
+    default: return 8;
+  }
+}
+
+// Mnemonics whose first operand is not a GPR destination.
+bool FirstOperandNotGprDest(std::string_view name) {
+  static constexpr std::string_view kPrefixes[] = {
+      "st", "cmp", "b", "f", "v", "tw", "td", "mt", "dcb", "icb", "sync", "lwsync", "isync",
+      "eieio", "ptesync", "nop", "cr", "mc", "sc", "db", "lf", "lv", "mffs", "mfvscr", "dss",
+      "dst", "attn", "trap", "tlb", "slb"};
+  for (std::string_view prefix : kPrefixes)
+    if (name.starts_with(prefix))
+      return true;
+  return false;
+}
+
+// X-form integer operations whose third operand is a source register.
+bool ThirdOperandIsGpr(std::string_view name) {
+  while (!name.empty() && (name.back() == '.' || name.back() == 'o'))
+    name.remove_suffix(1);
+  static constexpr std::string_view kNames[] = {
+      "add",  "addc", "adde", "subf", "subfc", "subfe", "and",   "andc", "or",
+      "orc",  "xor",  "nor",  "nand", "eqv",   "slw",   "srw",   "sraw", "sld",
+      "srd",  "srad", "mullw", "mulhw", "mulhwu", "divw", "divwu", "mulld", "mulhd",
+      "mulhdu", "divd", "divdu"};
+  return std::find(std::begin(kNames), std::end(kNames), name) != std::end(kNames);
+}
+
+HostSavePlan ScanHostLocalSaves(const FunctionNode& fn, const EmitContext& ctx) {
+  using R = HostSaveReason;
+  const auto& cfg = ctx.config;
+  struct Word {
+    uint32_t address;
+    uint32_t raw;
+    const uint8_t* data;
+  };
+  std::vector<Word> words;
+  for (const auto& block : fn.blocks()) {
+    const uint8_t* data = ctx.binary.translate(block.base);
+    if (!data)
+      continue;
+    for (uint32_t address = block.base; address < block.end(); address += 4) {
+      const uint8_t* at = data + (address - block.base);
+      words.push_back({address, load_and_swap<uint32_t>(at), at});
+    }
+  }
+  auto calleeName = [&](uint32_t target) -> std::string_view {
+    const FunctionNode* callee = ctx.graph.getFunction(target);
+    return callee ? std::string_view(callee->name()) : std::string_view{};
+  };
+  auto branchTarget = [](const Word& w) {
+    return PPC_OP(w.raw) == PPC_OP_B ? w.address + PPC_BI(w.raw) : w.address + PPC_BD(w.raw);
+  };
+
+  // The prologue's save call.
+  size_t saveIndex = 0;
+  int first = -1;
+  int saves = 0;
+  for (size_t i = 0; i < words.size(); ++i) {
+    const uint32_t op = PPC_OP(words[i].raw);
+    if (op != PPC_OP_B || !PPC_BL(words[i].raw))
+      continue;
+    const int n = SaveRestoreHelperFirstRegister(calleeName(branchTarget(words[i])), "__savegprlr_");
+    if (n < 0)
+      continue;
+    if (saves++ == 0) {
+      saveIndex = i;
+      first = n;
+    }
+  }
+  if (saves == 0)
+    return {R::kNoSave};
+  const uint32_t saveAddress = words[saveIndex].address;
+  if (saves > 1)
+    return {R::kMultipleSaves, 0, saveAddress};
+  if (std::binary_search(cfg.hostLocalRegisterSavesKeep.begin(),
+                         cfg.hostLocalRegisterSavesKeep.end(), static_cast<uint32_t>(fn.base())))
+    return {R::kKeepList, 0, saveAddress};
+  if (cfg.nonVolatileRegistersAsLocalVariables)
+    return {R::kLocalized, 0, saveAddress};
+  if (cfg.interiorResume)
+    return {R::kInteriorResume, 0, saveAddress};
+  if (fn.sharesRegisters())
+    return {R::kSharesRegisters, 0, saveAddress};
+  if (fn.hasExceptionInfo())
+    return {R::kExceptionInfo, 0, saveAddress};
+
+  // Labels: internal branch targets and switch cases.
+  std::unordered_set<uint32_t> labels;
+  std::unordered_set<uint32_t> switchBctrs;
+  for (const auto& jt : fn.jumpTables()) {
+    switchBctrs.insert(jt.bctrAddress);
+    labels.insert(jt.targets.begin(), jt.targets.end());
+  }
+  for (const Word& w : words) {
+    if (cfg.midAsmHooks.count(w.address))
+      return {R::kMidAsmHook, 0, w.address};
+    const uint32_t op = PPC_OP(w.raw);
+    if ((op == PPC_OP_B || op == PPC_OP_BC) && fn.containsAddress(branchTarget(w)) &&
+        !(PPC_BL(w.raw) && branchTarget(w) == fn.base()))
+      labels.insert(branchTarget(w));
+    auto st = cfg.switchTables.find(w.address);
+    if (st != cfg.switchTables.end()) {
+      switchBctrs.insert(w.address);
+      labels.insert(st->second.targets.begin(), st->second.targets.end());
+    }
+    if (op == PPC_OP_CTR && PPC_XOP(w.raw) == 528 && !PPC_BL(w.raw) &&
+        !switchBctrs.count(w.address)) {
+      FunctionScanner scanner(ctx.binary);
+      if (auto jt = scanner.detect_jump_table(w.address)) {
+        switchBctrs.insert(w.address);
+        labels.insert(jt->targets.begin(), jt->targets.end());
+      }
+    }
+  }
+
+  // The GPR save area relative to the entry stack pointer; the LR slot at -8
+  // stays written and is not part of it.
+  const int64_t dangerHi = -8;
+  const int64_t dangerLo = dangerHi - 8 * (32 - first);
+  auto overlapsArea = [&](int64_t lo, int64_t hi) { return lo < dangerHi && hi > dangerLo; };
+
+  int64_t spOff = 0;  // r1 minus the entry stack pointer
+  std::optional<int64_t> bodyOff;
+  bool saved = false;
+  bool controlFlowSeen = false;  // a label or internal branch since entry
+  std::unordered_map<uint32_t, int64_t> spRel;  // GPR -> entry-relative stack address
+  std::unordered_map<uint32_t, int64_t> konst;  // GPR -> known constant
+  auto regOff = [&](uint32_t reg) -> std::optional<int64_t> {
+    if (reg == 1)
+      return spOff;
+    auto it = spRel.find(reg);
+    return it == spRel.end() ? std::nullopt : std::optional<int64_t>(it->second);
+  };
+  auto forget = [&](uint32_t reg) {
+    spRel.erase(reg);
+    konst.erase(reg);
+  };
+  auto clobberVolatiles = [&]() {
+    for (auto* map : {&spRel, &konst})
+      for (auto it = map->begin(); it != map->end();)
+        it = it->first < 14 ? map->erase(it) : std::next(it);
+  };
+  auto checkRestore = [&](int n, uint32_t address) -> std::optional<HostSavePlan> {
+    if (!saved)
+      return HostSavePlan{R::kSaveNotAtEntry, 0, address};
+    if (n < first)
+      return HostSavePlan{R::kRestoreWider, 0, address};
+    if (spOff != 0)
+      return HostSavePlan{R::kRestoreFrame, 0, address};
+    return std::nullopt;
+  };
+  // A pointer into the area refuses the function. One at its lower edge is
+  // the frame pointer the FPR and VMX helpers take in r12 (they store below).
+  auto pointerOk = [&](uint32_t rd, int64_t value) {
+    if (value > dangerLo && value < dangerHi)
+      return false;
+    return value != dangerLo || rd == 12;
+  };
+
+  ppc_insn insn;
+  for (size_t i = 0; i < words.size(); ++i) {
+    const Word& w = words[i];
+    if (labels.count(w.address)) {
+      controlFlowSeen = true;
+      spRel.clear();
+      konst.clear();
+      if (bodyOff)
+        spOff = *bodyOff;
+    }
+    Disassemble(w.data, 4, w.address, insn);
+    if (!insn.opcode) {
+      if (w.raw != 0)
+        return {R::kUndecoded, 0, w.address};
+      continue;
+    }
+    const std::string_view name = insn.opcode->name;
+    const auto& ops = insn.operands;
+    const uint32_t op = PPC_OP(w.raw);
+
+    // --- Branches ---
+    if (op == PPC_OP_B || op == PPC_OP_BC) {
+      const uint32_t target = branchTarget(w);
+      const bool linked = PPC_BL(w.raw);
+      if (fn.containsAddress(target) && !(linked && target == fn.base())) {
+        if (!saved)
+          return {R::kSaveNotAtEntry, 0, w.address};
+        controlFlowSeen = true;
+        continue;
+      }
+      const std::string_view callee = calleeName(target);
+      if (linked) {
+        if (i == saveIndex) {
+          if (controlFlowSeen || spOff != 0)
+            return {R::kSaveNotAtEntry, 0, w.address};
+          saved = true;
+        } else if (const int n = SaveRestoreHelperFirstRegister(callee, "__restgprlr_"); n >= 0) {
+          if (auto refusal = checkRestore(n, w.address))
+            return *refusal;
+        } else if ((cfg.longJmpAddress && target == cfg.longJmpAddress) ||
+                   (cfg.setJmpAddress && target == cfg.setJmpAddress)) {
+          return {R::kSetJmp, 0, w.address};
+        }
+        clobberVolatiles();
+        continue;
+      }
+      if (const int n = SaveRestoreHelperFirstRegister(callee, "__restgprlr_"); n >= 0) {
+        if (auto refusal = checkRestore(n, w.address))
+          return *refusal;
+        continue;
+      }
+      return {R::kTailBranch, 0, w.address};
+    }
+    if (op == PPC_OP_CTR) {
+      const uint32_t xop = PPC_XOP(w.raw);
+      if (xop == 528) {  // bcctr
+        if (PPC_BL(w.raw)) {
+          clobberVolatiles();
+          continue;
+        }
+        if (!switchBctrs.count(w.address))
+          return {R::kIndirectBranch, 0, w.address};
+        if (!saved)
+          return {R::kSaveNotAtEntry, 0, w.address};
+        controlFlowSeen = true;
+        continue;
+      }
+      if (xop == 16) {  // bclr: a return, or blrl, a call through LR
+        if (PPC_BL(w.raw))
+          clobberVolatiles();
+        continue;
+      }
+    }
+
+    // --- Loads, stores and cache operations ---
+    const bool isStore = name.starts_with("st");
+    const bool isCache = name.starts_with("dcb") || name.starts_with("icb");
+    const bool isLoad = name.starts_with("l") && !name.starts_with("li") &&
+                        !name.starts_with("lvsl") && !name.starts_with("lvsr");
+    if (isLoad || isStore || isCache) {
+      bool indexed = isCache || name.find('x') != std::string_view::npos;
+      uint32_t ra = 0, rb = 0;
+      int64_t disp = 0;
+      if (isCache) {
+        ra = ops[0];
+        rb = ops[1];
+      } else if (indexed) {
+        ra = ops[1];
+        rb = ops[2];
+      } else {
+        ra = ops[2];
+        disp = static_cast<int32_t>(ops[1]);
+      }
+      const bool update = !isCache && (name.ends_with("u") || name.ends_with("ux"));
+      const bool gprData = !isCache && !name.starts_with("lf") && !name.starts_with("stf") &&
+                           !name.starts_with("lv") && !name.starts_with("stv");
+
+      // The prologue's frame allocation and its back chain.
+      if (name == "stwu" && ops[0] == 1 && ra == 1) {
+        if (bodyOff)
+          return {R::kDynamicFrame, 0, w.address};
+        bodyOff = spOff + disp;
+        spOff = *bodyOff;
+        continue;
+      }
+      if (update && ra == 1)
+        return {R::kDynamicFrame, 0, w.address};
+      if (isStore && gprData && ops[0] == 1)
+        return {R::kSpStored, 0, w.address};
+
+      std::optional<int64_t> e;
+      if (indexed) {
+        const std::optional<int64_t> a = ra == 0 ? std::nullopt : regOff(ra);
+        const std::optional<int64_t> b = regOff(rb);
+        if (a && b)
+          return {R::kSpArithmetic, 0, w.address};
+        if (a || b) {
+          const uint32_t other = a ? rb : ra;
+          int64_t k = 0;
+          if (other != 0 || a) {
+            auto it = konst.find(other);
+            if (it == konst.end())
+              return {R::kSpIndexedUnknown, 0, w.address};
+            k = it->second;
+          }
+          e = (a ? *a : *b) + k;
+        }
+      } else if (ra != 0) {
+        e = regOff(ra);
+        if (e)
+          *e += disp;
+      }
+      if (e) {
+        int64_t lo = *e;
+        int64_t hi = lo + AccessSize(name);
+        if (name.starts_with("lmw") || name.starts_with("stmw"))
+          hi = lo + 4 * (32 - static_cast<int64_t>(ops[0]));
+        if (name.starts_with("lv") || name.starts_with("stv")) {
+          lo &= ~int64_t{15};
+          hi = lo + 16;
+        }
+        if (isCache) {
+          lo &= ~int64_t{127};
+          hi = lo + 128;
+        }
+        if (overlapsArea(lo, hi))
+          return {R::kSaveSlotAccess, 0, w.address};
+      }
+
+      if (isLoad && gprData) {
+        const uint32_t rd = ops[0];
+        if (name.starts_with("lmw")) {
+          if (rd <= 1)
+            return {R::kR1Write, 0, w.address};
+          for (uint32_t r = rd; r < 32; ++r)
+            forget(r);
+        } else if (rd == 1) {
+          // The back chain reload: r1 takes the entry stack pointer back.
+          if (name == "lwz" && ra == 1 && disp == 0 && bodyOff && spOff == *bodyOff)
+            spOff = 0;
+          else
+            return {R::kR1Write, 0, w.address};
+        } else {
+          forget(rd);
+        }
+      }
+      if (update)
+        forget(ra);
+      continue;
+    }
+
+    // --- Integer operations on r1 and the registers derived from it ---
+    if (name == "addi" || name == "mr") {
+      const uint32_t rd = ops[0];
+      const uint32_t ra = ops[1];
+      const int64_t imm = name == "addi" ? static_cast<int32_t>(ops[2]) : 0;
+      if (rd == 1) {
+        if (name == "addi" && ra == 1 && bodyOff && spOff == *bodyOff && spOff + imm == 0) {
+          spOff = 0;
+          continue;
+        }
+        return {R::kR1Write, 0, w.address};
+      }
+      if (auto a = regOff(ra)) {
+        const int64_t value = *a + imm;
+        if (!pointerOk(rd, value))
+          return {R::kSaveAreaAddress, 0, w.address};
+        konst.erase(rd);
+        spRel[rd] = value;
+        continue;
+      }
+      auto k = konst.find(ra);
+      const std::optional<int64_t> known =
+          k == konst.end() ? std::nullopt : std::optional<int64_t>(k->second + imm);
+      forget(rd);
+      if (known)
+        konst[rd] = *known;
+      continue;
+    }
+    if (name == "li" || name == "lis") {
+      const uint32_t rd = ops[0];
+      if (rd == 1)
+        return {R::kR1Write, 0, w.address};
+      forget(rd);
+      const int64_t imm = static_cast<int32_t>(ops[1]);
+      konst[rd] = name == "li" ? imm : static_cast<int64_t>(static_cast<int32_t>(
+                                           static_cast<uint32_t>(imm) << 16));
+      continue;
+    }
+    if (FirstOperandNotGprDest(name))
+      continue;
+    const uint32_t rd = ops[0];
+    if (rd == 1)
+      return {R::kR1Write, 0, w.address};
+    if (!name.starts_with("mf") && (ops[1] == 1 || spRel.count(ops[1])))
+      return {R::kSpArithmetic, 0, w.address};
+    if (ThirdOperandIsGpr(name) && (ops[2] == 1 || spRel.count(ops[2])))
+      return {R::kSpArithmetic, 0, w.address};
+    forget(rd);
+  }
+
+  // A split function that falls through into the next entry continues in
+  // another function on this frame (emitCpp's fall-through tail call).
+  if (!fn.blocks().empty() && fn.blocks().back().end() == fn.end()) {
+    const auto* next = ctx.graph.getFunction(fn.end());
+    const auto* last = ctx.binary.translate(fn.end() - 4);
+    if (next && next != &fn && last) {
+      const uint32_t raw = load_and_swap<uint32_t>(last);
+      const uint32_t op = PPC_OP(raw);
+      if (!((op == PPC_OP_B || op == PPC_OP_CTR) && !PPC_BL(raw)))
+        return {R::kFallthrough, 0, fn.end() - 4};
+    }
+  }
+  if (!saved)
+    return {R::kSaveNotAtEntry, 0, saveAddress};
+  return {R::kTransformed, first, saveAddress};
+}
+
 }  // namespace
+
+void LogHostLocalSaveStats() {
+  uint64_t total = 0;
+  for (size_t i = 0; i < gHostSaveStats.size(); ++i)
+    if (i != static_cast<size_t>(HostSaveReason::kNoSave))
+      total += gHostSaveStats[i].load();
+  REXCODEGEN_INFO("host_local_register_saves: {} of {} functions with a __savegprlr_N prologue "
+                  "keep rN-r31 in host locals",
+                  gHostSaveStats[static_cast<size_t>(HostSaveReason::kTransformed)].load(), total);
+  for (size_t i = 0; i < gHostSaveStats.size(); ++i) {
+    const uint64_t count = gHostSaveStats[i].load();
+    if (count && i != static_cast<size_t>(HostSaveReason::kNoSave) &&
+        i != static_cast<size_t>(HostSaveReason::kTransformed))
+      REXCODEGEN_INFO("host_local_register_saves:   kept {} ({})", count, kHostSaveReasonNames[i]);
+  }
+}
 
 std::vector<uint32_t> FunctionNode::resumableReturnAddresses(const BinaryView& binary) const {
   std::vector<uint32_t> addresses;
@@ -984,6 +1472,21 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     }
   };
   RecompilerLocalVariables localVariables;
+
+  // host_local_register_saves: keep the prologue's saved GPRs in host locals
+  // when the save-area scan finds nothing else that needs the stack slots.
+  if (ctx.config.hostLocalRegisterSaves && !name_.starts_with("__")) {
+    const HostSavePlan plan = ScanHostLocalSaves(*this, ctx);
+    if (plan.reason != HostSaveReason::kNoSave && ctx.namePrefix.empty()) {
+      gHostSaveStats[static_cast<size_t>(plan.reason)]++;
+      if (plan.reason != HostSaveReason::kTransformed)
+        REXCODEGEN_DEBUG("host_local_register_saves: 0x{:08X} keeps the helpers ({} at 0x{:08X})",
+                         base(), kHostSaveReasonNames[static_cast<size_t>(plan.reason)],
+                         plan.address);
+    }
+    if (plan.reason == HostSaveReason::kTransformed)
+      localVariables.hostSaveFirst = static_cast<uint8_t>(plan.first);
+  }
 
   // Local map for late-detected jump tables (can't mutate const config)
   std::unordered_map<uint32_t, JumpTable> lateJumpTables;
@@ -1340,6 +1843,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(out, "\tPPCVRegister vTemp{{}};");
   if (localVariables.ea)
     emit_println(out, "\tuint32_t ea{{}};");
+  for (int i = localVariables.hostSaveFirst ? localVariables.hostSaveFirst : 32; i < 32; ++i)
+    emit_println(out, "\tuint64_t rex_save_r{}{{}};", i);
 
   // If SEH, emit SEH_TRY and indent body
   if (generateSeh) {

@@ -129,6 +129,17 @@ struct RecompilerConfig {
   /// into a read-only section (.rdata) with the literal value. The folded
   /// ranges are hashed and checked against the loaded image at start.
   bool foldRodataLoads = false;
+  /// Replace a function's prologue `bl __savegprlr_N` and its `__restgprlr_N`
+  /// epilogues with copies of rN-r31 in host locals: ctx is write-through, so
+  /// the copy at entry and the copy back at each restore give the caller the
+  /// same registers without the guest stack slots. The LR slot store and its
+  /// reload stay. Only functions the save-area scan proves never touch the
+  /// slots otherwise (no slot loads or stores, no dynamic frame, no tail
+  /// branch, no exception info, no hook) are changed; the rest keep the calls.
+  bool hostLocalRegisterSaves = false;
+  /// Functions that keep the helper calls with host_local_register_saves on
+  /// (a host or hook reader of their save slots).
+  std::vector<uint32_t> hostLocalRegisterSavesKeep;
   /// Emit `#line <guest offset> "<project>.guest"` before each instruction's
   /// code, so debug line tables (and sample profiles built from them) name
   /// guest addresses and survive changes to the generated C++.

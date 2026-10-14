@@ -206,5 +206,7 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // global critical region. mfmsr reports this thread's state without locking.
 #define REX_CHECK_GLOBAL_LOCK() rex::thread::global_critical_region::GuestCheck()
 #define REX_ENTER_GLOBAL_LOCK() rex::thread::global_critical_region::GuestEnter()
+#define REX_ENTER_GLOBAL_LOCK_RESERVATION() \
+  rex::thread::global_critical_region::GuestEnterReservation()
 #define REX_LEAVE_GLOBAL_LOCK() rex::thread::global_critical_region::GuestLeave()
 

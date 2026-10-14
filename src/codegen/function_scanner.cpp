@@ -201,6 +201,19 @@ enum class JumpTableType : u8 {
   kShortOffset,  // lhzx + add - 16-bit offset added to base
 };
 
+// The size of one table entry: absolute tables hold 32-bit targets, offset
+// tables bytes or halfwords.
+static uint8_t JumpTableEntryBytes(JumpTableType type) {
+  switch (type) {
+    case JumpTableType::kAbsolute:
+      return 4;
+    case JumpTableType::kShortOffset:
+      return 2;
+    default:
+      return 1;
+  }
+}
+
 // Helper struct for tracking pattern match state
 struct JumpTableMatch {
   JumpTableType type = JumpTableType::kAbsolute;
@@ -837,6 +850,7 @@ std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_ad
   jt.bctrAddress = static_cast<uint32_t>(bctr_address);
   jt.tableAddress = static_cast<uint32_t>(table_address);
   jt.indexRegister = match.index_reg;
+  jt.entryBytes = JumpTableEntryBytes(match.type);
   jt.targets = std::move(targets);
 
   return jt;
@@ -1694,6 +1708,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   jt.bctrAddress = bctrAddr;
   jt.tableAddress = tableAddr;
   jt.indexRegister = finalIndexReg;
+  jt.entryBytes = JumpTableEntryBytes(tableType);
 
   REXCODEGEN_TRACE(
       "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={}",

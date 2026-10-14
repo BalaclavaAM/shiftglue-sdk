@@ -16,6 +16,14 @@
 #define REX_PROFILE_INDIRECT_DISPATCH()
 #endif
 
+// Only functions with interior resume entries read ctx.dispatch_address, so
+// without interior_resume an indirect call does not publish its target.
+#ifdef REX_CONFIG_INTERIOR_RESUME
+#define REX_SET_DISPATCH_ADDRESS(x) (ctx.dispatch_address = (x))
+#else
+#define REX_SET_DISPATCH_ADDRESS(x) ((void)0)
+#endif
+
 #define REX_LOOKUP_FUNC(x, y) \
   (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
 
@@ -34,7 +42,7 @@
       ctx.last_indirect_target = rex_indirect_target_;                                     \
       rex_indirect_func_ = rex::runtime::ResolveIndirectFunction(rex_indirect_target_);    \
     }                                                                                      \
-    ctx.dispatch_address = rex_indirect_target_;                                           \
+    REX_SET_DISPATCH_ADDRESS(rex_indirect_target_);                                        \
     rex_indirect_func_(ctx, base);                                                         \
-    ctx.dispatch_address = 0;                                                              \
+    REX_SET_DISPATCH_ADDRESS(0);                                                           \
   } while (0)

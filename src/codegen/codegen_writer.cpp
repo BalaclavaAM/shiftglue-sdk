@@ -332,6 +332,7 @@ bool CodegenWriter::write(bool force) {
   referenceConfig.nonVolatileRegistersAsLocalVariables = false;
   referenceConfig.skipLr = false;
   referenceConfig.foldRodataLoads = false;
+  referenceConfig.hostLocalRegisterSaves = false;
   referenceConfig.directCallsBypassThunk = false;
   referenceConfig.callProbes = false;
   referenceConfig.abiPoisonChecks = false;
@@ -381,6 +382,8 @@ bool CodegenWriter::write(bool force) {
   }
   emitCtx.referenced = nullptr;
   emitCtx.foldedRanges = nullptr;
+  if (config().hostLocalRegisterSaves)
+    rex::codegen::LogHostLocalSaveStats();
 
   // The reference functions, for the host verifier: one macro line each.
   {
@@ -416,6 +419,20 @@ bool CodegenWriter::write(bool force) {
     println("	{{ 0, 0 }}");
     println("}};");
     println("const uint64_t PPCFoldedHash = 0x{:016X}ull;", hash);
+    std::map<uint32_t, uint32_t> jumpTables;
+    for (const auto* fn : functions) {
+      for (const auto& jt : fn->jumpTables()) {
+        if (!jt.tableAddress || jt.targets.empty())
+          continue;
+        auto& size = jumpTables[jt.tableAddress];
+        size = std::max<uint32_t>(size, uint32_t(jt.targets.size()) * jt.entryBytes);
+      }
+    }
+    println("const PPCFoldedRange PPCJumpTableRanges[] = {{");
+    for (const auto& [address, size] : jumpTables)
+      println("	{{ 0x{:08X}, {} }},", address, size);
+    println("	{{ 0, 0 }}");
+    println("}};");
     SaveCurrentOutData(fmt::format("{}_folds.cpp", projectName));
     REXCODEGEN_TRACE("Folded {} read-only ranges ({} bytes) into literals", foldedRanges.size(),
                      bytes);

@@ -131,6 +131,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("direct_calls_bypass_thunk"), "direct_calls_bypass_thunk");
   MergeBool(cfg.foldRodataLoads, toml["fold_rodata_loads"].value_or(false),
             hasBool("fold_rodata_loads"), "fold_rodata_loads");
+  MergeBool(cfg.hostLocalRegisterSaves, toml["host_local_register_saves"].value_or(false),
+            hasBool("host_local_register_saves"), "host_local_register_saves");
+  if (auto keep = toml["host_local_register_saves_keep"].as_array()) {
+    for (const auto& elem : *keep) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostLocalRegisterSavesKeep.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   MergeBool(cfg.guestLineDirectives, toml["guest_line_directives"].value_or(false),
             hasBool("guest_line_directives"), "guest_line_directives");
   MergeBool(cfg.disassemblyComments, toml["disassembly_comments"].value_or(true),
@@ -509,6 +517,12 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     cfg.hostOverriddenFunctions.erase(
         std::unique(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end()),
         cfg.hostOverriddenFunctions.end());
+  }
+  if (!cfg.hostLocalRegisterSavesKeep.empty()) {
+    std::sort(cfg.hostLocalRegisterSavesKeep.begin(), cfg.hostLocalRegisterSavesKeep.end());
+    cfg.hostLocalRegisterSavesKeep.erase(
+        std::unique(cfg.hostLocalRegisterSavesKeep.begin(), cfg.hostLocalRegisterSavesKeep.end()),
+        cfg.hostLocalRegisterSavesKeep.end());
   }
   if (!cfg.exceptionHandlerFuncHints.empty()) {
     std::sort(cfg.exceptionHandlerFuncHints.begin(), cfg.exceptionHandlerFuncHints.end());

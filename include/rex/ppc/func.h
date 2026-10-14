@@ -65,3 +65,7 @@ struct PPCFoldedRange {
 };
 extern const PPCFoldedRange PPCFoldedRanges[];  // terminated by {0, 0}
 extern const uint64_t PPCFoldedHash;
+// The switch jump tables the generated code still loads from guest memory,
+// which sit inside the code section (terminated by {0, 0}). Code that takes
+// access from the translated code bytes must keep these readable.
+extern const PPCFoldedRange PPCJumpTableRanges[];
