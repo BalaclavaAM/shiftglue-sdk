@@ -107,6 +107,7 @@ class SharedMemory {
   const UploadStats& upload_stats(UploadKind kind) const {
     return upload_stats_[size_t(kind)];
   }
+  UploadKind upload_kind() const { return upload_kind_; }
 
   // Command-processor thread only. Copy CPU-authoritative bytes, rejecting any
   // GPU-written page and leaving destination unchanged on rejection. Callers

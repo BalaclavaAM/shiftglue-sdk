@@ -75,6 +75,11 @@ REXCVAR_DEFINE_INT32(fh1_debug_untile, 0, "GPU",
                      "fh1_untile_predicated_tiling diagnostics: 1 keeps the first tile's "
                      "predication, 2 draws the later tiles too")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_untile_early_skip, true, "GPU",
+                    "fh1_untile_predicated_tiling: drop a later tile's draw at the start of "
+                    "IssueDraw instead of after its shaders, primitives, samplers and textures "
+                    "were set up (NN-2.1)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_untile_height, 720, "GPU",
                      "The screen height in guest pixels the untiled first tile renders "
                      "(fh1_untile_predicated_tiling)")
@@ -4470,6 +4475,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     }
     in_render_pass_ = false;
   }
+  PERF_counter_inc(kGpuRenderings);
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
@@ -4544,6 +4550,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     }
     in_render_pass_ = false;
   }
+  PERF_counter_inc(kGpuRenderings);
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
@@ -4622,6 +4629,7 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   }
   EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  PERF_counter_inc(kGpuRenderings);
   const char* const next_rendering_label = next_rendering_label_;
   next_rendering_label_ = nullptr;
   if (debug_labels_) {
@@ -5167,6 +5175,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     return IssueCopy();
+  }
+
+  // A later tile's draw under fh1_untile_predicated_tiling is dropped further
+  // down anyway (the first tile drew its objects over the whole height); the
+  // setup between here and there only fed the skipped draw.
+  if (untile_tiling_ && REXCVAR_GET(fh1_untile_early_skip) &&
+      regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset && TilingPassOfSelect() != 0 &&
+      !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+    fh1_native_executor_->CountEvent("untile_skipped_draw");
+    PERF_counter_inc(kFh1UntileSkippedDraws);
+    ++untile_skipped_draws_;
+    return true;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -6048,6 +6068,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      SharedMemory::UploadKindScope upload_kind(*shared_memory_, SharedMemory::UploadKind::kVertex);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "

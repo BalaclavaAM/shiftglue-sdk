@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -22,10 +23,16 @@
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(vulkan_sparse_shared_memory_turnip, 1, "GPU/Vulkan",
+                      "Sparse shared memory on Turnip: 0 never, 1 on the Adreno 740 only "
+                      "(checked with Turnip gen8-v37, NN-6.1), 2 on every Adreno")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
@@ -64,9 +71,25 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
   // Turnip (Mesa, loaded on Android through android_gpu_driver) advertises
-  // sparse residency, but resolves written into the sparse buffer read back
-  // as zeros on the Adreno 740, so the whole frame came out black.
-  const bool sparse_broken = vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP;
+  // sparse residency. With an older Turnip, resolves written into the sparse
+  // buffer read back as zeros on the Adreno 740, so the whole frame came out
+  // black; with the bundled gen8-v37 the Odin 2 (Adreno 740) race renders as
+  // with a dense buffer and its device memory falls by 290 MB (NN-6.1). Other
+  // Adrenos have not been checked, so they keep the dense buffer by default.
+  bool sparse_broken = false;
+  if (vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP) {
+    switch (REXCVAR_GET(vulkan_sparse_shared_memory_turnip)) {
+      case 0:
+        sparse_broken = true;
+        break;
+      case 1:
+        sparse_broken = std::string_view(vulkan_device->properties().deviceName).find("740") ==
+                        std::string_view::npos;
+        break;
+      default:
+        break;
+    }
+  }
   if (sparse_broken && REXCVAR_GET(vulkan_sparse_shared_memory)) {
     REXGPU_INFO("Shared memory: not using sparse residency on Turnip");
   }
@@ -281,6 +304,23 @@ bool VulkanSharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
     return true;
+  }
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+    PERF_counter_add(kGpuUploadBytes, int64_t(upload_range.second) << page_size_log2());
+  }
+  // An upload while a rendering is open ends it: count it by what it was for.
+  if (command_processor_.in_render_pass()) {
+    switch (upload_kind()) {
+      case UploadKind::kIndex:
+        PERF_counter_inc(kGpuUploadSplitsIndex);
+        break;
+      case UploadKind::kTexture:
+        PERF_counter_inc(kGpuUploadSplitsTexture);
+        break;
+      default:
+        PERF_counter_inc(kGpuUploadSplitsVertex);
+        break;
+    }
   }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
