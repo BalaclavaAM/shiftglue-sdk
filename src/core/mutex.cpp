@@ -38,6 +38,10 @@ REXCVAR_DEFINE_INT32(critical_region_hold_log_ms, 0, "Diagnostics",
                      "recompiled guest sections with the function that entered them, and "
                      "on Android any holder's thread id; 0 logs none")
     .range(0, 100000);
+REXCVAR_DEFINE_BOOL(guest_reservation_sections_unlocked, true, "Kernel",
+                    "Run interrupts-off guest sections that hold only one load-reserve/"
+                    "store-conditional pair without the global critical region (NN-3.1)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::thread {
 namespace {
@@ -130,6 +134,9 @@ void HoldWatchdog(int32_t log_ms) {
 }  // namespace
 #endif
 
+int32_t global_critical_region::guest_hold_log_ms_ = -1;
+std::atomic<bool> global_critical_region::reservation_sections_unlocked_{true};
+
 void global_critical_region::GuestHoldLogInit() {
   static std::once_flag once;
   std::call_once(once, [] {
@@ -138,7 +145,18 @@ void global_critical_region::GuestHoldLogInit() {
     if (log_ms > 0) std::thread(HoldWatchdog, log_ms).detach();
 #endif
     guest_hold_log_ms_ = log_ms;
+    reservation_sections_unlocked_.store(REXCVAR_GET(guest_reservation_sections_unlocked),
+                                         std::memory_order_relaxed);
+    rex::cvar::RegisterChangeCallback(
+        "guest_reservation_sections_unlocked", [](std::string_view, std::string_view) {
+          reservation_sections_unlocked_.store(REXCVAR_GET(guest_reservation_sections_unlocked),
+                                               std::memory_order_relaxed);
+        });
   });
+}
+
+void global_critical_region::CountReservationSection() {
+  PERF_counter_inc(kCriticalRegionUnlockedSections);
 }
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -154,6 +172,9 @@ void global_critical_region::GuestHoldBegin() {
 }
 
 void global_critical_region::GuestHoldEnd() {
+  if (!guest_hold_start_ns_) {
+    return;
+  }
   const int64_t held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count() -

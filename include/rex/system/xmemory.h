@@ -411,6 +411,13 @@ class Memory {
   // Resets all memory to zero and resets all allocations.
   void Reset();
 
+  // Takes all access from a range of the executable image (0x80000000-
+  // 0x8FFFFFFF and its 0x90000000 alias) that nothing reads after load, such
+  // as the guest code the recompiler replaced; with release, also frees its
+  // pages (a hole in the backing file). A later access faults. POSIX only;
+  // returns false elsewhere or for a range outside the image heaps.
+  bool RetireImageRange(uint32_t address, uint32_t size, bool release);
+
   // Full file name and path of the memory-mapped file backing all memory.
   const std::filesystem::path& file_name() const { return file_name_; }
 

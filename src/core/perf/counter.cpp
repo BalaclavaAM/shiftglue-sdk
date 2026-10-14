@@ -22,7 +22,9 @@
 #include <functional>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 #if REX_PLATFORM_WIN32
 #include <share.h>
 #include <windows.h>
@@ -38,6 +40,12 @@
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
                       "Path to write per-frame CSV log (empty = disabled)");
+REXCVAR_DEFINE_STRING(perf_thread_cpu, "", "Perf",
+                      "Up to eight thread-name prefixes separated by semicolons (for example "
+                      "'Guest 825A6320;GPU Submission'): the CSV's thread_cpu_slotN_ns column "
+                      "is the CPU time this frame of the threads whose name starts with prefix "
+                      "N (Linux and Android)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(perf_log_max_mb, 0, "Perf",
                     "Stop CSV recording at this size (0 = unlimited)");
 REXCVAR_DEFINE_BOOL(perf_critical_path_trace, false, "Perf",
@@ -246,6 +254,23 @@ constexpr const char* kCounterNames[] = {
     "load_alu_constant_dwords",
     "load_alu_constant_sources",
     "load_alu_constant_changed",
+    "thread_cpu_slot0_ns",
+    "thread_cpu_slot1_ns",
+    "thread_cpu_slot2_ns",
+    "thread_cpu_slot3_ns",
+    "thread_cpu_slot4_ns",
+    "thread_cpu_slot5_ns",
+    "thread_cpu_slot6_ns",
+    "thread_cpu_slot7_ns",
+    "write_watch_protect_ns",
+    "write_watch_slow_protects",
+    "xma_decoder_opens",
+    "critical_region_unlocked_sections",
+    "gpu_renderings",
+    "gpu_upload_splits_vertex",
+    "gpu_upload_splits_index",
+    "gpu_upload_splits_texture",
+    "gpu_upload_bytes",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -369,6 +394,23 @@ constexpr bool kIsGauge[] = {
     false,  // kLoadAluConstantDwords
     false,  // kLoadAluConstantSources
     false,  // kLoadAluConstantChanged
+    false,  // kThreadCpuSlot0Ns (set each frame)
+    false,  // kThreadCpuSlot1Ns
+    false,  // kThreadCpuSlot2Ns
+    false,  // kThreadCpuSlot3Ns
+    false,  // kThreadCpuSlot4Ns
+    false,  // kThreadCpuSlot5Ns
+    false,  // kThreadCpuSlot6Ns
+    false,  // kThreadCpuSlot7Ns
+    false,  // kWriteWatchProtectNs
+    false,  // kWriteWatchSlowProtects
+    false,  // kXmaDecoderOpens
+    false,  // kCriticalRegionUnlockedSections
+    false,  // kGpuRenderings
+    false,  // kGpuUploadSplitsVertex
+    false,  // kGpuUploadSplitsIndex
+    false,  // kGpuUploadSplitsTexture
+    false,  // kGpuUploadBytes
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -479,8 +521,91 @@ void InjectFrameCost() {
   worker->wake.notify_one();
 }
 
+// perf_thread_cpu: threads matched by name and the CPU time each had at the
+// last frame. Linux CPU clocks can be read for any thread of the process by
+// its id (MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)).
+namespace {
+constexpr size_t kThreadCpuSlots = 8;
+struct TrackedThread {
+  int64_t tid;
+  size_t slot;
+  int64_t last_ns;
+};
+std::mutex g_thread_cpu_mutex;
+std::vector<TrackedThread> g_thread_cpu_threads;
+
+std::vector<std::string> ThreadCpuPrefixes() {
+  std::vector<std::string> prefixes;
+  const std::string value = REXCVAR_GET(perf_thread_cpu);
+  size_t start = 0;
+  while (start <= value.size() && prefixes.size() < kThreadCpuSlots) {
+    const size_t end = value.find(';', start);
+    prefixes.push_back(value.substr(start, end == std::string::npos ? std::string::npos
+                                                                    : end - start));
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return prefixes;
+}
+
+int64_t ThreadCpuNs(int64_t tid) {
+#if REX_PLATFORM_LINUX
+  timespec time = {};
+  const clockid_t clock = clockid_t((~clockid_t(tid) << 3) | 6);
+  if (clock_gettime(clock, &time)) return -1;
+  return int64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
+#else
+  (void)tid;
+  return -1;
+#endif
+}
+
+void SampleThreadCpu() {
+  std::array<int64_t, kThreadCpuSlots> sums{};
+  {
+    std::lock_guard<std::mutex> lock(g_thread_cpu_mutex);
+    for (size_t i = 0; i < g_thread_cpu_threads.size();) {
+      TrackedThread& thread = g_thread_cpu_threads[i];
+      const int64_t now = ThreadCpuNs(thread.tid);
+      if (now < 0) {
+        // The thread exited.
+        g_thread_cpu_threads.erase(g_thread_cpu_threads.begin() + i);
+        continue;
+      }
+      if (thread.last_ns >= 0 && now >= thread.last_ns) sums[thread.slot] += now - thread.last_ns;
+      thread.last_ns = now;
+      ++i;
+    }
+  }
+  for (size_t slot = 0; slot < kThreadCpuSlots; ++slot) {
+    SetCounter(CounterId(size_t(CounterId::kThreadCpuSlot0Ns) + slot), sums[slot]);
+  }
+}
+}  // namespace
+
+void NoteNamedThread(int64_t tid, std::string_view name) {
+  // Parsed per call: threads are named rarely, some before the cvars load.
+  const std::vector<std::string> prefixes = ThreadCpuPrefixes();
+  if (prefixes.empty() || tid <= 0) return;
+  for (size_t slot = 0; slot < prefixes.size(); ++slot) {
+    const std::string& prefix = prefixes[slot];
+    if (prefix.empty() || name.substr(0, prefix.size()) != prefix) continue;
+    std::lock_guard<std::mutex> lock(g_thread_cpu_mutex);
+    for (TrackedThread& thread : g_thread_cpu_threads) {
+      if (thread.tid == tid) {
+        thread.slot = slot;
+        return;
+      }
+    }
+    g_thread_cpu_threads.push_back({tid, slot, ThreadCpuNs(tid)});
+    REXSYS_INFO("perf_thread_cpu: slot {} tracks thread {} '{}'", slot, tid, name);
+    return;
+  }
+}
+
 void ResetFrameCounters() {
   SetCounter(CounterId::kAaToggle, REXCVAR_GET(perf_aa_toggle));
+  SampleThreadCpu();
   {
     const int64_t now = ProcessCpuTimeNs();
     const int64_t last = g_last_process_cpu_ns.exchange(now, std::memory_order_relaxed);

@@ -216,12 +216,42 @@ enum class CounterId : uint16_t {
   kLoadAluConstantDwords,
   kLoadAluConstantSources,
   kLoadAluConstantChanged,
+  // CPU time this frame of the threads perf_thread_cpu names, one slot per
+  // name prefix, summed over the threads that match it (Linux and Android).
+  kThreadCpuSlot0Ns,
+  kThreadCpuSlot1Ns,
+  kThreadCpuSlot2Ns,
+  kThreadCpuSlot3Ns,
+  kThreadCpuSlot4Ns,
+  kThreadCpuSlot5Ns,
+  kThreadCpuSlot6Ns,
+  kThreadCpuSlot7Ns,
+  // Write-watch protection changes (NN-2.4): their time, and those over 2 ms.
+  kWriteWatchProtectNs,
+  kWriteWatchSlowProtects,
+  // XMA decoder opens (NN-4.1): each allocates and zero-fills a decoder state.
+  kXmaDecoderOpens,
+  // Single-reservation sections run without the global mutex (NN-3.1).
+  kCriticalRegionUnlockedSections,
+  // Vulkan renderings begun (all kinds), shared memory uploads that ended an
+  // open rendering by what they were for (vertex fetch and other, guest DMA
+  // index, texture), and upload bytes.
+  kGpuRenderings,
+  kGpuUploadSplitsVertex,
+  kGpuUploadSplitsIndex,
+  kGpuUploadSplitsTexture,
+  kGpuUploadBytes,
 
   kCount  // sentinel -- must be last
 };
 
 // Returns human-readable name for a counter (e.g. "frame_time_us")
 const char* CounterName(CounterId id);
+
+// A thread was given `name`: perf_thread_cpu may track its CPU time from now
+// on (a slot whose prefix the name starts with). `tid` is the kernel thread
+// id; ignored where per-thread CPU clocks are not readable by id.
+void NoteNamedThread(int64_t tid, std::string_view name);
 
 // Set a counter to an absolute value
 void SetCounter(CounterId id, int64_t value);

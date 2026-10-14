@@ -1198,6 +1198,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
       PinAndroidNamedThread(pthread_gettid_np(thread_), name);
+      rex::perf::NoteNamedThread(pthread_gettid_np(thread_), name);
+#elif REX_PLATFORM_LINUX
+      rex::perf::NoteNamedThread(tid_, name);
 #endif
     }
   }
@@ -2070,6 +2073,9 @@ void set_current_thread_name(const std::string_view name) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
   }
   PinAndroidNamedThread(gettid(), name);
+#endif
+#if REX_PLATFORM_LINUX
+  rex::perf::NoteNamedThread(int64_t(gettid()), name);
 #endif
 }
 

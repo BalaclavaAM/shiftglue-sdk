@@ -13,12 +13,14 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 
 #include <rex/platform/fpscr.h>
 #include <rex/ppc/func.h>
+#include <rex/runtime_api.h>
 #include <rex/types.h>
 
 #include <simde/x86/avx.h>
@@ -145,6 +147,12 @@ constexpr uint32_t kRoundUp = 0x02;
 constexpr uint32_t kRoundDown = 0x03;
 constexpr uint32_t kRoundMask = 0x03;
 
+// Fixed IEEE FP mode (NEAR_NATIVE_RESEARCH NN-1.1, cvar ppc_fixed_fp_mode):
+// guest code never turns on flush-to-zero, so VMX code keeps denormals instead
+// of flushing them as the console does, and the per-site host FP control
+// register writes are skipped. Read on the toggles' rare path only.
+extern REX_RUNTIME_DATA std::atomic<bool> g_fixed_fp_mode;
+
 struct FPSCRRegister {
   uint32_t csr;
 
@@ -178,18 +186,27 @@ struct FPSCRRegister {
     setcsr(csr);
   }
 
+  static bool FixedMode() noexcept { return g_fixed_fp_mode.load(std::memory_order_relaxed); }
+
   inline void enableFlushModeUnconditional() noexcept {
+    if (FixedMode()) return;
     csr |= FlushMask;
     setcsr(csr);
   }
 
+  // In fixed mode nothing sets flush-to-zero, so the cached csr is exact.
   inline void disableFlushModeUnconditional() noexcept {
+    if (FixedMode()) {
+      disableFlushMode();
+      return;
+    }
     csr &= ~FlushMask;
     setcsr(csr);
   }
 
   inline void enableFlushMode() noexcept {
     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+      if (FixedMode()) return;
       csr |= FlushMask;
       setcsr(csr);
     }

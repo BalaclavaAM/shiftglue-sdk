@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -25,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/context.h>
+#include <rex/platform.h>
 #include <rex/platform/exceptions.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
@@ -51,6 +53,23 @@ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(latency_critical_thread_placement, false, "Kernel",
                     "Run the main guest thread and the GPU command and vblank threads at "
                     "above-normal priority, on performance cores of hybrid CPUs");
+
+// ARM64 only by default: x86 cores can take microcode assists on denormal
+// operands, which flush-to-zero avoided.
+#if defined(REX_ARCH_ARM64)
+#define REX_FIXED_FP_MODE_DEFAULT true
+#else
+#define REX_FIXED_FP_MODE_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(ppc_fixed_fp_mode, REX_FIXED_FP_MODE_DEFAULT, "CPU",
+                    "Run guest code in IEEE FP mode only: never enable flush-to-zero for VMX "
+                    "code, which skips the host FP control writes around it (NN-1.1). VMX "
+                    "results keep denormals the console flushes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex::ppc {
+std::atomic<bool> g_fixed_fp_mode{REX_FIXED_FP_MODE_DEFAULT};
+}  // namespace rex::ppc
 
 namespace rex::system {
 
@@ -769,6 +788,13 @@ void XThread::Execute() {
   if (args.size() > 7)
     ctx->r10.u64 = args[7];
 
+  static std::once_flag fixed_fp_mode_once;
+  std::call_once(fixed_fp_mode_once, [] {
+    rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
+    rex::cvar::RegisterChangeCallback("ppc_fixed_fp_mode", [](std::string_view, std::string_view) {
+      rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
+    });
+  });
   ctx->fpscr.InitHost();
 
   // Convert this host thread to a fiber so SwitchTo works bidirectionally.

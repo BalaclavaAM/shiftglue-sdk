@@ -10,10 +10,12 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
 #if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <cerrno>
 #endif
@@ -493,6 +495,38 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
     return UINT32_MAX;
   }
   return static_cast<const PhysicalHeap*>(heap)->GetPhysicalAddress(address);
+}
+
+bool Memory::RetireImageRange(uint32_t address, uint32_t size, bool release) {
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+  const uint32_t page = system_page_size_ ? system_page_size_ : 4096;
+  const uint32_t begin = (address + page - 1) & ~(page - 1);
+  const uint32_t end = (address + size) & ~(page - 1);
+  if (address < 0x80000000u || uint64_t(address) + size > 0x90000000ull || end <= begin) {
+    return false;
+  }
+  const size_t length = end - begin;
+  // The 0x80000000 view maps file offset == address; 0x90000000 aliases it.
+  for (uint32_t view : {begin, begin + 0x10000000u}) {
+    if (mprotect(virtual_membase_ + view, length, PROT_NONE) != 0) {
+      return false;
+    }
+  }
+#if REX_PLATFORM_LINUX
+  if (release && fallocate(int(mapping_), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off_t(begin),
+                           off_t(length)) != 0) {
+    return false;
+  }
+#else
+  (void)release;
+#endif
+  return true;
+#else
+  (void)address;
+  (void)size;
+  (void)release;
+  return false;
+#endif
 }
 
 void Memory::Zero(uint32_t address, uint32_t size) {
@@ -2190,6 +2224,21 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   return BaseHeap::Protect(address, size, protect);
 }
 
+
+namespace {
+// A write-watch protection change, timed: with thousands of mappings one
+// mprotect can take milliseconds under the global lock (NN-2.4).
+void WatchProtect(void* base, size_t length, rex::memory::PageAccess access) {
+  const auto start = std::chrono::steady_clock::now();
+  rex::memory::Protect(base, length, access);
+  const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+  PERF_counter_add(kWriteWatchProtectNs, ns);
+  if (ns > 2000000) PERF_counter_inc(kWriteWatchSlowProtects);
+}
+}  // namespace
+
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                                          bool enable_invalidation_notifications,
                                          bool enable_data_providers,
@@ -2294,7 +2343,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     } else {
       if (protect_system_page_first != UINT32_MAX) {
-        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+        WatchProtect(protect_base + protect_system_page_first * system_page_size_,
                              (i - protect_system_page_first) * system_page_size_, protect_access);
         PERF_counter_inc(kWriteWatchProtectCalls);
         PERF_counter_add(kWriteWatchProtectPages, i - protect_system_page_first);
@@ -2303,7 +2352,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
-    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+    WatchProtect(protect_base + protect_system_page_first * system_page_size_,
                          (system_page_last + 1 - protect_system_page_first) * system_page_size_,
                          protect_access);
     PERF_counter_inc(kWriteWatchProtectCalls);
@@ -2502,14 +2551,14 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
         page_access = rex::memory::PageAccess::kReadOnly;
       }
       if (i != restore_page_first && page_access != run_access) {
-        rex::memory::Protect(protect_base + run_first * system_page_size_,
+        WatchProtect(protect_base + run_first * system_page_size_,
                              (i - run_first) * system_page_size_, run_access);
         PERF_counter_inc(kWriteWatchProtectCalls);
         run_first = i;
       }
       run_access = page_access;
     }
-    rex::memory::Protect(protect_base + run_first * system_page_size_,
+    WatchProtect(protect_base + run_first * system_page_size_,
                          (restore_page_last + 1 - run_first) * system_page_size_, run_access);
     PERF_counter_inc(kWriteWatchProtectCalls);
     PERF_counter_add(kWriteWatchProtectPages, restore_page_last + 1 - restore_page_first);

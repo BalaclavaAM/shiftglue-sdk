@@ -11,8 +11,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
+
+#include <rex/runtime_api.h>
 
 namespace rex::thread {
 
@@ -75,8 +78,31 @@ class global_critical_region {
       GuestHoldBegin();
     }
   }
+  // NN-3.1: a section the code generator found to hold one load-reserve/
+  // store-conditional pair and nothing else. Its store-conditional is a host
+  // compare-exchange, so with guest_reservation_sections_unlocked it runs
+  // without the mutex; mfmsr still sees interrupts off. The section's leave
+  // is the next GuestLeave this thread makes, since the section holds no
+  // call or nested section.
+  static void GuestEnterReservation() {
+    if (guest_hold_log_ms_ < 0) {
+      GuestHoldLogInit();  // also reads the cvar
+    }
+    if (!reservation_sections_unlocked_.load(std::memory_order_relaxed)) {
+      GuestEnter();
+      return;
+    }
+    ++unlocked_depth_;
+    ++guest_depth_;
+    CountReservationSection();
+  }
   static void GuestLeave() {
-    if (--guest_depth_ == 0 && guest_hold_start_ns_) {
+    if (unlocked_depth_) {
+      --unlocked_depth_;
+      --guest_depth_;
+      return;
+    }
+    if (--guest_depth_ == 0 && guest_hold_log_ms_ > 0) {
       GuestHoldEnd();
     }
     mutex().unlock();
@@ -122,7 +148,23 @@ class global_critical_region {
   static void GuestHoldLogInit();
   static void GuestHoldBegin();
   static void GuestHoldEnd();
-  static inline int32_t guest_hold_log_ms_ = -1;
+  // Defined once in mutex.cpp, not inline: an inline static is a weak symbol
+  // that each shared library resolves to its own copy on Android, so the
+  // generated code in libmain never saw the runtime's writes. The
+  // thread_locals below stay inline and are only used by the generated code,
+  // except the hold timestamps, which GuestHoldBegin/End keep in the runtime.
+  // On Windows the generated code reads this and
+  // reservation_sections_unlocked_ through rexruntime's import table
+  // (REX_RUNTIME_DATA).
+  static REX_RUNTIME_DATA int32_t guest_hold_log_ms_;
+  static void CountReservationSection();
+
+ public:
+  // guest_reservation_sections_unlocked (NN-3.1), mirrored for generated code.
+  static REX_RUNTIME_DATA std::atomic<bool> reservation_sections_unlocked_;
+
+ private:
+  static inline thread_local int32_t unlocked_depth_ = 0;
   static inline thread_local int64_t guest_hold_start_ns_ = 0;
   static inline thread_local const void* guest_hold_site_ = nullptr;
 };
