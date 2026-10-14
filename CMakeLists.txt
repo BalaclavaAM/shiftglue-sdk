@@ -114,13 +114,24 @@ function(rex_config_postfix target)
         RELWITHDEBINFO_POSTFIX "${CMAKE_RELWITHDEBINFO_POSTFIX}")
 endfunction()
 
+# NEAR_NATIVE_RESEARCH.md NN-1.8: Linux x86-64 uses the small code model with
+# linker relaxation. A recompiled title's code is far below its 2 GB limit
+# (FH1: 53 MB of .text), and the large model made every call a movabs plus a
+# register-indirect call: on the Steam Deck the small model with x86-64-v3
+# cut the simulation thread's cycles by 10 %, audio by 26 %. large (with
+# --no-relax) stays for a title whose code would not fit.
+set(REXGLUE_X86_64_CODE_MODEL "small" CACHE STRING
+    "Code model of Linux x86-64 targets: small (relaxed calls, the default) or large (--no-relax)")
+set_property(CACHE REXGLUE_X86_64_CODE_MODEL PROPERTY STRINGS small large)
+if(NOT REXGLUE_X86_64_CODE_MODEL MATCHES "^(small|large)$")
+    message(FATAL_ERROR "REXGLUE_X86_64_CODE_MODEL must be small or large")
+endif()
 if(NOT WIN32)
     # Use appropriate code model based on architecture
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
-        # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
-        # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
+        # macOS (below) always uses small: the ld64 linker on macOS 15+ rejects text relocations produced
         # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
-        add_compile_options(-mcmodel=large)
+        add_compile_options(-mcmodel=${REXGLUE_X86_64_CODE_MODEL})
     else()
         add_compile_options(-mcmodel=small)
     endif()
