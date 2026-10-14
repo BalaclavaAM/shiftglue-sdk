@@ -128,16 +128,18 @@ constexpr uint32_t bit_count(T v) {
 
 // lzcnt - count leading zeros.
 // Returns the size of the input operand if value is zero.
-uint8_t lzcnt(uint8_t v);
-uint8_t lzcnt(uint16_t v);
-uint8_t lzcnt(uint32_t v);
-uint8_t lzcnt(uint64_t v);
+// Inline: out of line in the core library, every call from the GPU library
+// went through a PLT stub (NN-3.6).
+inline uint8_t lzcnt(uint8_t v) { return static_cast<uint8_t>(std::countl_zero(v)); }
+inline uint8_t lzcnt(uint16_t v) { return static_cast<uint8_t>(std::countl_zero(v)); }
+inline uint8_t lzcnt(uint32_t v) { return static_cast<uint8_t>(std::countl_zero(v)); }
+inline uint8_t lzcnt(uint64_t v) { return static_cast<uint8_t>(std::countl_zero(v)); }
 
 // tzcnt - count trailing zeros.
-uint8_t tzcnt(uint8_t v);
-uint8_t tzcnt(uint16_t v);
-uint8_t tzcnt(uint32_t v);
-uint8_t tzcnt(uint64_t v);
+inline uint8_t tzcnt(uint8_t v) { return static_cast<uint8_t>(std::countr_zero(v)); }
+inline uint8_t tzcnt(uint16_t v) { return static_cast<uint8_t>(std::countr_zero(v)); }
+inline uint8_t tzcnt(uint32_t v) { return static_cast<uint8_t>(std::countr_zero(v)); }
+inline uint8_t tzcnt(uint64_t v) { return static_cast<uint8_t>(std::countr_zero(v)); }
 inline uint8_t lzcnt(int8_t v) {
   return lzcnt(static_cast<uint8_t>(v));
 }
@@ -167,8 +169,14 @@ inline uint8_t tzcnt(int64_t v) {
 // Search the value from least significant bit (LSB) to the most significant bit
 // (MSB) for a set bit (1).
 // Returns false if no bits are set and the output index is invalid.
-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
+inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return v != 0;
+}
+inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return v != 0;
+}
 inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
 }

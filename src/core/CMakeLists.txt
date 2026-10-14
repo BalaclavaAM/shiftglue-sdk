@@ -43,7 +43,6 @@ if(WIN32)
         filesystem_win.cpp
         fiber_win32.cpp
         mapped_memory_win.cpp
-        math_msvc.cpp
         memory_win.cpp
         platform/console_win.cpp
         platform/env_win.cpp
@@ -65,7 +64,6 @@ elseif(UNIX)
         filesystem_posix.cpp
         fiber_posix.cpp
         mapped_memory_posix.cpp
-        math_gcc.cpp
         memory_posix.cpp
         platform/console_posix.cpp
         platform/env_posix.cpp
