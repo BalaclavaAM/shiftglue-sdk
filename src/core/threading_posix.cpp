@@ -53,10 +53,26 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <sys/resource.h>
 
 #if REX_PLATFORM_ANDROID
+#include <dirent.h>
 #include <dlfcn.h>
+
+#include <cstdlib>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
 
 #include <rex/main_android.h>
 #include <rex/string.h>
+
+REXCVAR_DEFINE_STRING(android_thread_cores, "auto", "Kernel",
+                      "Pins this process's threads to cores by thread name. auto puts the "
+                      "GPU command decoder on the fastest cores where two or more of them "
+                      "form their own cluster (Snapdragon 8 Elite); otherwise entries "
+                      "NAME=CORES separated by semicolons, NAME a thread-name prefix (* for "
+                      "every thread no other entry names; _ also matches a space), CORES a "
+                      "list such as 6-7 or 0,2-5. Applies to the threads running when it is "
+                      "set; a value without entries (empty, off) restores them")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #endif
 
 REXCVAR_DEFINE_BOOL(posix_event_driven_waits, true, "Kernel",
@@ -92,7 +108,170 @@ static void* android_libc_;
 // API 26+.
 static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
 
+namespace {
+// "6-7" or "0,2-5" as a CPU mask; zero when malformed.
+uint64_t ParseCoreList(const std::string& list) {
+  uint64_t mask = 0;
+  std::stringstream parts(list);
+  for (std::string part; std::getline(parts, part, ',');) {
+    const size_t dash = part.find('-');
+    char* end = nullptr;
+    const unsigned long first = std::strtoul(part.c_str(), &end, 10);
+    unsigned long last = first;
+    if (dash != std::string::npos) last = std::strtoul(part.c_str() + dash + 1, &end, 10);
+    if (end == part.c_str() || first > last || last > 63) return 0;
+    for (unsigned long cpu = first; cpu <= last; cpu++) mask |= uint64_t(1) << cpu;
+  }
+  return mask;
+}
+
+cpu_set_t MaskToSet(uint64_t mask) {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int cpu = 0; cpu < 64; cpu++) {
+    if (mask & (uint64_t(1) << cpu)) CPU_SET(cpu, &set);
+  }
+  return set;
+}
+
+// android_thread_cores parsed: a mask per thread-name prefix, and one for
+// every other thread (zero leaves them alone).
+struct ThreadCoreRules {
+  std::string value;
+  std::vector<std::pair<std::string, uint64_t>> entries;
+  uint64_t others = 0;
+};
+
+// "auto": where the fastest cores form a cluster of two or more that is not
+// every core (Snapdragon 8 Elite: cores 6-7 at 4.32 GHz, 0-5 at 3.53), the
+// GPU command decoder runs on that cluster. Left to the scheduler it spent
+// whole stretches on the slower cores: in-run A/B on the 8 Elite, 25 % of
+// frames over 17.5 ms at the 60 fps cap and 16.2 ms of decoder CPU a frame,
+// against 2 % and 10.2 ms pinned. Elsewhere nothing changes.
+std::string AutoThreadCores() {
+  std::vector<uint32_t> capacities;
+  for (uint32_t cpu = 0; cpu < 64; ++cpu) {
+    std::ifstream file("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpu_capacity");
+    uint32_t capacity = 0;
+    if (!(file >> capacity)) break;
+    capacities.push_back(capacity);
+  }
+  if (capacities.empty()) return {};
+  const uint32_t largest = *std::max_element(capacities.begin(), capacities.end());
+  std::string top;
+  size_t top_count = 0;
+  for (size_t cpu = 0; cpu < capacities.size(); ++cpu) {
+    if (capacities[cpu] == largest) {
+      top += (top.empty() ? "" : ",") + std::to_string(cpu);
+      top_count++;
+    }
+  }
+  if (top_count < 2 || top_count == capacities.size()) return {};
+  return "GPU_Commands=" + top;
+}
+
+ThreadCoreRules ParseThreadCoreRules(const std::string& value) {
+  ThreadCoreRules rules;
+  rules.value = value;
+  std::stringstream items(value == "auto" ? AutoThreadCores() : value);
+  for (std::string item; std::getline(items, item, ';');) {
+    const size_t equals = item.rfind('=');
+    if (equals == std::string::npos || equals == 0) continue;
+    const uint64_t mask = ParseCoreList(item.substr(equals + 1));
+    if (!mask) {
+      REXSYS_WARN("android_thread_cores: bad core list in '{}'", item);
+      continue;
+    }
+    const std::string name = item.substr(0, equals);
+    if (name == "*") {
+      rules.others = mask;
+    } else {
+      rules.entries.emplace_back(name, mask);
+    }
+  }
+  return rules;
+}
+
+uint64_t ThreadCoreMask(const ThreadCoreRules& rules, std::string_view name) {
+  for (const auto& [prefix, mask] : rules.entries) {
+    if (name.size() >= prefix.size() &&
+        std::equal(prefix.begin(), prefix.end(), name.begin(),
+                   [](char p, char c) { return p == c || (p == '_' && c == ' '); })) {
+      return mask;
+    }
+  }
+  return rules.others;
+}
+
+std::mutex android_thread_cores_mutex_;
+ThreadCoreRules android_thread_cores_rules_;
+// The masks threads had before android_thread_cores first changed them.
+std::unordered_map<pid_t, cpu_set_t> android_thread_cores_saved_;
+
+// Pins `tid` to `mask`, or restores its earlier mask when `mask` is zero.
+// Returns 1 when pinned, -1 when restored, 0 otherwise. Caller holds the mutex.
+int PinThreadLocked(pid_t tid, uint64_t mask) {
+  auto saved = android_thread_cores_saved_.find(tid);
+  if (mask) {
+    if (saved == android_thread_cores_saved_.end()) {
+      cpu_set_t original;
+      if (sched_getaffinity(tid, sizeof(original), &original) != 0) return 0;
+      android_thread_cores_saved_.emplace(tid, original);
+    }
+    const cpu_set_t set = MaskToSet(mask);
+    return sched_setaffinity(tid, sizeof(set), &set) == 0 ? 1 : 0;
+  }
+  if (saved != android_thread_cores_saved_.end()) {
+    sched_setaffinity(tid, sizeof(saved->second), &saved->second);
+    android_thread_cores_saved_.erase(saved);
+    return -1;
+  }
+  return 0;
+}
+
+void ApplyAndroidThreadCores(const std::string& value) {
+  std::lock_guard lock(android_thread_cores_mutex_);
+  android_thread_cores_rules_ = ParseThreadCoreRules(value);
+  DIR* tasks = opendir("/proc/self/task");
+  if (!tasks) return;
+  size_t pinned = 0, restored = 0;
+  while (const dirent* entry = readdir(tasks)) {
+    const pid_t tid = pid_t(std::atoi(entry->d_name));
+    if (tid <= 0) continue;
+    std::ifstream comm_file("/proc/self/task/" + std::string(entry->d_name) + "/comm");
+    std::string comm;
+    std::getline(comm_file, comm);
+    const int result = PinThreadLocked(tid, ThreadCoreMask(android_thread_cores_rules_, comm));
+    pinned += result > 0;
+    restored += result < 0;
+  }
+  closedir(tasks);
+  REXSYS_INFO("android_thread_cores '{}': {} threads pinned, {} restored", value, pinned,
+              restored);
+}
+}  // namespace
+
+// Pins a thread as android_thread_cores asks for its new name; true when it
+// did (the thread then keeps that mask over other placement).
+bool PinAndroidNamedThread(pid_t tid, std::string_view name) {
+  const std::string value = REXCVAR_GET(android_thread_cores);
+  std::lock_guard lock(android_thread_cores_mutex_);
+  if (android_thread_cores_rules_.value != value) {
+    android_thread_cores_rules_ = ParseThreadCoreRules(value);
+  }
+  const uint64_t mask = ThreadCoreMask(android_thread_cores_rules_, name);
+  if (PinThreadLocked(tid, mask) <= 0) return false;
+  REXSYS_INFO("android_thread_cores: thread '{}' on cores {:#x}", name, mask);
+  return true;
+}
+
 void AndroidInitialize() {
+  rex::cvar::RegisterChangeCallback("android_thread_cores",
+                                    [](std::string_view, std::string_view value) {
+                                      // Off the registry lock the callback runs under.
+                                      std::thread(ApplyAndroidThreadCores, std::string(value))
+                                          .detach();
+                                    });
   if (rex::GetAndroidApiLevel() >= 26) {
     android_libc_ = dlopen("libc.so", RTLD_NOW);
     assert_not_null(android_libc_);
@@ -1018,6 +1197,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
+      PinAndroidNamedThread(pthread_gettid_np(thread_), name);
 #endif
     }
   }
@@ -1037,6 +1217,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
 #else
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+#endif
+#if REX_PLATFORM_ANDROID
+  pid_t tid() const { return pthread_gettid_np(thread_); }
 #endif
 
   uint64_t affinity_mask() {
@@ -1726,6 +1909,12 @@ class PosixThread : public PosixConditionHandle<Thread> {
   // A hard affinity, unlike Windows' CPU sets: the little cores of a phone
   // run a recorder or a simulation step two to three times slower.
   bool PreferPerformanceCores() override {
+#if REX_PLATFORM_ANDROID
+    // android_thread_cores placement wins over the generic preference.
+    if (PinAndroidNamedThread(handle_.tid(), name())) {
+      return true;
+    }
+#endif
     const uint64_t mask = PerformanceCoreMask();
     if (!mask) {
       return false;
@@ -1880,6 +2069,7 @@ void set_current_thread_name(const std::string_view name) {
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
   }
+  PinAndroidNamedThread(gettid(), name);
 #endif
 }
 
