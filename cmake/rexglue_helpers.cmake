@@ -52,7 +52,12 @@ function(rexglue_apply_target_settings target_name)
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            # A consumer may raise the baseline (REXGLUE_ARM64_MARCH, e.g. armv8.2-a
+            # for LSE atomics instead of LL/SC loops and outline-atomic calls).
+            if(NOT REXGLUE_ARM64_MARCH)
+                set(REXGLUE_ARM64_MARCH armv8-a)
+            endif()
+            target_compile_options(${target_name} PRIVATE -march=${REXGLUE_ARM64_MARCH})
         endif()
     endif()
 
