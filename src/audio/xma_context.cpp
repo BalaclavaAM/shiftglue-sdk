@@ -44,6 +44,17 @@ REXCVAR_DEFINE_BOOL(
     xma_relaxed_padding_admission, false, "Audio",
     "Treat XMA output padding as best-effort headroom instead of a hard decode requirement");
 
+REXCVAR_DEFINE_BOOL(xma_lazy_decoder_state, true, "Audio",
+                    "Allocate a context's FFmpeg decoder state at its first decode instead of "
+                    "for all 320 contexts at startup (NN-4.1); each state is about 460 KB, "
+                    "zero-filled")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(xma_direct_decode, true, "Audio",
+                    "Call the XMA frame decoder directly instead of through FFmpeg's "
+                    "send-packet/receive-frame queue, which copies and queues each packet "
+                    "(NN-4.1)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
 
@@ -197,15 +208,19 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
     return 1;
   }
 
-  av_context_ = avcodec_alloc_context3(av_codec_);
-  if (!av_context_) {
-    REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
-    return 1;
-  }
+  // PrepareDecoder opens the decoder state at the first decode, so a context
+  // the title never uses holds none.
+  if (!REXCVAR_GET(xma_lazy_decoder_state)) {
+    av_context_ = avcodec_alloc_context3(av_codec_);
+    if (!av_context_) {
+      REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
+      return 1;
+    }
 
-  // Initialize these to 0. They'll actually be set later.
-  av_context_->channels = 0;
-  av_context_->sample_rate = 0;
+    // Initialize these to 0. They'll actually be set later.
+    av_context_->channels = 0;
+    av_context_->sample_rate = 0;
+  }
 
   av_frame_ = av_frame_alloc();
   if (!av_frame_) {
@@ -896,15 +911,17 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || av_context_->sample_rate != sample_rate ||
       av_context_->channels != static_cast<int>(channels)) {
     const bool is_stream_reinitialization =
-        av_context_->sample_rate != 0 || av_context_->channels != 0;
+        av_context_ && (av_context_->sample_rate != 0 || av_context_->channels != 0);
     if (is_stream_reinitialization) {
       ResetStallMetrics();
     }
     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
-                       av_context_->sample_rate, sample_rate, av_context_->channels, channels);
+                       av_context_ ? av_context_->sample_rate : 0, sample_rate,
+                       av_context_ ? av_context_->channels : 0, channels);
+    PERF_counter_inc(kXmaDecoderOpens);
     avcodec_free_context(&av_context_);
     av_context_ = avcodec_alloc_context3(av_codec_);
 
@@ -933,6 +950,21 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
 
 bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
                               AVFrame* av_frame) {
+  if (REXCVAR_GET(xma_direct_decode)) {
+    // The xmaframes decoder turns one packet into at most one frame, so the
+    // queue between the two calls below holds nothing across them.
+    av_frame_unref(av_frame);
+    int got_frame = 0;
+    const int ret =
+        av_codec_->decode(av_context, av_frame, &got_frame, const_cast<AVPacket*>(av_packet));
+    if (ret < 0) {
+      char errbuf[AV_ERROR_MAX_STRING_SIZE];
+      av_strerror(ret, errbuf, sizeof(errbuf));
+      REXAPU_ERROR("XmaContext {}: Error during decoding: {} ({})", id(), errbuf, ret);
+      return false;
+    }
+    return got_frame != 0;
+  }
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
