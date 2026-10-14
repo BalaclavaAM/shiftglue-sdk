@@ -52,14 +52,17 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <algorithm>
 #include <sys/resource.h>
 
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_LINUX
 #include <dirent.h>
-#include <dlfcn.h>
 
 #include <cstdlib>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#endif
+
+#if REX_PLATFORM_ANDROID
+#include <dlfcn.h>
 
 #include <rex/main_android.h>
 #include <rex/string.h>
@@ -72,6 +75,18 @@ REXCVAR_DEFINE_STRING(android_thread_cores, "auto", "Kernel",
                       "every thread no other entry names; _ also matches a space), CORES a "
                       "list such as 6-7 or 0,2-5. Applies to the threads running when it is "
                       "set; a value without entries (empty, off) restores them")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#elif REX_PLATFORM_LINUX
+// NEAR_NATIVE_RESEARCH.md NN-3.14: the same placement by thread name on desktop
+// Linux; auto applies the layout measured on the Steam Deck there only.
+REXCVAR_DEFINE_STRING(linux_thread_cores, "auto", "Kernel",
+                      "Pins this process's threads to cores by thread name. auto applies the "
+                      "measured Steam Deck layout on a Steam Deck (LCD or OLED) and changes "
+                      "nothing elsewhere; otherwise entries NAME=CORES separated by "
+                      "semicolons, NAME a thread-name prefix (* for every thread no other "
+                      "entry names; _ also matches a space), CORES a list such as 6-7 or "
+                      "0,2-5. Applies to the threads running when it is set; a value without "
+                      "entries (empty, off) restores them")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #endif
 
@@ -107,7 +122,9 @@ namespace rex::thread {
 static void* android_libc_;
 // API 26+.
 static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
+#endif
 
+#if REX_PLATFORM_LINUX
 namespace {
 // "6-7" or "0,2-5" as a CPU mask; zero when malformed.
 uint64_t ParseCoreList(const std::string& list) {
@@ -142,6 +159,7 @@ struct ThreadCoreRules {
   uint64_t others = 0;
 };
 
+#if REX_PLATFORM_ANDROID
 // "auto": where the fastest cores form a cluster of two or more that is not
 // every core (Snapdragon 8 Elite: cores 6-7 at 4.32 GHz, 0-5 at 3.53), the
 // GPU command decoder runs on that cluster. Left to the scheduler it spent
@@ -169,6 +187,76 @@ std::string AutoThreadCores() {
   if (top_count < 2 || top_count == capacities.size()) return {};
   return "GPU_Commands=" + top;
 }
+#else
+std::string ReadFirstLine(const std::string& path) {
+  std::ifstream file(path);
+  std::string line;
+  std::getline(file, line);
+  return line;
+}
+
+// The Steam Deck's APU: board vendor Valve with product Jupiter (LCD) or
+// Galileo (OLED), or the CPU model AMD Custom APU 0405 (LCD) or 0932 (OLED).
+// Returns a description of the match, or empty elsewhere.
+std::string DetectSteamDeck() {
+  const std::string vendor = ReadFirstLine("/sys/devices/virtual/dmi/id/board_vendor");
+  const std::string product = ReadFirstLine("/sys/devices/virtual/dmi/id/product_name");
+  if (vendor == "Valve" && (product == "Jupiter" || product == "Galileo")) {
+    return vendor + " " + product;
+  }
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  for (std::string line; std::getline(cpuinfo, line);) {
+    if (line.rfind("model name", 0) != 0) continue;
+    if (line.find("AMD Custom APU 0405") != std::string::npos ||
+        line.find("AMD Custom APU 0932") != std::string::npos) {
+      return line.substr(line.find(':') + 2);
+    }
+    break;
+  }
+  return {};
+}
+
+// "auto": on a Steam Deck (4 cores, 8 threads, SMT siblings numbered 0-1,
+// 2-3, 4-5, 6-7) the simulation and audio threads share core 0's two
+// siblings, render and GPU Submission core 1's, GPU Commands and GPU Recorder
+// have cores 2 and 3, and every other thread runs on the remaining siblings
+// of cores 2 and 3. In-run A/B on the Deck LCD (fh1-race-sustained, Steam
+// launches, five runs in two toggle orders): process CPU -6.1 and -6.8 %
+// adjusted for draws, from GPU Commands (-7 to -10 %) and the recorder (-6
+// to -8 %), p99 +0.08 ms. The guest entries name the base title's thread
+// entries and then the v4 title update's (825CEC88, 83075D18, 8261E318);
+// only the base layout was measured. Elsewhere nothing changes. Decided once
+// and logged once.
+std::string AutoThreadCores() {
+  static const std::string layout = [] {
+    const std::string deck = DetectSteamDeck();
+    if (deck.empty()) {
+      REXSYS_INFO("linux_thread_cores auto: not a Steam Deck, threads left to the scheduler");
+      return std::string();
+    }
+    for (int core = 0; core < 4; ++core) {
+      const std::string expected = std::to_string(core * 2) + "-" + std::to_string(core * 2 + 1);
+      const std::string siblings = ReadFirstLine("/sys/devices/system/cpu/cpu" +
+                                                 std::to_string(core * 2) +
+                                                 "/topology/thread_siblings_list");
+      if (siblings != expected) {
+        REXSYS_INFO(
+            "linux_thread_cores auto: Steam Deck ({}) but cpu{} siblings are '{}', not '{}'; "
+            "threads left to the scheduler",
+            deck, core * 2, siblings, expected);
+        return std::string();
+      }
+    }
+    std::string value =
+        "Guest_8255AE10=0;Guest_825CEC88=0;Guest_82FB4AF8=1;Guest_83075D18=1;"
+        "Guest_825A6320=2;Guest_8261E318=2;GPU_Submission=3;GPU_Commands=4;GPU_Recorder=6;"
+        "*=5,7";
+    REXSYS_INFO("linux_thread_cores auto: Steam Deck ({}), layout {}", deck, value);
+    return value;
+  }();
+  return layout;
+}
+#endif
 
 ThreadCoreRules ParseThreadCoreRules(const std::string& value) {
   ThreadCoreRules rules;
@@ -179,7 +267,7 @@ ThreadCoreRules ParseThreadCoreRules(const std::string& value) {
     if (equals == std::string::npos || equals == 0) continue;
     const uint64_t mask = ParseCoreList(item.substr(equals + 1));
     if (!mask) {
-      REXSYS_WARN("android_thread_cores: bad core list in '{}'", item);
+      REXSYS_WARN("thread_cores: bad core list in '{}'", item);
       continue;
     }
     const std::string name = item.substr(0, equals);
@@ -246,25 +334,94 @@ void ApplyAndroidThreadCores(const std::string& value) {
     restored += result < 0;
   }
   closedir(tasks);
-  REXSYS_INFO("android_thread_cores '{}': {} threads pinned, {} restored", value, pinned,
+  REXSYS_INFO("thread_cores '{}': {} threads pinned, {} restored", value, pinned,
               restored);
 }
+
+#if !REX_PLATFORM_ANDROID
+// Set by an exit handler, under the mutex, so the sweep below never touches
+// the rules or the cvars while static destructors run.
+bool linux_thread_cores_stopping_ = false;
+
+// A layout set at startup (auto on a Deck) has to place the threads nobody
+// names (the main thread, the driver's, SDL's and PipeWire's), and threads
+// inherit the mask of the thread that starts them: SDL's audio threads,
+// started from the simulation thread, would share its core. The measured
+// layout had every thread placed by its name, so while that value stays,
+// every thread whose mask differs from its name's is placed again every 5 s.
+void SweepThreadCores(std::string value) {
+  ApplyAndroidThreadCores(value);
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::lock_guard lock(android_thread_cores_mutex_);
+    if (linux_thread_cores_stopping_ || REXCVAR_GET(linux_thread_cores) != value) return;
+    if (android_thread_cores_rules_.value != value) {
+      android_thread_cores_rules_ = ParseThreadCoreRules(value);
+    }
+    DIR* tasks = opendir("/proc/self/task");
+    if (!tasks) return;
+    size_t moved = 0;
+    while (const dirent* entry = readdir(tasks)) {
+      const pid_t tid = pid_t(std::atoi(entry->d_name));
+      if (tid <= 0) continue;
+      std::ifstream comm_file("/proc/self/task/" + std::string(entry->d_name) + "/comm");
+      std::string comm;
+      std::getline(comm_file, comm);
+      const uint64_t mask = ThreadCoreMask(android_thread_cores_rules_, comm);
+      cpu_set_t current;
+      if (!mask || sched_getaffinity(tid, sizeof(current), &current) != 0) continue;
+      const cpu_set_t wanted = MaskToSet(mask);
+      if (CPU_EQUAL(&current, &wanted)) continue;
+      moved += PinThreadLocked(tid, mask) > 0;
+    }
+    closedir(tasks);
+    if (moved) REXSYS_INFO("thread_cores '{}': {} more threads placed", value, moved);
+  }
+}
+#endif
 }  // namespace
 
 // Pins a thread as android_thread_cores asks for its new name; true when it
 // did (the thread then keeps that mask over other placement).
 bool PinAndroidNamedThread(pid_t tid, std::string_view name) {
+#if !REX_PLATFORM_ANDROID
+  // Desktop Linux has no AndroidInitialize: register the hot-reload callback
+  // when the first thread is named, after the cvars are parsed.
+  static std::once_flag callback_once;
+  std::call_once(callback_once, [] {
+    rex::cvar::RegisterChangeCallback("linux_thread_cores",
+                                      [](std::string_view, std::string_view value) {
+                                        std::thread(ApplyAndroidThreadCores, std::string(value))
+                                            .detach();
+                                      });
+    const std::string value = REXCVAR_GET(linux_thread_cores);
+    if (!(value == "auto" ? AutoThreadCores() : value).empty()) {
+      std::atexit([] {
+        std::lock_guard lock(android_thread_cores_mutex_);
+        linux_thread_cores_stopping_ = true;
+      });
+      std::thread(SweepThreadCores, value).detach();
+    }
+  });
+#endif
+#if REX_PLATFORM_ANDROID
   const std::string value = REXCVAR_GET(android_thread_cores);
+#else
+  const std::string value = REXCVAR_GET(linux_thread_cores);
+#endif
   std::lock_guard lock(android_thread_cores_mutex_);
   if (android_thread_cores_rules_.value != value) {
     android_thread_cores_rules_ = ParseThreadCoreRules(value);
   }
   const uint64_t mask = ThreadCoreMask(android_thread_cores_rules_, name);
   if (PinThreadLocked(tid, mask) <= 0) return false;
-  REXSYS_INFO("android_thread_cores: thread '{}' on cores {:#x}", name, mask);
+  // Threads are created unnamed and named right after; log the name only.
+  if (!name.empty()) REXSYS_INFO("thread_cores: thread '{}' on cores {:#x}", name, mask);
   return true;
 }
+#endif
 
+#if REX_PLATFORM_ANDROID
 void AndroidInitialize() {
   rex::cvar::RegisterChangeCallback("android_thread_cores",
                                     [](std::string_view, std::string_view value) {
@@ -1200,6 +1357,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       PinAndroidNamedThread(pthread_gettid_np(thread_), name);
       rex::perf::NoteNamedThread(pthread_gettid_np(thread_), name);
 #elif REX_PLATFORM_LINUX
+      PinAndroidNamedThread(tid_, name);
       rex::perf::NoteNamedThread(tid_, name);
 #endif
     }
@@ -1223,6 +1381,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
 #if REX_PLATFORM_ANDROID
   pid_t tid() const { return pthread_gettid_np(thread_); }
+#elif REX_PLATFORM_LINUX
+  pid_t tid() const { return tid_; }
 #endif
 
   uint64_t affinity_mask() {
@@ -1912,8 +2072,8 @@ class PosixThread : public PosixConditionHandle<Thread> {
   // A hard affinity, unlike Windows' CPU sets: the little cores of a phone
   // run a recorder or a simulation step two to three times slower.
   bool PreferPerformanceCores() override {
-#if REX_PLATFORM_ANDROID
-    // android_thread_cores placement wins over the generic preference.
+#if REX_PLATFORM_LINUX
+    // android_thread_cores (linux_thread_cores) placement wins over the generic preference.
     if (PinAndroidNamedThread(handle_.tid(), name())) {
       return true;
     }
@@ -2072,6 +2232,8 @@ void set_current_thread_name(const std::string_view name) {
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
   }
+  PinAndroidNamedThread(gettid(), name);
+#elif REX_PLATFORM_LINUX
   PinAndroidNamedThread(gettid(), name);
 #endif
 #if REX_PLATFORM_LINUX
