@@ -183,12 +183,14 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
+  // The global lock first: the entry pointer stays valid only while it is
+  // held (Resize moves the table).
+  auto global_lock = global_critical_region_.Acquire();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
     entry->object = nullptr;
@@ -275,7 +277,7 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
 
   XObject* object = nullptr;
   if (!already_locked) {
-    global_critical_region_.LockCounted();
+    global_critical_region_.LockCounted(rex::thread::LockSource::kObjectLookup);
   }
 
   // Lower 2 bits are ignored.

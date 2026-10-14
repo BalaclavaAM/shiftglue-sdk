@@ -221,9 +221,12 @@ class XObject {
   }
 
   // Stash native pointer into X_DISPATCH_HEADER
+  // The handle is stored before the signature, with a release fence between,
+  // so a reader that sees the signature also sees the handle.
   static void StashHandle(X_DISPATCH_HEADER* header, uint32_t handle) {
-    header->wait_list_flink = kXObjSignature;
     header->wait_list_blink = handle;
+    std::atomic_thread_fence(std::memory_order_release);
+    header->wait_list_flink = kXObjSignature;
   }
 
   static uint32_t TimeoutTicksToMs(int64_t timeout_ticks);
