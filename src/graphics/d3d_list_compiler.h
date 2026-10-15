@@ -3,6 +3,7 @@
 // DL-2.1 list compiler state (see d3d_list_compiler.cpp). Private to
 // command_processor.cpp and d3d_list_compiler.cpp.
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -13,7 +14,40 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/register_file.h>
 
+namespace rex::memory {
+class Memory;
+}
+
 namespace rex::graphics {
+
+// DL-2.1 attempt 2: guest writes into watched physical pages, through the
+// memory system's invalidation callbacks (the same write watch the shared
+// memory uses, so file loads, protection changes and kernel writes report too).
+// A watched page is read-only to the guest until it is written; the write
+// bumps the page's generation and drops the watch. Whoever depends on a page
+// takes a snapshot of its generation, then arms it, then reads it: a later
+// write shows as a changed generation.
+struct D3dPageWatch {
+  static constexpr uint32_t kPageShift = 12;
+  static constexpr uint32_t kPageCount = 0x20000000u >> kPageShift;
+  std::unique_ptr<std::atomic<uint32_t>[]> gen;
+  std::unique_ptr<std::atomic<uint8_t>[]> armed;
+  memory::Memory* memory = nullptr;
+  void* handle = nullptr;
+  // Written by guest threads in the callback.
+  std::atomic<uint64_t> faults{0};       // callbacks that dropped one of our watches
+  std::atomic<uint64_t> fault_pages{0};  // pages whose watch they dropped
+  // Decoder side.
+  uint64_t arms = 0, arm_pages = 0;
+
+  explicit D3dPageWatch(memory::Memory* memory);
+  ~D3dPageWatch();
+  uint32_t Gen(uint32_t page) const { return gen[page].load(std::memory_order_acquire); }
+  // Watches [page_first, page_first + page_count) where it is not watched yet.
+  void Arm(uint32_t page_first, uint32_t page_count);
+  static std::pair<uint32_t, uint32_t> Callback(void* context, uint32_t physical_start,
+                                                uint32_t length, bool exact_range);
+};
 
 struct CommandProcessor::D3dListCompiler {
   enum OpKind : uint32_t {
@@ -25,6 +59,9 @@ struct CommandProcessor::D3dListCompiler {
     kOpPacket,        // ExecutePacket over the packet at offset
     kOpRegsMem,       // PacketWriteRegistersFromMem(first, physical payload, count)
     kOpBin,           // a bin mask or select packet (first = opcode)
+    // Host plan only: WriteRegistersHost(first, plan_values + payload, count);
+    // one register class, values in host order, redundant writes dropped.
+    kOpHost,
   };
   // A type-3 packet with its predicate bit (type-0 headers use bit 0 for the
   // register index).
@@ -51,6 +88,23 @@ struct CommandProcessor::D3dListCompiler {
     uint32_t draws = 0;
     bool compiled = false;
     bool uncompilable = false;
+    // Attempt 2, page watch: the list's pages and their generations when it
+    // was last validated (compiled or checked). While they hold, no guest
+    // write reached the list, so neither its structure nor its values moved.
+    uint32_t page_first = 0;
+    uint32_t page_count = 0;
+    std::vector<uint32_t> page_gens;
+    bool watched = false;
+    uint32_t dirty = 0;             // watched runs found written, this sweep
+    uint32_t watch_off_until = 0;   // swap; checked every run until then
+    // Host plan (gpu_d3d_list_host_regs), valid while watched: the ops with
+    // register runs precomputed in host order, split by register class, and
+    // the writes that repeat a value the list itself wrote earlier dropped.
+    std::vector<Op> plan;
+    std::vector<uint32_t> plan_values;
+    uint32_t plan_written = 0;  // registers the plan writes
+    uint32_t plan_elided = 0;   // register writes it drops
+    bool plan_valid = false;
   };
 
   enum Fallback : uint32_t {
@@ -68,10 +122,14 @@ struct CommandProcessor::D3dListCompiler {
   static constexpr uint32_t kSweepSwaps = 600;
   static constexpr uint32_t kVolatileChanges = 4;
   static constexpr uint32_t kBackoffSwaps = 600;
+  // A watched list written this often in a sweep is checked instead.
+  static constexpr uint32_t kVolatileDirty = 3;
+  static constexpr uint32_t kWatchOffSwaps = 600;
 
   std::unordered_map<uint64_t, List> lists;
   uint32_t swaps = 0;
   uint32_t sweep_swaps = 0;
+  std::unique_ptr<D3dPageWatch> watch;
 
   struct Stats {
     uint64_t runs = 0;
@@ -84,6 +142,18 @@ struct CommandProcessor::D3dListCompiler {
     uint64_t draws = 0;
     uint64_t bailed = 0;
     uint64_t evicted = 0;
+    // Validation (attempt 2).
+    uint64_t clean = 0;         // runs validated by the page watch
+    uint64_t checked = 0;       // runs validated by comparing every check word
+    uint64_t check_words = 0;
+    uint64_t dirty = 0;         // watched runs whose pages were written
+    uint64_t watch_off = 0;     // lists put on checks for being written often
+    uint64_t watch_misses = 0;  // verify: the watch said clean, the words differ
+    // Host plan.
+    uint64_t plan_runs = 0;
+    uint64_t plan_builds = 0;
+    uint64_t plan_registers = 0;  // written by the plan
+    uint64_t plan_elided = 0;     // dropped by the plan
     // Verify.
     uint64_t verified = 0;
     uint64_t verified_draws = 0;
@@ -102,6 +172,11 @@ struct CommandProcessor::D3dListCompiler {
     if ((packet >> 30) == 1) return 0x200;
     return ((packet & 1) ? 0x100 : 0) | ((packet >> 8) & 0x7F);
   }
+
+  // Plan building: the value the list itself last wrote to a register, while
+  // known (stamp == plan_epoch).
+  uint32_t plan_epoch = 0;
+  std::unique_ptr<uint32_t[]> plan_stamp, plan_known;
 
   // Verify model.
   struct Load {
@@ -129,6 +204,32 @@ struct CommandProcessor::D3dListCompiler {
     }
     model.values[index] = value;
   }
+
+  // DL-2.1 attempt 2, shader-load cache (gpu_d3d_shader_cache): an IM_LOAD's
+  // microcode hash and shader by (type, address, dwords), valid while the
+  // page watch shows the microcode's pages unwritten.
+  struct ShaderEntry {
+    uint32_t address = 0;
+    uint32_t dwords = 0;
+    uint32_t type = 0;
+    uint32_t page_first = 0;
+    uint32_t page_count = 0;  // 0: empty
+    uint32_t page_gens[5] = {};  // kShaderPages
+    uint64_t hash = 0;
+    Shader* shader = nullptr;
+  };
+  static constexpr uint32_t kShaderEntries = 4096;
+  static constexpr uint32_t kShaderPages = 5;
+  std::unique_ptr<ShaderEntry[]> shaders;
+  struct ShaderStats {
+    uint64_t loads = 0;
+    uint64_t hits = 0;
+    uint64_t same = 0;      // hit, and already the active shader
+    uint64_t fills = 0;
+    uint64_t stale = 0;     // entry found, pages written since
+    uint64_t verified = 0;
+    uint64_t mismatches = 0;
+  } shader_stats;
 };
 
 }  // namespace rex::graphics

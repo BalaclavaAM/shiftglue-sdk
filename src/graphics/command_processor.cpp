@@ -3591,8 +3591,16 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
   if (d3d_list_verify_depth_ == trace_ib_depth_) {
     D3dListVerifyLoad(uint32_t(shader_type), addr, size_dwords);
   }
+  uint64_t cached_hash = 0;
+  if (d3d_shader_cache_mode_ &&
+      D3dShaderCacheLoad(shader_type, addr, size_dwords, ucode, cached_hash)) {
+    // DL-2.1 attempt 2: the same microcode as when hashed; the shader is set.
+    decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+    return;
+  }
   // Hashing the microcode is most of a shader load; the decoder has time.
-  const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
+  const uint64_t ucode_hash =
+      record_split_ ? (cached_hash ? cached_hash : HashShaderMicrocode(ucode, size_dwords)) : 0;
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
     decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
                                std::memory_order_relaxed);

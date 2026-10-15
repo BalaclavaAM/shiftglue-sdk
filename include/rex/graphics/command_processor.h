@@ -669,6 +669,18 @@ class CommandProcessor {
   struct D3dListCompiler;
   std::unique_ptr<D3dListCompiler> d3d_lists_;
   uint32_t d3d_list_mode_ = 0;
+  // Attempt 2 parts, read at each swap with the mode: the page watch
+  // validates compiled lists (gpu_d3d_list_watch), watched lists replay their
+  // register writes from a host plan (gpu_d3d_list_host_regs), and IM_LOADs
+  // reuse their hash and shader while their microcode is unwritten
+  // (gpu_d3d_shader_cache: 1 verify, 2 on).
+  bool d3d_list_watch_ = false;
+  bool d3d_list_host_regs_ = false;
+  uint32_t d3d_shader_cache_mode_ = 0;
+  // An IM_LOAD through the shader cache: true if it set the active shader;
+  // otherwise `hash` is the microcode's hash when the cache knows it (0 not).
+  bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
+                          const uint32_t* ucode, uint64_t& hash);
   // Runs a nested buffer from its compiled form; false to decode it.
   bool D3dListExecute(uint32_t ptr, uint32_t count);
   // Verify: the buffer at this depth was modelled; it is decoded now and
