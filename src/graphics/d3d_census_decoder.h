@@ -24,6 +24,11 @@ void Packet(uint32_t offset);
 // A draw packet passed its predicate; drawn: it is a draw (not an EDRAM copy)
 // of the first tile or of an untiled pass.
 void Draw(bool drawn);
+// DL-1.1: the packet being decoded is in a buffer, or after a mark, whose
+// drawn draws the census counts as visible to an API-level renderer: a draw
+// call (immediate, tiled or internal) or a display list unchanged since its
+// previous run or changed only by fixups. Only meaningful while Active().
+bool Visible();
 // A swap was decoded: publish this frame's counts.
 void Swap();
 

@@ -272,6 +272,11 @@ constexpr const char* kCounterNames[] = {
     "gpu_upload_splits_index",
     "gpu_upload_splits_texture",
     "gpu_upload_bytes",
+    "d3d_census_visible_draws",
+    "d3d_census_fallback_draws",
+    "d3d_census_skipped_draws",
+    "d3d_census_skipped_shader_loads",
+    "d3d_census_skipped_constant_packets",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -412,6 +417,11 @@ constexpr bool kIsGauge[] = {
     false,  // kGpuUploadSplitsIndex
     false,  // kGpuUploadSplitsTexture
     false,  // kGpuUploadBytes
+    false,  // kD3dCensusVisibleDraws
+    false,  // kD3dCensusFallbackDraws
+    false,  // kD3dCensusSkippedDraws
+    false,  // kD3dCensusSkippedShaderLoads
+    false,  // kD3dCensusSkippedConstantPackets
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

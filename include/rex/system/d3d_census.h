@@ -99,6 +99,11 @@ enum DrawClass : uint8_t {
 
 bool Enabled();
 void SetEnabled(bool enabled);
+// DL-1.1: classify only. The decoder keeps the draw classes and drops what
+// only the census report needs (per-packet mark lookups inside display
+// lists, the class timing); the game side drops the DL-0.2 device snapshots.
+bool Lean();
+void SetLean(bool lean);
 // The guest's presented frames (set by the game side at each frame); marks
 // older than a few frames are ignored, as their buffers may have been reused.
 uint32_t Frame();

@@ -11,6 +11,7 @@ namespace rex::system::d3d_census {
 namespace {
 
 std::atomic<bool> g_enabled{false};
+std::atomic<bool> g_lean{false};
 std::atomic<uint32_t> g_frame{0};
 
 // A mark older than this many guest frames is ignored: the guest runs at
@@ -76,6 +77,9 @@ void SetEnabled(bool enabled) {
   }
   g_enabled.store(enabled, std::memory_order_release);
 }
+
+bool Lean() { return g_lean.load(std::memory_order_relaxed); }
+void SetLean(bool lean) { g_lean.store(lean, std::memory_order_relaxed); }
 
 uint32_t Frame() { return g_frame.load(std::memory_order_relaxed); }
 void SetFrame(uint32_t frame) { g_frame.store(frame, std::memory_order_relaxed); }

@@ -241,6 +241,15 @@ enum class CounterId : uint16_t {
   kGpuUploadSplitsIndex,
   kGpuUploadSplitsTexture,
   kGpuUploadBytes,
+  // D3D census (DL-0.1/DL-1.1, pinyon_shift_d3d_census): drawn draws the
+  // census counts as visible to an API-level renderer and as fallback; with
+  // gpu_d3d_census_skip_visible, the draw packets, shader loads and ALU
+  // constant packets skipped in visible buffers.
+  kD3dCensusVisibleDraws,
+  kD3dCensusFallbackDraws,
+  kD3dCensusSkippedDraws,
+  kD3dCensusSkippedShaderLoads,
+  kD3dCensusSkippedConstantPackets,
 
   kCount  // sentinel -- must be last
 };

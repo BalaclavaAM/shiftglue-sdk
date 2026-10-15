@@ -595,6 +595,27 @@ class CommandProcessor {
     uint64_t hash = 0;
     uint32_t dword_count = 0;
   } decode_last_shader_load_[2];
+  // DL-1.1 wrong-image ceiling (gpu_d3d_census_skip_visible, read at each
+  // indirect buffer): the decoder skips the draws, shader loads and (at 2)
+  // ALU constant packets of the buffers the D3D census counts as visible.
+  // A skipped shader load is kept by type and done before the next draw
+  // that runs, so the fallback draws still see their shaders.
+  int32_t d3d_skip_visible_ = 0;
+  struct SkippedShaderLoad {
+    bool valid = false;
+    xenos::ShaderType type = xenos::ShaderType::kVertex;
+    uint32_t address = 0;
+    const uint32_t* ucode = nullptr;
+    uint32_t dword_count = 0;
+  } d3d_skipped_load_[2];
+  bool d3d_skipped_loads_pending_ = false;
+  // The census half of a draw packet; true if the packet was skipped.
+  bool D3dCensusDraw(memory::RingBuffer* reader, uint32_t count);
+  // Skips an ALU constant packet of a visible buffer; true if skipped.
+  bool D3dCensusSkipConstants(memory::RingBuffer* reader, uint32_t opcode, uint32_t count);
+  // Registers [first, first + count) may be skipped in a visible buffer.
+  bool D3dCensusSkippableRange(uint32_t first, uint32_t count) const;
+  void FlushSkippedShaderLoads();
   // PD-1.6: scratch registers whose writes do not write back (their
   // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
   // before anything that could observe them.

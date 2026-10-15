@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string_view>
 #include <unordered_map>
 
@@ -133,6 +134,18 @@ REXCVAR_DEFINE_INT32(gpu_trace_ib_writers, 0, "GPU",
                      "their link register) that write them")
     .range(0, 4096)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(gpu_d3d_census_skip_visible, 0, "GPU",
+                     "Diagnostics (D3D_RENDERER_RESEARCH DL-1.1, wrong image): with "
+                     "pinyon_shift_d3d_census on, skip the decoder's work for the draws the "
+                     "census counts as visible to an API-level renderer (draw calls, and lists "
+                     "unchanged or changed only by fixups). 1: their draw packets (EDRAM copies "
+                     "still run) and shader loads (done at the next draw that runs); 2: also "
+                     "their ALU constant packets; 3: also every register packet that touches "
+                     "no control, render-target, window, copy or resolve register (or fetch "
+                     "constant 0, which resolves read). Events, waits, memory writes, nested "
+                     "buffers and EDRAM copies are always executed")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_trace_ib_writers_rearm, false, "GPU",
                     "Diagnostics (DL-0.1): with gpu_trace_ib_writers, watch a written page again "
                     "at the decoder's next indirect buffer instead of at that buffer's next "
@@ -1732,6 +1745,8 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   } depth_guard{trace_ib_depth_};
   // DL-0.1 D3D source census (one flag check while it is off).
   d3d_census_decoder::IbBegin(ptr, count, trace_ib_depth_);
+  d3d_skip_visible_ =
+      d3d_census_decoder::Active() ? REXCVAR_GET(gpu_d3d_census_skip_visible) : 0;
   struct CensusGuard {
     uint32_t depth;
     ~CensusGuard() {
@@ -2175,6 +2190,13 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (d3d_skip_visible_ >= 2 && d3d_census_decoder::Active() && d3d_census_decoder::Visible() &&
+      D3dCensusSkippableRange(base_index, write_one_reg ? 1 : count)) {
+    // DL-1.1: state of a visible buffer.
+    PERF_counter_inc(kD3dCensusSkippedConstantPackets);
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    return true;
+  }
   if (!write_one_reg) {
     WriteRegisterRangeFromRing(reader, base_index, count);
     return true;
@@ -2283,6 +2305,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
         ReplayProbeMarkUnskippable();
         break;
     }
+  }
+
+  if (d3d_skip_visible_ >= 2 && d3d_census_decoder::Active() && d3d_census_decoder::Visible() &&
+      D3dCensusSkipConstants(reader, opcode, count)) {
+    return true;
   }
 
   bool cpu_visible_write = false;
@@ -3234,16 +3261,114 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
     }
 }
 
+bool CommandProcessor::D3dCensusDraw(memory::RingBuffer* reader, uint32_t count) {
+  if (d3d_census_decoder::Active()) {
+    const bool copy =
+        decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
+    // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
+    // of no tiling pass), the draws the untiled Android path keeps.
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy);
+    if (copy && d3d_skip_visible_ >= 3 && d3d_census_decoder::Visible()) {
+      static uint64_t visible_copies = 0;
+      const uint64_t copies = ++visible_copies;
+      if (!(copies & (copies - 1)) || !(copies % 10000)) {
+        REXGPU_INFO("DL-1.1: {} EDRAM copies met in visible buffers with skip mode 3", copies);
+      }
+    }
+    if (d3d_skip_visible_ && !copy && d3d_census_decoder::Visible()) {
+      // DL-1.1: no draw state derivation, no recording, no submission.
+      PERF_counter_inc(kD3dCensusSkippedDraws);
+      reader->AdvanceRead(count * sizeof(uint32_t));
+      return true;
+    }
+  }
+  if (d3d_skipped_loads_pending_) {
+    FlushSkippedShaderLoads();
+  }
+  return false;
+}
+
+void CommandProcessor::FlushSkippedShaderLoads() {
+  d3d_skipped_loads_pending_ = false;
+  for (SkippedShaderLoad& load : d3d_skipped_load_) {
+    if (!load.valid) continue;
+    load.valid = false;
+    auto shader = LoadShader(load.type, load.address, load.ucode, load.dword_count);
+    if (load.type == xenos::ShaderType::kVertex) {
+      active_vertex_shader_ = shader;
+    } else {
+      active_pixel_shader_ = shader;
+    }
+  }
+}
+
+bool CommandProcessor::D3dCensusSkippableRange(uint32_t first, uint32_t count) const {
+  if (!count) return false;
+  const uint32_t last = first + count - 1;
+  // ALU constants: from mode 2.
+  if (first >= 0x4000 && last < 0x4800) return true;
+  if (d3d_skip_visible_ < 3) return false;
+  // Mode 3: anything but the registers fences, events, render targets,
+  // windows, copies and resolves read (and fetch constant 0, the resolve
+  // rectangle's vertices), so EDRAM copies and the CPU-visible protocol stay
+  // exact while the draw state of visible buffers is not applied.
+  static constexpr uint32_t kKept[][2] = {
+      {0x0000, 0x2010},  // control, scratch, coherency; RB_*_INFO, screen scissor
+      {0x2080, 0x2090},  // window offset and scissors
+      {0x21F9, 0x21FA},  // VGT_EVENT_INITIATOR
+      {0x2200, 0x2210},  // PA_SU_SC_MODE_CNTL, PA_CL_VTE_CNTL, RB_MODECONTROL
+      {0x2310, 0x2330},  // RB_COPY_*, clears, sample counts
+      {0x4800, 0x4806},  // fetch constant 0
+  };
+  for (const auto& range : kKept) {
+    if (first < range[1] && last >= range[0]) return false;
+  }
+  return last < 0x10000;
+}
+
+bool CommandProcessor::D3dCensusSkipConstants(memory::RingBuffer* reader, uint32_t opcode,
+                                              uint32_t count) {
+  memory::RingBuffer peek = *reader;
+  uint32_t first = 0, registers = 0;
+  switch (opcode) {
+    case PM4_SET_CONSTANT: {
+      static constexpr uint32_t kBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+      const uint32_t offset_type = peek.ReadAndSwap<uint32_t>();
+      const uint32_t type = (offset_type >> 16) & 0xFF;
+      if (type >= std::size(kBase)) return false;
+      first = kBase[type] + (offset_type & 0x7FF);
+      registers = count - 1;
+    } break;
+    case PM4_LOAD_ALU_CONSTANT: {
+      static constexpr uint32_t kBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+      if (count < 3) return false;
+      peek.ReadAndSwap<uint32_t>();
+      const uint32_t offset_type = peek.ReadAndSwap<uint32_t>();
+      const uint32_t type = (offset_type >> 16) & 0xFF;
+      if (type >= std::size(kBase)) return false;
+      first = kBase[type] + (offset_type & 0x7FF);
+      registers = peek.ReadAndSwap<uint32_t>() & 0xFFF;
+    } break;
+    case PM4_SET_CONSTANT2:
+    case PM4_SET_SHADER_CONSTANTS:
+      first = peek.ReadAndSwap<uint32_t>() & 0xFFFF;
+      registers = count - 1;
+      break;
+    default:
+      return false;
+  }
+  if (!D3dCensusSkippableRange(first, registers)) return false;
+  PERF_counter_inc(kD3dCensusSkippedConstantPackets);
+  reader->AdvanceRead(count * sizeof(uint32_t));
+  return true;
+}
+
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
   ++ib_stats.decoded_draws;
   PERF_counter_inc(kGpuDecodedDraws);
-  if (d3d_census_decoder::Active()) {
-    // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
-    // of no tiling pass), the draws the untiled Android path keeps.
-    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 &&
-                             decode_regs().Get<reg::RB_MODECONTROL>().edram_mode !=
-                                 xenos::EdramMode::kCopy);
+  if (D3dCensusDraw(reader, count)) {
+    return true;
   }
   if (replay_probe.capturing &&
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
@@ -3268,12 +3393,8 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
                                                       uint32_t count) {
   ++ib_stats.decoded_draws;
   PERF_counter_inc(kGpuDecodedDraws);
-  if (d3d_census_decoder::Active()) {
-    // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
-    // of no tiling pass), the draws the untiled Android path keeps.
-    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 &&
-                             decode_regs().Get<reg::RB_MODECONTROL>().edram_mode !=
-                                 xenos::EdramMode::kCopy);
+  if (D3dCensusDraw(reader, count)) {
+    return true;
   }
   if (replay_probe.capturing &&
       register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
@@ -3402,6 +3523,16 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     return false;
   }
   const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
+  SkippedShaderLoad& skipped_load = d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel];
+  if (!record_split_ && d3d_skip_visible_ && d3d_census_decoder::Active() &&
+      d3d_census_decoder::Visible()) {
+    // DL-1.1: done only if a draw that runs comes before the next load.
+    skipped_load = {true, shader_type, addr, ucode, size_dwords};
+    d3d_skipped_loads_pending_ = true;
+    PERF_counter_inc(kD3dCensusSkippedShaderLoads);
+    return true;
+  }
+  skipped_load.valid = false;
   // Hashing the microcode is most of a shader load; the decoder has time.
   const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
@@ -3478,6 +3609,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
     return false;
   }
   const uint32_t guest_address = uint32_t(reader->read_ptr());
+  d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
   if (!record_split_) {
     auto shader = LoadShader(shader_type, guest_address,
                              reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
