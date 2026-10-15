@@ -41,6 +41,7 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/system/d3d_census.h>
+#include <rex/system/d3d_draw.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -53,6 +54,7 @@
 #endif
 
 #include "d3d_census_decoder.h"
+#include "d3d_draw_window.h"
 
 REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
@@ -2188,6 +2190,9 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
     return false;
   }
 
+  if (d3d_draw_open_ && D3dDrawType0(reader, packet)) {
+    return true;
+  }
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
   if (d3d_skip_visible_ >= 2 && d3d_census_decoder::Active() && d3d_census_decoder::Visible() &&
@@ -2245,6 +2250,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   if (opcode == PM4_XE_SWAP) {
     ++trace_swaps_;
     d3d_census_decoder::Swap();
+    if (d3d_draw_) D3dDrawSwap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -2261,22 +2267,12 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
                 register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
                 count > 0 ? rex::byte_swap(words[0]) : 0u, count > 1 ? rex::byte_swap(words[1]) : 0u);
   }
-  if (packet & 1) {
-    // Untiled, the first tile also runs the later tiles' objects; the packets
-    // predicated on a whole later tile set that tile's window offset,
-    // scissors and resolve destination, and stay with their tile.
-    const bool tile_state = (bin_mask_ & 0xFFFFFFFFu) == bin_mask_ &&
-                            (bin_mask_ & ~uint64_t(3)) &&
-                            (bin_mask_ == (uint64_t(3) << rex::tzcnt(uint32_t(bin_mask_)))) &&
-                            !(rex::tzcnt(uint32_t(bin_mask_)) & 1);
-    const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state
-                                ? ~uint64_t(0)
-                                : bin_select_;
-    bool any_pass = (select & bin_mask_) != 0;
-    if (!any_pass || opcode == PM4_XE_SWAP) {
-      reader->AdvanceRead(count * sizeof(uint32_t));
-      return true;
-    }
+  if (d3d_draw_open_ && D3dDrawType3(reader, packet, opcode, count)) {
+    return true;
+  }
+  if ((packet & 1) && PredicatedOut(packet, opcode)) {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+    return true;
   }
 
   if (replay_probe.capturing) {
@@ -2466,6 +2462,22 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   return result;
 }
 
+bool CommandProcessor::PredicatedOut(uint32_t packet, uint32_t opcode) const {
+  if (!(packet & 1)) return false;
+  // Untiled, the first tile also runs the later tiles' objects; the packets
+  // predicated on a whole later tile set that tile's window offset,
+  // scissors and resolve destination, and stay with their tile.
+  const bool tile_state = (bin_mask_ & 0xFFFFFFFFu) == bin_mask_ &&
+                          (bin_mask_ & ~uint64_t(3)) &&
+                          (bin_mask_ == (uint64_t(3) << rex::tzcnt(uint32_t(bin_mask_)))) &&
+                          !(rex::tzcnt(uint32_t(bin_mask_)) & 1);
+  const uint64_t select = untile_select_all_ && TilingPassOfSelect() == 0 && !tile_state
+                              ? ~uint64_t(0)
+                              : bin_select_;
+  const bool any_pass = (select & bin_mask_) != 0;
+  return !any_pass || opcode == PM4_XE_SWAP;
+}
+
 bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   // initialize CP's micro-engine
@@ -2479,6 +2491,14 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
+  if (count == 3) {
+    // DL-1.2: a D3D-level draw's marker (rex/system/d3d_draw.h).
+    const uint32_t magic = reader->ReadAndSwap<uint32_t>();
+    const uint32_t id = reader->ReadAndSwap<uint32_t>();
+    const uint32_t mode = reader->ReadAndSwap<uint32_t>();
+    if (magic == system::d3d_draw::kMarkerMagic) D3dDrawMarker(id, mode);
+    return true;
+  }
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
   reader->AdvanceRead(count * sizeof(uint32_t));
@@ -3328,7 +3348,18 @@ bool CommandProcessor::D3dCensusSkippableRange(uint32_t first, uint32_t count) c
 
 bool CommandProcessor::D3dCensusSkipConstants(memory::RingBuffer* reader, uint32_t opcode,
                                               uint32_t count) {
-  memory::RingBuffer peek = *reader;
+  uint32_t first = 0, registers = 0;
+  if (!ConstantPacketRange(*reader, opcode, count, &first, &registers)) return false;
+  if (!D3dCensusSkippableRange(first, registers)) return false;
+  PERF_counter_inc(kD3dCensusSkippedConstantPackets);
+  reader->AdvanceRead(count * sizeof(uint32_t));
+  return true;
+}
+
+bool CommandProcessor::ConstantPacketRange(const memory::RingBuffer& reader, uint32_t opcode,
+                                           uint32_t count, uint32_t* first_out,
+                                           uint32_t* registers_out) {
+  memory::RingBuffer peek = reader;
   uint32_t first = 0, registers = 0;
   switch (opcode) {
     case PM4_SET_CONSTANT: {
@@ -3357,9 +3388,8 @@ bool CommandProcessor::D3dCensusSkipConstants(memory::RingBuffer* reader, uint32
     default:
       return false;
   }
-  if (!D3dCensusSkippableRange(first, registers)) return false;
-  PERF_counter_inc(kD3dCensusSkippedConstantPackets);
-  reader->AdvanceRead(count * sizeof(uint32_t));
+  *first_out = first;
+  *registers_out = registers;
   return true;
 }
 
@@ -3522,17 +3552,23 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     assert_unhandled_case(shader_type);
     return false;
   }
-  const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
-  SkippedShaderLoad& skipped_load = d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel];
   if (!record_split_ && d3d_skip_visible_ && d3d_census_decoder::Active() &&
       d3d_census_decoder::Visible()) {
     // DL-1.1: done only if a draw that runs comes before the next load.
-    skipped_load = {true, shader_type, addr, ucode, size_dwords};
+    d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel] = {
+        true, shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords};
     d3d_skipped_loads_pending_ = true;
     PERF_counter_inc(kD3dCensusSkippedShaderLoads);
     return true;
   }
-  skipped_load.valid = false;
+  LoadGuestShader(shader_type, addr, size_dwords);
+  return true;
+}
+
+void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t addr,
+                                       uint32_t size_dwords) {
+  const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
+  d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
   // Hashing the microcode is most of a shader load; the decoder has time.
   const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
@@ -3544,7 +3580,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
       decode_shader_loads_skipped_.store(
           decode_shader_loads_skipped_.load(std::memory_order_relaxed) + 1,
           std::memory_order_relaxed);
-      return true;
+      return;
     }
     last.valid = true;
     last.hash = ucode_hash;
@@ -3561,7 +3597,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     const uint64_t ucode_pointer = uint64_t(reinterpret_cast<uintptr_t>(ucode));
     std::memcpy(entry + 4, &ucode_pointer, sizeof(ucode_pointer));
     std::memcpy(entry + 6, &ucode_hash, sizeof(ucode_hash));
-    return true;
+    return;
   }
   decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
   RecordCall([this, shader_type, addr, ucode, size_dwords, ucode_hash]() {
@@ -3573,7 +3609,6 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
       active_pixel_shader_ = shader;
     }
   });
-  return true;
 }
 
 void CommandProcessor::ExecuteLoadShaderRecord(const uint32_t* words) {
@@ -3608,11 +3643,18 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
     assert_unhandled_case(shader_type);
     return false;
   }
-  const uint32_t guest_address = uint32_t(reader->read_ptr());
+  LoadInlineShader(shader_type, uint32_t(reader->read_ptr()),
+                   reinterpret_cast<const uint32_t*>(reader->read_ptr()), size_dwords);
+  reader->AdvanceRead(size_dwords * sizeof(uint32_t));
+  return true;
+}
+
+void CommandProcessor::LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                                        const uint32_t* ucode_words, uint32_t size_dwords) {
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
   if (!record_split_) {
-    auto shader = LoadShader(shader_type, guest_address,
-                             reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+    auto shader =
+        LoadShader(shader_type, guest_address, const_cast<uint32_t*>(ucode_words), size_dwords);
     if (shader_type == xenos::ShaderType::kVertex) {
       active_vertex_shader_ = shader;
     } else {
@@ -3623,8 +3665,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
     // thread moves on: the recorder gets a copy.
     decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
     std::vector<uint32_t> ucode(size_dwords);
-    std::memcpy(ucode.data(), reinterpret_cast<const void*>(reader->read_ptr()),
-                size_dwords * sizeof(uint32_t));
+    std::memcpy(ucode.data(), ucode_words, size_dwords * sizeof(uint32_t));
     RecordCall([this, shader_type, guest_address, ucode = std::move(ucode)]() mutable {
       auto shader = LoadShader(shader_type, guest_address, ucode.data(), uint32_t(ucode.size()));
       if (shader_type == xenos::ShaderType::kVertex) {
@@ -3634,8 +3675,6 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
       }
     });
   }
-  reader->AdvanceRead(size_dwords * sizeof(uint32_t));
-  return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* reader,
@@ -3673,6 +3712,12 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
   }
 
   return true;
+}
+
+
+void CommandProcessor::D3dDrawCountDraw() {
+  ++ib_stats.decoded_draws;
+  PERF_counter_inc(kGpuDecodedDraws);
 }
 
 }  // namespace rex::graphics

@@ -616,6 +616,39 @@ class CommandProcessor {
   // Registers [first, first + count) may be skipped in a visible buffer.
   bool D3dCensusSkippableRange(uint32_t first, uint32_t count) const;
   void FlushSkippedShaderLoads();
+  // An IM_LOAD's work (also a D3D-level draw's pointer load).
+  void LoadGuestShader(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords);
+  // An IM_LOAD_IMMEDIATE's work; ucode is copied when recorded.
+  void LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                        const uint32_t* ucode, uint32_t size_dwords);
+  // Registers [*first, *first + *count) a constant packet writes; false for
+  // other packets.
+  static bool ConstantPacketRange(const memory::RingBuffer& reader, uint32_t opcode,
+                                  uint32_t count, uint32_t* first, uint32_t* registers);
+  // A predicated type-3 packet that the bin mask and select drop.
+  bool PredicatedOut(uint32_t packet, uint32_t opcode) const;
+
+  // DL-1.2 D3D-level draws (rex/system/d3d_draw.h): a marker opens a window
+  // over the packets of one guest draw call, which ends at its draw packet.
+  // In verify mode the packets run and are compared with the description;
+  // in draw mode the packets the description covers are skipped and the
+  // description is applied and drawn at the draw packet.
+  struct D3dDrawWindow;
+  std::unique_ptr<D3dDrawWindow> d3d_draw_;
+  bool d3d_draw_open_ = false;
+  void D3dDrawMarker(uint32_t id, uint32_t mode);
+  // A packet inside an open window: true if it was consumed.
+  bool D3dDrawType0(memory::RingBuffer* reader, uint32_t packet);
+  bool D3dDrawType3(memory::RingBuffer* reader, uint32_t packet, uint32_t opcode,
+                    uint32_t count);
+  // Closes the window; in draw mode applies the skipped state first.
+  void D3dDrawAbort(uint32_t reason);
+  void D3dDrawApplyState();
+  void D3dDrawVerify(const memory::RingBuffer& reader, uint32_t opcode, uint32_t count);
+  void D3dDrawIssue(uint32_t packet);
+  void D3dDrawSwap();
+  // Counts a drawn description as a decoded draw (the scene measure).
+  void D3dDrawCountDraw();
   // PD-1.6: scratch registers whose writes do not write back (their
   // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
   // before anything that could observe them.
