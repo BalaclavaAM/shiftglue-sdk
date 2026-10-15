@@ -28,7 +28,7 @@
 
 #include "d3d_shader_cache.h"
 
-REXCVAR_DEFINE_INT32(gpu_d3d_shader_cache, 0, "GPU",
+REXCVAR_DEFINE_INT32(gpu_d3d_shader_cache, 2, "GPU",
                      "Keep each IM_LOAD's microcode hash and shader by address and size while a "
                      "write watch shows its pages unwritten, so a repeated load neither hashes "
                      "nor looks the shader up (0: off; 1: verify, hash and look up every load "
