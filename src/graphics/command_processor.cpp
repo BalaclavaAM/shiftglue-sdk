@@ -55,6 +55,7 @@
 
 #include "d3d_census_decoder.h"
 #include "d3d_draw_window.h"
+#include "d3d_list_compiler.h"
 
 REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "Diagnostics: log the bin masks, bin selects, screen extent writes, draws, "
@@ -1889,6 +1890,13 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     }
   }
 
+  // DL-2.1: nested buffers (display lists) from their compiled form. The
+  // mode is 0 whenever the census, the packet recorder or bin tracing is on.
+  if (d3d_list_mode_ && trace_ib_depth_ >= 2 && !d3d_draw_open_ && !probe_mode &&
+      !ib_stats_enabled && !template_stats && D3dListExecute(ptr, count)) {
+    return;
+  }
+
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -1900,6 +1908,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+  if (d3d_list_verify_depth_ == trace_ib_depth_) D3dListVerifyEnd();
 
   if (template_stats) {
     RecordCall([this]() { TemplateStatsIbEnd(); });
@@ -2251,6 +2260,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     ++trace_swaps_;
     d3d_census_decoder::Swap();
     if (d3d_draw_) D3dDrawSwap();
+    D3dListSwap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -2269,6 +2279,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   }
   if (d3d_draw_open_ && D3dDrawType3(reader, packet, opcode, count)) {
     return true;
+  }
+  if (d3d_list_verify_depth_ == trace_ib_depth_ &&
+      (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2)) {
+    D3dListVerifyDraw();
   }
   if ((packet & 1) && PredicatedOut(packet, opcode)) {
     reader->AdvanceRead(count * sizeof(uint32_t));
@@ -2496,7 +2510,12 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
     const uint32_t magic = reader->ReadAndSwap<uint32_t>();
     const uint32_t id = reader->ReadAndSwap<uint32_t>();
     const uint32_t mode = reader->ReadAndSwap<uint32_t>();
-    if (magic == system::d3d_draw::kMarkerMagic) D3dDrawMarker(id, mode);
+    if (magic == system::d3d_draw::kMarkerMagic) {
+      D3dDrawMarker(id, mode);
+    } else if (magic == system::d3d_draw::kReplaceMagic) {
+      // DL-2.1: a replaced draw call (arena offset, (id << 2) | mode).
+      D3dSliceMarker(id, mode);
+    }
     return true;
   }
   // skip N 32-bit words to get to the next packet
@@ -3569,6 +3588,9 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
                                        uint32_t size_dwords) {
   const uint32_t* ucode = memory_->TranslatePhysical<uint32_t*>(addr);
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+  if (d3d_list_verify_depth_ == trace_ib_depth_) {
+    D3dListVerifyLoad(uint32_t(shader_type), addr, size_dwords);
+  }
   // Hashing the microcode is most of a shader load; the decoder has time.
   const uint64_t ucode_hash = record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0;
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
@@ -3652,6 +3674,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
 void CommandProcessor::LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                         const uint32_t* ucode_words, uint32_t size_dwords) {
   d3d_skipped_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
+  if (d3d_list_verify_depth_ == trace_ib_depth_) {
+    D3dListVerifyLoad(uint32_t(shader_type), 0, size_dwords);
+  }
   if (!record_split_) {
     auto shader =
         LoadShader(shader_type, guest_address, const_cast<uint32_t*>(ucode_words), size_dwords);
