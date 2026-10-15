@@ -41,9 +41,8 @@
 //   WriteRegistersHost. The register file, its state hash and the backend's
 //   dirty tracking end each draw as the PM4 path leaves them: a dropped write
 //   stored the value the register already held.
-// - Shader cache (gpu_d3d_shader_cache): an IM_LOAD's hash and shader by
-//   address, size and type, valid while the microcode's pages are unwritten,
-//   so a repeated load neither hashes nor looks the shader up.
+// The page watch and the shader-load cache it was built with are in
+// d3d_shader_cache.cpp.
 
 #include <algorithm>
 #include <cstring>
@@ -89,14 +88,6 @@ REXCVAR_DEFINE_INT32(gpu_d3d_list_host_regs, -1, "GPU",
                      "at each swap")
     .range(-1, 1)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(gpu_d3d_shader_cache, -1, "GPU",
-                     "D3D_RENDERER_RESEARCH DL-2.1 attempt 2: keep each IM_LOAD's microcode hash "
-                     "and shader by address and size while a write watch shows its pages "
-                     "unwritten (-1: follow gpu_d3d_list_compile's mode; 0: off; 1: verify, hash "
-                     "every load and compare; 2: on). Read at each swap")
-    .range(-1, 2)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
 REXCVAR_DECLARE(bool, gpu_ib_identity_stats);
 REXCVAR_DECLARE(bool, gpu_template_stats);
@@ -276,76 +267,6 @@ void CommandProcessor::ExecutePacketsFrom(const uint32_t* base, uint32_t count,
   } while (reader.read_count());
 }
 
-D3dPageWatch::D3dPageWatch(memory::Memory* memory_in) : memory(memory_in) {
-  gen.reset(new std::atomic<uint32_t>[kPageCount]);
-  armed.reset(new std::atomic<uint8_t>[kPageCount]);
-  for (uint32_t i = 0; i < kPageCount; ++i) {
-    gen[i].store(0, std::memory_order_relaxed);
-    armed[i].store(0, std::memory_order_relaxed);
-  }
-  handle = memory->RegisterPhysicalMemoryInvalidationCallback(Callback, this);
-}
-
-D3dPageWatch::~D3dPageWatch() {
-  if (handle) memory->UnregisterPhysicalMemoryInvalidationCallback(handle);
-}
-
-void D3dPageWatch::Arm(uint32_t page_first, uint32_t page_count) {
-  uint32_t run_first = UINT32_MAX;
-  auto flush = [&](uint32_t end) {
-    if (run_first == UINT32_MAX) return;
-    memory->EnablePhysicalMemoryAccessCallbacks(run_first << kPageShift,
-                                                (end - run_first) << kPageShift, true, false);
-    ++arms;
-    arm_pages += end - run_first;
-    run_first = UINT32_MAX;
-  };
-  const uint32_t page_end = std::min(page_first + page_count, kPageCount);
-  for (uint32_t page = page_first; page < page_end; ++page) {
-    if (armed[page].load(std::memory_order_relaxed)) {
-      flush(page);
-      continue;
-    }
-    armed[page].store(1, std::memory_order_relaxed);
-    if (run_first == UINT32_MAX) run_first = page;
-  }
-  flush(page_end);
-}
-
-std::pair<uint32_t, uint32_t> D3dPageWatch::Callback(void* context, uint32_t physical_start,
-                                                     uint32_t length, bool exact_range) {
-  // On the writing thread, with the global critical region held.
-  auto& self = *static_cast<D3dPageWatch*>(context);
-  const uint32_t first = std::min(physical_start >> kPageShift, kPageCount - 1);
-  const uint32_t last = std::min(
-      uint32_t((uint64_t(physical_start) + std::max(length, 1u) - 1) >> kPageShift),
-      kPageCount - 1);
-  uint32_t dropped = 0;
-  for (uint32_t page = first; page <= last; ++page) {
-    if (self.armed[page].load(std::memory_order_relaxed)) {
-      self.armed[page].store(0, std::memory_order_relaxed);
-      ++dropped;
-    }
-    // After the armed flag: a decoder reading the new generation re-arms.
-    self.gen[page].fetch_add(1, std::memory_order_release);
-  }
-  if (dropped) {
-    self.faults.fetch_add(1, std::memory_order_relaxed);
-    self.fault_pages.fetch_add(dropped, std::memory_order_relaxed);
-  }
-  if (exact_range) return {0, UINT32_MAX};
-  // The memory system unwatches the intersection of the callbacks' ranges,
-  // up to 4 MB around the write: keep it off the other pages we watch, which
-  // would otherwise lose their watch without a callback.
-  const uint32_t window_first = first & ~uint32_t(1023);
-  const uint32_t window_last = std::min(last | 1023u, kPageCount - 1);
-  uint32_t lo = first, hi = last;
-  while (lo > window_first && !self.armed[lo - 1].load(std::memory_order_relaxed)) --lo;
-  while (hi < window_last && !self.armed[hi + 1].load(std::memory_order_relaxed)) ++hi;
-  if (lo == window_first && hi == window_last) return {0, UINT32_MAX};
-  return {lo << kPageShift, (hi - lo + 1) << kPageShift};
-}
-
 namespace {
 
 // Writes the host plan never drops: they act on more than the register value,
@@ -500,7 +421,7 @@ bool CommandProcessor::D3dListExecute(uint32_t ptr, uint32_t count) {
   const bool watchable =
       d3d_list_watch_ && int32_t(list.watch_off_until - c.swaps) <= 0;
   auto snapshot_and_arm = [&]() {
-    D3dPageWatch& watch = *c.watch;
+    D3dPageWatch& watch = *d3d_page_watch_;
     const uint32_t physical = ptr & 0x1FFFFFFFu;
     list.page_first = physical >> D3dPageWatch::kPageShift;
     list.page_count =
@@ -516,7 +437,7 @@ bool CommandProcessor::D3dListExecute(uint32_t ptr, uint32_t count) {
     if (list.watched && d3d_list_watch_) {
       clean = true;
       for (uint32_t i = 0; i < list.page_count; ++i) {
-        if (c.watch->Gen(list.page_first + i) != list.page_gens[i]) {
+        if (d3d_page_watch_->Gen(list.page_first + i) != list.page_gens[i]) {
           clean = false;
           break;
         }
@@ -738,7 +659,17 @@ bool CommandProcessor::D3dListExecute(uint32_t ptr, uint32_t count) {
                          op.count);
       } break;
       case D3dListCompiler::kOpDraw: {
-        if ((op.packet & 1) && PredicatedOut(op.packet, op.first)) break;
+        // DL-2.2 statistics: replayed draws by tiling pass (-1 untiled, 0
+        // the first tile, 1 and up a later one), those the bin predicate
+        // culled, and those the backend dropped for the untile pass.
+        const int32_t pass = TilingPassOfSelect();
+        const uint32_t tile = pass < 0 ? 0 : (pass == 0 ? 1 : 2);
+        ++c.stats.tile_draws[tile];
+        if ((op.packet & 1) && PredicatedOut(op.packet, op.first)) {
+          ++c.stats.tile_culled[tile];
+          break;
+        }
+        const uint64_t untile_before = untile_skipped_draws_;
         memory::RingBuffer reader(
             reinterpret_cast<uint8_t*>(const_cast<uint32_t*>(words + op.payload)),
             op.count * sizeof(uint32_t));
@@ -748,6 +679,7 @@ bool CommandProcessor::D3dListExecute(uint32_t ptr, uint32_t count) {
         } else {
           ExecutePacketType3_DRAW_INDX_2(&reader, op.packet, op.count);
         }
+        c.stats.tile_untile_skipped[tile] += untile_skipped_draws_ - untile_before;
       } break;
       case D3dListCompiler::kOpBin: {
         const uint64_t value = Swap(words[op.payload]);
@@ -792,77 +724,6 @@ bool CommandProcessor::D3dListExecute(uint32_t ptr, uint32_t count) {
       } break;
     }
   }
-  return true;
-}
-
-bool CommandProcessor::D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr,
-                                          uint32_t size_dwords, const uint32_t* ucode,
-                                          uint64_t& hash) {
-  D3dListCompiler& c = *d3d_lists_;
-  D3dListCompiler::ShaderStats& s = c.shader_stats;
-  ++s.loads;
-  const uint32_t physical = addr & 0x1FFFFFFFu;
-  const uint32_t page_first = physical >> D3dPageWatch::kPageShift;
-  const uint32_t page_count =
-      size_dwords
-          ? ((physical + size_dwords * 4 - 1) >> D3dPageWatch::kPageShift) - page_first + 1
-          : 1;
-  if (page_count > D3dListCompiler::kShaderPages) return false;
-  const uint32_t slot = ((physical >> 2) * 0x9E3779B1u ^ size_dwords * 0x85EBCA6Bu ^
-                         uint32_t(shader_type) * 0xC2B2AE35u) >>
-                        (32 - 12);
-  static_assert(D3dListCompiler::kShaderEntries == 1u << 12);
-  D3dListCompiler::ShaderEntry& e = c.shaders[slot];
-  D3dPageWatch& watch = *c.watch;
-  bool valid = e.page_count && e.address == addr && e.dwords == size_dwords &&
-               e.type == uint32_t(shader_type);
-  if (valid) {
-    for (uint32_t i = 0; i < e.page_count; ++i) {
-      if (watch.Gen(e.page_first + i) != e.page_gens[i]) {
-        valid = false;
-        ++s.stale;
-        break;
-      }
-    }
-  }
-  const bool verify = d3d_shader_cache_mode_ == 1;
-  if (valid && verify) {
-    ++s.verified;
-    if (HashShaderMicrocode(ucode, size_dwords) != e.hash) {
-      ++s.mismatches;
-      valid = false;
-      if (c.logs < 64) {
-        ++c.logs;
-        REXGPU_INFO("DL-2.1 shader cache mismatch: {:08X}, {} dwords", addr, size_dwords);
-      }
-    }
-  }
-  if (!valid) {
-    // Snapshot, arm, then hash: a write after the snapshot shows.
-    e.page_count = 0;
-    for (uint32_t i = 0; i < page_count; ++i) e.page_gens[i] = watch.Gen(page_first + i);
-    watch.Arm(page_first, page_count);
-    const uint64_t new_hash = HashShaderMicrocode(ucode, size_dwords);
-    if (!new_hash) return false;  // the backend hashes for itself
-    e.address = addr;
-    e.dwords = size_dwords;
-    e.type = uint32_t(shader_type);
-    e.page_first = page_first;
-    e.page_count = page_count;
-    e.hash = new_hash;
-    e.shader = record_split_ ? nullptr
-                             : LoadShaderHashed(shader_type, addr, ucode, size_dwords, new_hash);
-    ++s.fills;
-  } else {
-    ++s.hits;
-  }
-  if (verify) return false;
-  hash = e.hash;
-  if (record_split_) return false;  // recorded with the hash
-  Shader*& active =
-      shader_type == xenos::ShaderType::kVertex ? active_vertex_shader_ : active_pixel_shader_;
-  s.same += active == e.shader;
-  active = e.shader;
   return true;
 }
 
@@ -961,20 +822,12 @@ void CommandProcessor::D3dListSwap() {
   if (watch < 0) watch = 1;
   int32_t host_regs = REXCVAR_GET(gpu_d3d_list_host_regs);
   if (host_regs < 0) host_regs = 1;
-  int32_t shader_cache = REXCVAR_GET(gpu_d3d_shader_cache);
-  if (shader_cache < 0) shader_cache = mode;
   d3d_list_watch_ = mode && watch;
   d3d_list_host_regs_ = d3d_list_watch_ && host_regs;
-  d3d_shader_cache_mode_ = mode ? uint32_t(shader_cache) : 0;
   if (mode && !d3d_lists_) d3d_lists_ = std::make_unique<D3dListCompiler>();
   if (!d3d_lists_) return;
   D3dListCompiler& c = *d3d_lists_;
-  if ((d3d_list_watch_ || d3d_shader_cache_mode_) && !c.watch) {
-    c.watch = std::make_unique<D3dPageWatch>(memory_);
-  }
-  if (d3d_shader_cache_mode_ && !c.shaders) {
-    c.shaders.reset(new D3dListCompiler::ShaderEntry[D3dListCompiler::kShaderEntries]);
-  }
+  if (d3d_list_watch_) D3dPageWatchGet();
   ++c.swaps;
   if (++c.sweep_swaps < D3dListCompiler::kSweepSwaps) return;
   c.sweep_swaps = 0;
@@ -1004,12 +857,14 @@ void CommandProcessor::D3dListSwap() {
         s.generic_ops, s.bailed, s.compiles, c.lists.size(), s.evicted,
         fallback.empty() ? " none" : fallback);
     uint64_t faults = 0, fault_pages = 0, arms = 0, arm_pages = 0;
-    if (c.watch) {
-      faults = c.watch->faults.exchange(0, std::memory_order_relaxed);
-      fault_pages = c.watch->fault_pages.exchange(0, std::memory_order_relaxed);
-      arms = c.watch->arms;
-      arm_pages = c.watch->arm_pages;
-      c.watch->arms = c.watch->arm_pages = 0;
+    if (d3d_page_watch_) {
+      // Arms include the shader cache's.
+      D3dPageWatch& w = *d3d_page_watch_;
+      faults = w.faults.exchange(0, std::memory_order_relaxed);
+      fault_pages = w.fault_pages.exchange(0, std::memory_order_relaxed);
+      arms = w.arms;
+      arm_pages = w.arm_pages;
+      w.arms = w.arm_pages = 0;
     }
     REXGPU_INFO(
         "DL-2.1 list validation (watch {}, plan {}): {} clean by the watch, {} checked ({} "
@@ -1019,6 +874,15 @@ void CommandProcessor::D3dListSwap() {
         d3d_list_watch_, d3d_list_host_regs_, s.clean, s.checked, s.check_words, s.dirty,
         s.watch_off, s.watch_misses, arms, arm_pages, faults, fault_pages, s.plan_runs,
         s.plan_builds, s.plan_registers, s.plan_elided);
+    if (s.tile_draws[1] || s.tile_draws[2]) {
+      REXGPU_INFO(
+          "DL-2.2 list draws by tiling pass (replayed / culled by the bin predicate / dropped "
+          "for the untile pass): untiled {} / {} / {}, first tile {} / {} / {}, later tiles {} / "
+          "{} / {}",
+          s.tile_draws[0], s.tile_culled[0], s.tile_untile_skipped[0], s.tile_draws[1],
+          s.tile_culled[1], s.tile_untile_skipped[1], s.tile_draws[2], s.tile_culled[2],
+          s.tile_untile_skipped[2]);
+    }
     if (s.verified) {
       REXGPU_INFO(
           "DL-2.1 list verify: {} runs ({} unmodelled after a generic packet), {} draws, {} "
@@ -1038,15 +902,6 @@ void CommandProcessor::D3dListSwap() {
   }
   if (!top.empty()) REXGPU_INFO("DL-2.1 lists: generic packets by opcode:{}", top);
   c.stats = {};
-  const auto& t = c.shader_stats;
-  if (t.loads) {
-    REXGPU_INFO(
-        "DL-2.1 shader cache (mode {}): {} loads, {} hits ({} already active), {} fills, {} "
-        "stale; verify: {} compared, {} mismatches",
-        d3d_shader_cache_mode_, t.loads, t.hits, t.same, t.fills, t.stale, t.verified,
-        t.mismatches);
-  }
-  c.shader_stats = {};
 }
 
 }  // namespace rex::graphics

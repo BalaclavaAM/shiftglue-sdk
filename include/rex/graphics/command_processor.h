@@ -51,6 +51,7 @@ namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+struct D3dPageWatch;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -522,6 +523,8 @@ class CommandProcessor {
   // gpu_trace_bins_vblank: the indirect buffer nesting depth.
   uint32_t trace_ib_depth_ = 0;
  protected:
+  // Forgets the shader cache's shaders (before the backend destroys them).
+  void D3dShaderCacheReset();
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
@@ -670,17 +673,25 @@ class CommandProcessor {
   std::unique_ptr<D3dListCompiler> d3d_lists_;
   uint32_t d3d_list_mode_ = 0;
   // Attempt 2 parts, read at each swap with the mode: the page watch
-  // validates compiled lists (gpu_d3d_list_watch), watched lists replay their
-  // register writes from a host plan (gpu_d3d_list_host_regs), and IM_LOADs
-  // reuse their hash and shader while their microcode is unwritten
-  // (gpu_d3d_shader_cache: 1 verify, 2 on).
+  // validates compiled lists (gpu_d3d_list_watch) and watched lists replay
+  // their register writes from a host plan (gpu_d3d_list_host_regs).
   bool d3d_list_watch_ = false;
   bool d3d_list_host_regs_ = false;
+  // Write watch on guest physical pages (d3d_shader_cache.cpp), shared by the
+  // list compiler and the shader cache; made by the first user.
+  std::unique_ptr<D3dPageWatch> d3d_page_watch_;
+  D3dPageWatch& D3dPageWatchGet();
+  // Shader-load cache (d3d_shader_cache.cpp): IM_LOADs reuse their hash and,
+  // decoding inline, their shader while their microcode is unwritten
+  // (gpu_d3d_shader_cache, read at each swap: 0 off, 1 verify, 2 on).
+  struct D3dShaderCache;
+  std::unique_ptr<D3dShaderCache> d3d_shader_cache_;
   uint32_t d3d_shader_cache_mode_ = 0;
   // An IM_LOAD through the shader cache: true if it set the active shader;
   // otherwise `hash` is the microcode's hash when the cache knows it (0 not).
   bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
                           const uint32_t* ucode, uint64_t& hash);
+  void D3dShaderCacheSwap();
   // Runs a nested buffer from its compiled form; false to decode it.
   bool D3dListExecute(uint32_t ptr, uint32_t count);
   // Verify: the buffer at this depth was modelled; it is decoded now and

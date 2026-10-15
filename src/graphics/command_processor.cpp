@@ -1303,7 +1303,7 @@ bool CommandProcessor::SetupContext() {
   return true;
 }
 
-void CommandProcessor::ShutdownContext() {}
+void CommandProcessor::ShutdownContext() { D3dShaderCacheReset(); }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
   read_ptr_index_ = 0;
@@ -2261,6 +2261,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     d3d_census_decoder::Swap();
     if (d3d_draw_) D3dDrawSwap();
     D3dListSwap();
+    D3dShaderCacheSwap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -3594,13 +3595,14 @@ void CommandProcessor::LoadGuestShader(xenos::ShaderType shader_type, uint32_t a
   uint64_t cached_hash = 0;
   if (d3d_shader_cache_mode_ &&
       D3dShaderCacheLoad(shader_type, addr, size_dwords, ucode, cached_hash)) {
-    // DL-2.1 attempt 2: the same microcode as when hashed; the shader is set.
+    // The same microcode as when hashed; the shader is set.
     decode_last_shader_load_[shader_type == xenos::ShaderType::kPixel].valid = false;
     return;
   }
   // Hashing the microcode is most of a shader load; the decoder has time.
+  // The shader cache may have hashed it already.
   const uint64_t ucode_hash =
-      record_split_ ? (cached_hash ? cached_hash : HashShaderMicrocode(ucode, size_dwords)) : 0;
+      cached_hash ? cached_hash : (record_split_ ? HashShaderMicrocode(ucode, size_dwords) : 0);
   if (record_split_ && REXCVAR_GET(gpu_record_shader_load_entries)) {
     decode_shader_loads_.store(decode_shader_loads_.load(std::memory_order_relaxed) + 1,
                                std::memory_order_relaxed);

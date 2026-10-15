@@ -2669,6 +2669,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   const auto destroy = [this]() {
     fh1_native_executor_.reset();
     texture_cache_.reset();
+    D3dShaderCacheReset();  // its shaders go with the pipeline cache
     pipeline_cache_.reset();
     render_target_cache_.reset();
   };

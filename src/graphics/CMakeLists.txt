@@ -20,6 +20,7 @@ set(REXGPU_XENOS_SOURCES
     d3d_census_decoder.cpp
     d3d_draw_path.cpp
     d3d_list_compiler.cpp
+    d3d_shader_cache.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
     fh1_frame_dump.cpp
