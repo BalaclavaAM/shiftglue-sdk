@@ -6,6 +6,8 @@
 #include <iterator>
 #include <sstream>
 
+#include <rex/filesystem.h>
+
 namespace rex::graphics {
 
 namespace {
@@ -93,7 +95,7 @@ bool ParseCubeLut(std::string_view text, CubeLut& lut, std::string& error) {
 bool LoadCubeLut(const std::filesystem::path& path, CubeLut& lut, std::string& error) {
   std::ifstream file(path, std::ios::binary);
   if (!file) {
-    error = "cannot open " + path.string();
+    error = "cannot open " + rex::path_to_utf8(path);
     return false;
   }
   const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};

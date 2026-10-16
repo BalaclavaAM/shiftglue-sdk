@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/cube_lut.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/logging.h>
@@ -243,7 +244,9 @@ bool VulkanCommandProcessor::UpdateSceneLut() {
   bool real = false;
   if (!path.empty()) {
     std::string error;
-    real = LoadCubeLut(path, lut, error);
+    // The cvar holds UTF-8; a std::string converts through the ANSI code
+    // page on Windows.
+    real = LoadCubeLut(rex::to_path(path), lut, error);
     if (real) {
       REXGPU_INFO("Scene LUT: {} ({}^3)", path, lut.size);
     } else {

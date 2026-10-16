@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/audio/host_music.h>
+#include <rex/filesystem.h>
 
 namespace {
 
@@ -120,4 +121,22 @@ TEST_CASE("Host music finds playable tracks recursively in name order", "[audio]
   if (HostMusicPlayer::CanDecodeMp3()) expected.push_back(folder.path / "c.mp3");
   expected.push_back(folder.path / "sub" / "a.WAV");
   CHECK(tracks == expected);
+}
+
+TEST_CASE("Host music reports a title the ANSI code page cannot hold", "[audio][host_music]") {
+  // path::string() threw for a Cyrillic file name on Windows, so the
+  // status line crashed the game (pinyon-shift#552). Titles are UTF-8.
+  TempFolder folder;
+  std::vector<uint8_t> data(4);
+  // "Кино - Кукушка" in UTF-8.
+  const std::string title =
+      "\xD0\x9A\xD0\xB8\xD0\xBD\xD0\xBE - \xD0\x9A\xD1\x83\xD0\xBA\xD1\x83\xD1\x88\xD0\xBA\xD0\xB0";
+  WriteWav(folder.path / rex::to_path(title + ".wav"), 1, 1, 44100, 16, data);
+
+  auto& player = HostMusicPlayer::Get();
+  REQUIRE(player.Play(folder.path));
+  const auto status = player.GetStatus();
+  player.Stop();
+  CHECK(status.count == 1);
+  CHECK(status.title == title);
 }

@@ -518,7 +518,10 @@ HostMusicPlayer::Status HostMusicPlayer::GetStatus() const {
   status.count = impl_->tracks.size();
   if (!impl_->order.empty()) {
     status.index = impl_->order[impl_->position];
-    status.title = impl_->tracks[status.index].stem().string();
+    // UTF-8, not path::string(): on Windows that converts through the ANSI
+    // code page and throws for a name it can't hold, such as Cyrillic
+    // titles on a Western-locale PC (pinyon-shift#552).
+    status.title = rex::path_to_utf8(impl_->tracks[status.index].stem());
   }
   return status;
 }
