@@ -67,6 +67,10 @@ REXCVAR_DEFINE_BOOL(vulkan_debug_object_names, !REX_PLATFORM_ANDROID, "UI/Vulkan
                     "Android: the emulator's Mesa-based driver crashes naming objects its "
                     "gfxstream layer does not back with Mesa objects")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(vulkan_max_api_version_minor, 0, "UI/Vulkan",
+                     "Diagnostics: treat the device as Vulkan 1.<n> at most (1 or 2; 0 = no cap), "
+                     "so the 1.1 and 1.2 setup paths can be tested on a newer driver (#618)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_capability_report, REX_PLATFORM_ANDROID, "UI/Vulkan",
                     "Log one VULKAN_CAPABILITY_REPORT line per device: the features, "
                     "extensions, limits, memory heaps and render-target formats the renderer "
@@ -290,6 +294,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
 
   const uint32_t unclamped_api_version = properties.apiVersion;
+  if (const int32_t max_minor = REXCVAR_GET(vulkan_max_api_version_minor);
+      max_minor > 0 && VK_API_VERSION_MINOR(properties.apiVersion) > uint32_t(max_minor)) {
+    properties.apiVersion = VK_MAKE_API_VERSION(0, 1, uint32_t(max_minor), 0);
+  }
   if (vulkan_instance->api_version() < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // From the VkApplicationInfo specification:
     //
