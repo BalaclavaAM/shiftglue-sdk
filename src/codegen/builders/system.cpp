@@ -58,8 +58,9 @@ bool build_isync(BuilderContext& ctx) {
 }
 
 bool build_db16cyc(BuilderContext& ctx) {
-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
-  (void)ctx;
+  // Xenon 16-cycle delay hint, used in spin-wait loops; the runtime decides
+  // what it does on the host (ppc_db16cyc_hint).
+  ctx.println("\tREX_PPC_DB16CYC();");
   return true;
 }
 

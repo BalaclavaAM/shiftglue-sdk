@@ -231,6 +231,12 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 #define REX_PPC_EIEIO() ((void)0)
 #define REX_PPC_ISYNC() ((void)0)
 #endif
+#define REX_PPC_DB16CYC()                                                          \
+  do {                                                                             \
+    if (int hint = rex::ppc::g_db16cyc_hint.load(std::memory_order_relaxed)) {     \
+      rex::ppc::Db16cycHint(hint);                                                 \
+    }                                                                              \
+  } while (0)
 
 //=============================================================================
 // MMIO

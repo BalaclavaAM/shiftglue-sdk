@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -67,8 +68,26 @@ REXCVAR_DEFINE_BOOL(ppc_fixed_fp_mode, REX_FIXED_FP_MODE_DEFAULT, "CPU",
                     "results keep denormals the console flushes")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(ppc_db16cyc_hint, 0, "CPU",
+                     "What the guest's spin-wait delay hint (db16cyc) does: 0 nothing, 1 a CPU "
+                     "pause, 2 yield the thread (#601)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::ppc {
 std::atomic<bool> g_fixed_fp_mode{REX_FIXED_FP_MODE_DEFAULT};
+std::atomic<int> g_db16cyc_hint{0};
+
+void Db16cycHint(int mode) noexcept {
+  if (mode == 2) {
+    std::this_thread::yield();
+    return;
+  }
+#if defined(__x86_64__) || defined(_M_X64)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  __asm__ __volatile__("yield");
+#endif
+}
 }  // namespace rex::ppc
 
 namespace rex::system {
@@ -793,6 +812,10 @@ void XThread::Execute() {
     rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
     rex::cvar::RegisterChangeCallback("ppc_fixed_fp_mode", [](std::string_view, std::string_view) {
       rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
+    });
+    rex::ppc::g_db16cyc_hint.store(REXCVAR_GET(ppc_db16cyc_hint), std::memory_order_relaxed);
+    rex::cvar::RegisterChangeCallback("ppc_db16cyc_hint", [](std::string_view, std::string_view) {
+      rex::ppc::g_db16cyc_hint.store(REXCVAR_GET(ppc_db16cyc_hint), std::memory_order_relaxed);
     });
   });
   ctx->fpscr.InitHost();

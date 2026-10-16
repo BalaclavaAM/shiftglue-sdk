@@ -153,6 +153,12 @@ constexpr uint32_t kRoundMask = 0x03;
 // register writes are skipped. Read on the toggles' rare path only.
 extern REX_RUNTIME_DATA std::atomic<bool> g_fixed_fp_mode;
 
+// What db16cyc, the Xenon spin-wait delay hint, does on the host (#601, cvar
+// ppc_db16cyc_hint): 0 nothing, 1 a CPU pause, 2 yield the thread. Generated
+// code tests the flag inline and calls Db16cycHint only when it is set.
+extern REX_RUNTIME_DATA std::atomic<int> g_db16cyc_hint;
+void Db16cycHint(int mode) noexcept;
+
 struct FPSCRRegister {
   uint32_t csr;
 
