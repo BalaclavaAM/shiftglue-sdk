@@ -1128,17 +1128,15 @@ bool build_vpkuhum(BuilderContext& ctx) {
 
 bool build_vpkuhus(BuilderContext& ctx) {
   // Vector Pack Unsigned Halfword Unsigned Saturate
-  // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
-  // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
-  // instead of 0xFF.
-  for (size_t i = 0; i < 8; i++) {
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
-                ctx.v(ctx.insn.operands[1]), 7 - i);
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
-                ctx.v(ctx.insn.operands[2]), 7 - i);
-  }
+  // _mm_packus_epi16 treats its inputs as signed, so clamp each halfword to 0xFF as unsigned
+  // first; the pack then only narrows. Both sources are read before vD is written, so
+  // vD == vA or vD == vB (the float-to-byte colour idiom) packs the original lanes.
+  ctx.println(
+      "\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packus_epi16("
+      "simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF)), "
+      "simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), "
+      "simde_mm_set1_epi16(0xFF))));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[2]), ctx.v(ctx.insn.operands[1]));
   return true;
 }
 
@@ -1156,17 +1154,14 @@ bool build_vpkuwum(BuilderContext& ctx) {
 
 bool build_vpkuwus(BuilderContext& ctx) {
   // Vector Pack Unsigned Word Unsigned Saturate
-
-  // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
-  // Saturate each u32 to [0, 0xFFFF], then pack to u16
-  for (size_t i = 0; i < 4; i++) {
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
-                ctx.v(ctx.insn.operands[1]), 3 - i);
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
-                ctx.v(ctx.insn.operands[2]), 3 - i);
-  }
+  // As vpkuhus: clamp each word to 0xFFFF as unsigned, then the signed pack only narrows,
+  // with both sources read before vD is written.
+  ctx.println(
+      "\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32("
+      "simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(0xFFFF)), "
+      "simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), "
+      "simde_mm_set1_epi32(0xFFFF))));",
+      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[2]), ctx.v(ctx.insn.operands[1]));
   return true;
 }
 
