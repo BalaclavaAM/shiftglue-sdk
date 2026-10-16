@@ -238,8 +238,19 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
 
     // Only `#_` lines are directives; a plain `#` comment (a hand-encoded
     // instruction's mnemonic, a disabled instruction) is skipped like code.
+    // Comments among the directives (`# {0, 255, ...}` spelling a value out)
+    // are stepped over too; stopping at one dropped every directive after it,
+    // and a case whose first line was a comment lost all its inputs.
     auto is_directive = [&]() { return line.starts_with("#_"); };
-    while (getline() && is_directive()) {
+    auto is_comment = [&]() { return line.starts_with("#") && !is_directive(); };
+    auto next_directive = [&]() {
+      while (getline()) {
+        if (!is_comment())
+          return is_directive();
+      }
+      return false;
+    };
+    while (next_directive()) {
       ApplyDirective(line, "REGISTER_IN", "MEMORY_IN", spec.inputs, spec.mem_inputs);
     }
     while (!is_directive()) {
@@ -248,7 +259,7 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
     }
     do {
       ApplyDirective(line, "REGISTER_OUT", "MEMORY_OUT", spec.outputs, spec.mem_outputs);
-    } while (getline() && is_directive());
+    } while (next_directive());
 
     if (!spec.inputs.empty() || !spec.outputs.empty() || !spec.mem_inputs.empty() ||
         !spec.mem_outputs.empty()) {
