@@ -167,7 +167,14 @@ struct FPSCRRegister {
   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
 
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
-  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }
+  // Every write carries the host's exception policy: a context whose csr was
+  // never seeded (a host thread that runs guest code, such as an interrupt
+  // callback) would otherwise unmask every FP exception on its first rounding
+  // or flush write.
+  inline void setcsr(uint32_t csr) noexcept {
+    Platform::InitHostExceptions(csr);
+    Platform::setcsr(csr);
+  }
 
   // Restoring the whole word would unmask every FP exception when csr is 0.
   inline void restoreGuestBits(uint32_t saved) noexcept {

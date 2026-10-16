@@ -307,6 +307,27 @@ TEST_CASE("PPCContext: restoring a zeroed fpscr leaves host FP exception masks i
   CHECK(ctx.fpscr.csr == ctx.fpscr.getcsr());
 }
 
+TEST_CASE("PPCContext: guest fpscr writes from an unseeded context keep exceptions masked",
+          "[runtime][context]") {
+  PPCContext ctx{};
+  const uint32_t host_before = ctx.fpscr.getcsr();
+  // csr is 0, as on a host thread that never ran InitHost.
+  auto policy_holds = [&] {
+    uint32_t current = ctx.fpscr.getcsr();
+    uint32_t with_policy = current;
+    PPCFPSCRRegister::Platform::InitHostExceptions(with_policy);
+    return current == with_policy;
+  };
+
+  ctx.fpscr.storeFromGuest(1);  // round toward zero
+  CHECK(policy_holds());
+  ctx.fpscr.csr = 0;
+  ctx.fpscr.enableFlushModeUnconditional();
+  CHECK(policy_holds());
+
+  PPCFPSCRRegister::Platform::setcsr(host_before);
+}
+
 TEST_CASE("FunctionDispatcher: Execute carries the requested guest entry address",
           "[runtime][dispatcher][resume]") {
   auto& memory = GetTestMemory();
