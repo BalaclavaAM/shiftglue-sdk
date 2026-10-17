@@ -13,6 +13,7 @@
 #include <rex/ui/vulkan/upscaler.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -279,6 +280,12 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
         max_output_height <= max_output_height_ && hdr == hdr_) {
       return true;
     }
+    // A context that failed is not retried every frame for the same sizes.
+    const std::array<uint32_t, 5> request = {max_render_width, max_render_height,
+                                             max_output_width, max_output_height, uint32_t(hdr)};
+    if (request == failed_request_) {
+      return false;
+    }
     Release();
     const FfxRuntime& runtime = GetFfxRuntime();
 
@@ -311,11 +318,15 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     backend_desc.header.pNext = &override_desc.header;
 
     ffxContext context = nullptr;
-    if (runtime.create_context(&context, &create_desc.header, nullptr) != FFX_API_RETURN_OK) {
-      REXLOG_WARN("FidelityFX: could not create the FSR {} context ({}x{} to {}x{})", info_.version,
-                  max_render_width, max_render_height, max_output_width, max_output_height);
+    const ffxReturnCode_t created = runtime.create_context(&context, &create_desc.header, nullptr);
+    if (created != FFX_API_RETURN_OK) {
+      REXLOG_WARN("FidelityFX: could not create the FSR {} context ({}x{} to {}x{}): error {}",
+                  info_.version, max_render_width, max_render_height, max_output_width,
+                  max_output_height, created);
+      failed_request_ = request;
       return false;
     }
+    failed_request_ = {};
     context_ = context;
     max_render_width_ = max_render_width;
     max_render_height_ = max_render_height;
@@ -524,6 +535,7 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
   uint32_t max_output_width_ = 0;
   uint32_t max_output_height_ = 0;
   bool hdr_ = false;
+  std::array<uint32_t, 5> failed_request_ = {};
   NeutralImage neutral_depth_storage_;
   NeutralImage neutral_motion_vectors_storage_;
   VulkanUpscalerImage neutral_depth_;
