@@ -3786,6 +3786,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
     fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
+                                                        : 0u);
     if (camera_wanted) {
       camera_depth_view =
           fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
@@ -4407,6 +4409,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             upscaler_camera.far_plane = camera.far_plane;
             upscaler_camera.fov_y = camera.fov_y;
             upscaler_camera.cut = camera.cut;
+            upscaler_camera.jitter_x = camera.jitter_x;
+            upscaler_camera.jitter_y = camera.jitter_y;
             vulkan_context.SetCameraWritten(upscaler_camera);
           }
 
@@ -6327,6 +6331,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     viewport_memo.hud_squeeze = hud_squeeze;
     viewport_memo.hud_scale = hud_scale;
     viewport_memo.info = viewport_info;
+  }
+  // UP-1.5: a temporal upscaler's sub-pixel jitter, on the scene's draws
+  // only (a host pixel is 2 / extent in NDC).
+  float jitter_x, jitter_y;
+  if (fh1_native_executor_ && fh1_native_executor_->GetSceneJitter(jitter_x, jitter_y) &&
+      viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    viewport_info.ndc_offset[0] += 2.0f * jitter_x / float(viewport_info.xy_extent[0]);
+    viewport_info.ndc_offset[1] += 2.0f * jitter_y / float(viewport_info.xy_extent[1]);
   }
 
   // fh1_coarse_shading leaves draws whose coverage the shader decides at full

@@ -390,6 +390,9 @@ class Presenter {
   // Whether painting would use the game's depth and camera motion with the
   // guest output (a temporal upscaler, UP-1.3 and UP-1.4).
   virtual bool WantsGuestOutputCamera() const { return false; }
+  // UP-1.5: the length of the jitter sequence the game should render with
+  // (0: no jitter), for the temporal upscaler's ratio.
+  virtual uint32_t GuestOutputJitterPhases() const { return 0; }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }

@@ -188,6 +188,9 @@ class VulkanPresenter final : public Presenter {
   bool WantsGuestOutputCamera() const override {
     return guest_output_camera_wanted_.load(std::memory_order_relaxed);
   }
+  uint32_t GuestOutputJitterPhases() const override {
+    return guest_output_jitter_phases_.load(std::memory_order_relaxed);
+  }
   // The formats of the guest output's camera images.
   static constexpr VkFormat kGuestOutputDepthFormat = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kGuestOutputMotionFormat = VK_FORMAT_R16G16_SFLOAT;
@@ -673,6 +676,8 @@ class VulkanPresenter final : public Presenter {
   std::atomic<bool> hudless_guest_output_wanted_ = false;
   // UP-1.3: whether it would use the depth and camera motion.
   std::atomic<bool> guest_output_camera_wanted_ = false;
+  // UP-1.5: the jitter sequence length it wants, 0 for none.
+  std::atomic<uint32_t> guest_output_jitter_phases_ = 0;
   // UP-1.2: draws the HUD over the upscale of the HUD-less copy
   // (upscale_hud_composite.cs.glsl), created on first use.
   bool EnsureUpscaleHudComposite();

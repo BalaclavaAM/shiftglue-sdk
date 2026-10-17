@@ -3247,6 +3247,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   camera_depth_rows_ready_ = camera_depth_rows_;
   camera_depth_rows_ = 0;
   FinishCameraFrame();
+  AdvanceJitter();
   if (!initialized_) return;
   ReleaseRetiredImages(false);
   UpdateCoarseShading();

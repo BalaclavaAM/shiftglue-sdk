@@ -69,6 +69,9 @@ struct UpscalerCamera {
   float fov_y = 1.0472f;
   // No continuation of the previous frame: the history should be dropped.
   bool cut = false;
+  // The frame's sub-pixel jitter in render pixels, as UpscalerFrame.
+  float jitter_x = 0.0f;
+  float jitter_y = 0.0f;
 };
 
 struct UpscalerFrame {

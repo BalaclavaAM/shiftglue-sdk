@@ -109,6 +109,18 @@ bool Invert(const Matrix& m, Matrix& out) {
   return true;
 }
 
+// The radical inverse of index in base, in [0, 1).
+float Halton(uint32_t index, uint32_t base) {
+  float result = 0.0f;
+  float fraction = 1.0f;
+  while (index) {
+    fraction /= float(base);
+    result += fraction * float(index % base);
+    index /= base;
+  }
+  return result;
+}
+
 double RowLength(const std::array<float, 16>& m, int row) {
   return std::sqrt(double(m[row * 4]) * m[row * 4] + double(m[row * 4 + 1]) * m[row * 4 + 1] +
                    double(m[row * 4 + 2]) * m[row * 4 + 2]);
@@ -159,7 +171,49 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                                  Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
                                  depth_info.depth_format)
                         .Pack();
+  noted.color_key = CurrentColorKey();
   if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
+}
+
+uint64_t Fh1NativeExecutor::CurrentColorKey() const {
+  const auto color_info = register_file_.Get<reg::RB_COLOR_INFO>();
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  return uint64_t(color_info.color_base) | uint64_t(surface_info.surface_pitch) << 16 |
+         uint64_t(surface_info.msaa_samples) << 32 | uint64_t(color_info.color_format) << 40;
+}
+
+void Fh1NativeExecutor::AdvanceJitter() {
+  // The scene is drawn turned 180 degrees and the post pass turns it back,
+  // so a surface offset moves the picture the other way on the screen. In
+  // the upscalers' convention the frame's jitter is (-x, -y): of the four
+  // signs it is the one that came closest to a native 3x render of a still
+  // scene (PSNR, FSR 3.1.4 at 3x).
+  camera_ready_.jitter_x = -jitter_x_;
+  camera_ready_.jitter_y = -jitter_y_;
+  if (jitter_phases_) {
+    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
+    jitter_x_ = Halton(jitter_index_ + 1, 2) - 0.5f;
+    jitter_y_ = Halton(jitter_index_ + 1, 3) - 0.5f;
+  } else {
+    jitter_x_ = 0.0f;
+    jitter_y_ = 0.0f;
+  }
+}
+
+bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
+  if (!jitter_phases_ || !camera_scene_depth_valid_) return false;
+  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                   depth_info.depth_format)
+              .Pack() != camera_scene_depth_ ||
+      CurrentColorKey() != camera_scene_color_) {
+    return false;
+  }
+  x = jitter_x_;
+  y = jitter_y_;
+  return true;
 }
 
 void Fh1NativeExecutor::FinishCameraFrame() {
@@ -182,6 +236,14 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   // first in a frame, so a running count would pick them).
   camera_scene_depth_ = scene_depth;
   camera_scene_depth_valid_ = true;
+  std::unordered_map<uint64_t, size_t> color_counts;
+  for (const CameraDraw& noted : camera_draws_) {
+    if (noted.depth_key == scene_depth) ++color_counts[noted.color_key];
+  }
+  camera_scene_color_ =
+      std::max_element(color_counts.begin(), color_counts.end(),
+                       [](const auto& a, const auto& b) { return a.second < b.second; })
+          ->first;
   // The world: the largest group of scene draws sharing one matrix.
   std::unordered_map<std::array<float, 16>, size_t, MatrixHash> groups;
   std::unordered_map<uint64_t, std::array<float, 16>> objects;

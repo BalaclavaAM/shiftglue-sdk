@@ -146,12 +146,22 @@ class Fh1NativeExecutor {
     // No continuation of the previous frame (a cut, a load, a rebase): the
     // reprojection is the identity and the upscaler's history should go.
     bool cut;
+    // The frame's jitter in render pixels, in the upscalers' convention
+    // (UpscalerFrame).
+    float jitter_x;
+    float jitter_y;
   };
   void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
   // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
   // readable from compute shaders) and camera, if the depth covers width x
   // height; null otherwise.
   VkImageView TakeCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+  // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
+  // from the next frame (0: none).
+  void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
+  // Whether the current draw goes to the scene's color and depth surfaces,
+  // and if so this frame's jitter, in host pixels of the surface.
+  bool GetSceneJitter(float& x, float& y) const;
 
   void LogStats(uint64_t frame);
   // Native surfaces alive and the device memory their images take (LS-0.4).
@@ -446,6 +456,7 @@ class Fh1NativeExecutor {
   struct CameraDraw {
     uint64_t object;
     uint32_t depth_key;
+    uint64_t color_key;
     std::array<float, 16> wvp;
   };
   void NoteCameraDraw(const Fh1DrawInfo& draw);
@@ -461,9 +472,20 @@ class Fh1NativeExecutor {
   std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;
   Camera camera_ready_ = {};
   bool camera_ready_valid_ = false;
-  // The previous frame's scene depth: the one most matrix draws tested.
+  // The previous frame's scene depth: the one most matrix draws tested,
+  // and the color target those draws used most.
   uint32_t camera_scene_depth_ = 0;
+  uint64_t camera_scene_color_ = 0;
   bool camera_scene_depth_valid_ = false;
+  uint64_t CurrentColorKey() const;
+  // Records the swapped frame's jitter in camera_ready_ and picks the next.
+  void AdvanceJitter();
+  // UP-1.5 jitter: the sequence length, the position in it, and this
+  // frame's offset in surface pixels.
+  uint32_t jitter_phases_ = 0;
+  uint32_t jitter_index_ = 0;
+  float jitter_x_ = 0.0f;
+  float jitter_y_ = 0.0f;
   // A scene draw since the last band copy.
   bool camera_depth_dirty_ = false;
   // This frame's scene depth copy (R32_SFLOAT), the screen rows it covers,

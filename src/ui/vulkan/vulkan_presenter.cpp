@@ -59,6 +59,10 @@ REXCVAR_DEFINE_BOOL(present_upscaler_camera, true, "UI/Presenter",
                     "Give a temporal upscaler the game's depth and camera motion, taken from "
                     "its draws (false: far depth and no motion)");
 
+REXCVAR_DEFINE_BOOL(present_upscaler_jitter, true, "UI/Presenter",
+                    "Have the game jitter the scene by a sub-pixel offset each frame for a "
+                    "temporal upscaler (with present_upscaler_camera)");
+
 REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
                       "Show a temporal upscaler's output (upscale) or one of its inputs instead: "
                       "depth (near white, far black) or motion (red and green around grey)")
@@ -606,6 +610,8 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     frame.camera_near = camera->near_plane;
     frame.camera_far = camera->far_plane;
     frame.camera_fov_y = camera->fov_y;
+    frame.jitter_x = camera->jitter_x;
+    frame.jitter_y = camera->jitter_y;
   }
   frame.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
 
@@ -2516,6 +2522,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                            std::memory_order_relaxed);
         guest_output_camera_wanted_.store(camera_allowed && temporal_reads_guest_output,
                                           std::memory_order_relaxed);
+        // A Halton(2, 3) sequence of 8 samples per output pixel, the length
+        // FSR and DLSS recommend for the upscaling ratio.
+        uint32_t jitter_phases = 0;
+        if (camera_allowed && temporal_reads_guest_output && REXCVAR_GET(present_upscaler_jitter)) {
+          uint32_t jitter_input_width = 0, jitter_input_height = 0;
+          guest_output_flow.GetEffectInputSize(0, jitter_input_width, jitter_input_height);
+          if (jitter_input_width) {
+            const float ratio =
+                float(guest_output_flow.effect_output_sizes[0].first) / float(jitter_input_width);
+            jitter_phases = std::max(1u, uint32_t(std::ceil(8.0f * ratio * ratio)));
+          }
+        }
+        guest_output_jitter_phases_.store(jitter_phases, std::memory_order_relaxed);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
