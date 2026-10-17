@@ -223,6 +223,7 @@ endif()
 # FidelityFX (optional, fetched on demand)
 #=============================================================================
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_ffx_api_headers.cmake)
 
 #=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)

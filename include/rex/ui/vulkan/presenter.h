@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,7 @@
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
+#include <rex/ui/vulkan/upscaler.h>
 
 namespace rex {
 namespace ui {
@@ -137,6 +139,8 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool CapturePresentedOutput(RawImage& image_out) override;
+  std::vector<UpscalerInfo> GetUpscalers() const override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -206,6 +210,8 @@ class VulkanPresenter final : public Presenter {
     // of destruction only after painting is done on the GPU).
     std::shared_ptr<GuestOutputImage> image;
     uint64_t version = UINT64_MAX;
+    // Which refresh wrote the image last (guest_output_refresh_serial_).
+    uint64_t refresh_serial = 0;
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
@@ -497,15 +503,23 @@ class VulkanPresenter final : public Presenter {
       VkPipelineLayout layout = VK_NULL_HANDLE);
   bool CreateHdrSwapchainImages(VkFormat swapchain_format);
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
-                                     uint32_t output_width, uint32_t output_height);
-  bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VkImage input_image,
-                                uint32_t input_width, uint32_t input_height, VkImage output_image,
+  // present_upscaler_profile: the timestamp slot of this upscale, or
+  // UINT32_MAX.
+  uint32_t BeginTemporalUpscaleTiming(VkCommandBuffer command_buffer,
+                                      const VulkanUpscaler& upscaler, const UpscalerFrame& frame);
+  // The temporal provider for the selected effect, or null.
+  VulkanUpscaler* GetTemporalUpscaler(const GuestOutputPaintConfig& config);
+  // Records the temporal upscale of the flow's temporal slot from source into
+  // output (UP-1.1: once per new guest frame, its history reset only when it
+  // must be). False if nothing usable was recorded; the slot then falls back
+  // to FSR 1 EASU.
+  bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VulkanUpscaler& upscaler,
+                                VkImage source_image, VkImageView source_view,
+                                uint32_t source_width, uint32_t source_height,
+                                VkImage output_image, VkImageView output_view,
                                 uint32_t output_width, uint32_t output_height,
+                                uint64_t guest_output_refresh_serial,
                                 const GuestOutputPaintConfig& config);
-  void DestroyTemporalUpscalerContext();
-#endif
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -545,14 +559,44 @@ class VulkanPresenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  void* temporal_upscaler_context_ = nullptr;
-  uint32_t temporal_upscaler_max_render_width_ = 0;
-  uint32_t temporal_upscaler_max_render_height_ = 0;
-  uint32_t temporal_upscaler_max_output_width_ = 0;
-  uint32_t temporal_upscaler_max_output_height_ = 0;
-  bool temporal_upscaler_provider_logged_ = false;
-#endif
+  // Advanced by every guest output refresh (refresher thread; the consumer
+  // reads the copy in GuestOutputImageInstance).
+  uint64_t guest_output_refresh_serial_ = 0;
+
+  // Temporal upscaler providers (rex/ui/vulkan/upscaler.h) and the state of
+  // the last temporal dispatch, used by painting only.
+  std::vector<std::unique_ptr<VulkanUpscaler>> upscalers_;
+  struct TemporalUpscaleState {
+    VulkanUpscaler* upscaler = nullptr;
+    VkImage output_image = VK_NULL_HANDLE;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+    uint64_t refresh_serial = 0;
+    uint64_t last_dispatch_us = 0;
+    bool output_valid = false;
+    uint64_t dispatch_count = 0;
+    uint64_t reset_count = 0;
+    uint64_t repeat_count = 0;
+  };
+  TemporalUpscaleState temporal_upscale_;
+  VkQueryPool temporal_upscale_query_pool_ = VK_NULL_HANDLE;
+  std::array<uint64_t, 8> temporal_upscale_query_submissions_ = {};
+  double temporal_upscale_gpu_ns_ = 0.0;
+  uint32_t temporal_upscale_gpu_samples_ = 0;
+
+  // CapturePresentedOutput (present_capture_readable): every paint copies its
+  // finished image here, and a capture reads the latest copy once the queue
+  // is idle (the route is paused then, so no paint follows to wait for).
+  std::mutex presented_capture_mutex_;
+  VkBuffer presented_capture_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory presented_capture_memory_ = VK_NULL_HANDLE;
+  VkExtent2D presented_capture_buffer_extent_ = {};
+  VkExtent2D presented_capture_extent_ = {};
+  VkFormat presented_capture_format_ = VK_FORMAT_UNDEFINED;
+  uint64_t presented_capture_submission_ = 0;
+  bool presented_capture_written_ = false;
 };
 
 }  // namespace vulkan

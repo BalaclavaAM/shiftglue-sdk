@@ -11,6 +11,7 @@ set(REXUI_CORE_SOURCES
     keybinds.cpp
     menu_item.cpp
     presenter.cpp
+    upscaler.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     window.cpp
@@ -38,6 +39,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/single_layout_descriptor_set_pool.cpp
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
+    vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
@@ -145,6 +147,12 @@ if(TARGET amd_fidelityfx_dx12)
 endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
+endif()
+# The FSR 2/3 provider: linked to the SDK built from source, or loading
+# AMD's runtime at run time (cmake/rexglue_ffx_api_headers.cmake).
+if(REXGLUE_USE_VULKAN AND REXGLUE_FFX_API_INCLUDE_DIR)
+    target_include_directories(rexui PRIVATE "${REXGLUE_FFX_API_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_FFX_API=1)
 endif()
 
 if(REXGLUE_USE_VULKAN)

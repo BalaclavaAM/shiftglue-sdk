@@ -34,6 +34,7 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/presentation_pacer.h>
 #include <rex/ui/surface.h>
+#include <rex/ui/upscaler.h>
 #include <rex/ui/ui_drawer.h>
 
 #if REX_PLATFORM_WIN32
@@ -375,6 +376,13 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // The next painted image, guest output and host UI, as presented (render
+  // tests compare upscalers on it). Only with present_capture_readable, on
+  // SDR swapchains; false otherwise.
+  virtual bool CapturePresentedOutput([[maybe_unused]] RawImage& image_out) { return false; }
+
+  // What the guest output can be scaled with on this presenter.
+  virtual std::vector<UpscalerInfo> GetUpscalers() const { return GetSpatialUpscalerInfos(); }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
