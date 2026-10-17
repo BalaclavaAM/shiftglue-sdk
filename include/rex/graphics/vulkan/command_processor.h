@@ -797,6 +797,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
+  // UP-1.7: (re)creates the object slot image at the given size; it starts
+  // undefined, and the swap's camera pass initialises it.
+  bool CreateObjectSlotImage(uint32_t width, uint32_t height);
+  void DestroyObjectSlotImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
@@ -1164,6 +1168,26 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_camera_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_camera_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_camera_sets_{};
+  // UP-1.7: the scene's object slots (R32_UINT, (depth << 8) | slot, the
+  // nearest fragment's), written by scene pixel shaders through binding
+  // kObjectSlotImageBinding of the shared memory set when not using
+  // fragment shader interlock, read and cleared by the swap's camera pass,
+  // and the swapped frame's reprojection by slot for that pass.
+  VkImage object_slot_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory object_slot_image_memory_ = VK_NULL_HANDLE;
+  VkImageView object_slot_image_view_ = VK_NULL_HANDLE;
+  uint32_t object_slot_image_width_ = 0;
+  uint32_t object_slot_image_height_ = 0;
+  uint32_t object_slot_wanted_width_ = 0;
+  uint32_t object_slot_wanted_height_ = 0;
+  bool object_slot_image_initialized_ = false;
+  bool object_slot_set_binding_ = false;
+  uint32_t object_slot_draws_ = 0;
+  uint32_t object_slot_fallback_draws_ = 0;
+  std::array<VkBuffer, kMaxFramesInFlight> swap_object_table_buffers_{};
+  std::array<VkDeviceMemory, kMaxFramesInFlight> swap_object_table_memories_{};
+  std::array<uint32_t, kMaxFramesInFlight> swap_object_table_memory_types_{};
+  std::array<void*, kMaxFramesInFlight> swap_object_table_mappings_{};
   // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
   // the HUD left alone, told apart with the pre-HUD snapshot.
   bool EnsureSwapScenePost();
@@ -1445,6 +1469,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t interpolator_mask = 0;
     uint32_t ps_param_gen_pos = 0;
     uint32_t depth_control = 0;
+    // UP-1.7: whether the pixel shader writes the object slot.
+    bool object_slot = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;

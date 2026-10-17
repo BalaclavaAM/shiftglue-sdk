@@ -88,6 +88,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // UP-1.7: write the draw's object slot with the fragment depth to the
+      // object slot image (kObjectSlotImageBinding), nearest fragment
+      // winning, for a temporal upscaler's per-object motion. Host render
+      // targets only.
+      uint32_t object_slot_output : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -307,6 +312,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+
+    // UP-1.7: the slot pixel shaders with object_slot_output write, and the
+    // row of the full frame the surface's first row is (predicated tiles).
+    uint32_t object_slot;
+    int32_t object_row_offset;
   };
 
   enum ConstantBuffer : uint32_t {
@@ -439,6 +449,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool shared_memory_texel_buffer;
   };
   static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
+  // UP-1.7: the R32_UINT object slot image in the shared memory set.
+  static constexpr uint32_t kObjectSlotImageBinding = 3;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -616,6 +628,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
   void CompleteFragmentShaderInMain();
+  // UP-1.7, at the end of a pixel shader with object_slot_output.
+  void WriteObjectSlot();
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.
@@ -925,6 +939,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantObjectSlot,
+    kSystemConstantObjectRowOffset,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;

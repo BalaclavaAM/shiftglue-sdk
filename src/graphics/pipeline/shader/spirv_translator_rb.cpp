@@ -894,6 +894,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     }
   }
 
+  if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output) {
+    WriteObjectSlot();
+  }
+
   if (color_targets_written) {
     spv::Id fsi_color_targets_written = spv::NoResult;
     spv::Id fsi_const_int_1 = spv::NoResult;
@@ -3407,6 +3411,87 @@ spv::Id SpirvShaderTranslator::FSI_BlendColorOrAlphaWithUnclampedResult(
   id_vector_temp_.push_back(result_factors);
   id_vector_temp_.push_back(block_min_max_default_end.getId());
   return builder_->createOp(spv::OpPhi, value_type, id_vector_temp_);
+}
+
+
+void SpirvShaderTranslator::WriteObjectSlot() {
+  // UP-1.7: (depth << 8) | slot, the largest winning. FH1's viewport stores
+  // depth reversed (1 near), so the nearest fragment of the pixel wins
+  // whatever order the draws come in and whether its depth test passed.
+  // Killed and demoted invocations reach here not at all or as helpers,
+  // whose atomics have no effect.
+  assert_true(input_fragment_coordinates_ != spv::NoResult);
+  builder_->addCapability(spv::CapabilityImageQuery);
+  spv::Id type_image = builder_->makeImageType(type_uint_, spv::Dim2D, false, false, false, 2,
+                                               spv::ImageFormatR32ui);
+  spv::Id image = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
+                                           type_image, "xe_object_slots");
+  builder_->addDecoration(image, spv::DecorationDescriptorSet,
+                          int(kDescriptorSetSharedMemoryAndEdram));
+  builder_->addDecoration(image, spv::DecorationBinding, int(kObjectSlotImageBinding));
+  if (features_.spirv_version >= spv::Spv_1_4) {
+    main_interface_.push_back(image);
+  }
+  spv::Id frag_coord = builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectRowOffset));
+  spv::Id row_offset = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
+  spv::Id slot = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  spv::Id x = builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
+                                      builder_->createCompositeExtract(frag_coord, type_float_, 0));
+  spv::Id y = builder_->createBinOp(
+      spv::OpIAdd, type_int_,
+      builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
+                              builder_->createCompositeExtract(frag_coord, type_float_, 1)),
+      row_offset);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(x);
+  id_vector_temp_.push_back(y);
+  spv::Id coordinates = builder_->createCompositeConstruct(type_int2_, id_vector_temp_);
+  spv::Id size = builder_->createOp(spv::OpImageQuerySize, type_int2_,
+                                    std::vector<spv::Id>{builder_->createLoad(image,
+                                                                              spv::NoPrecision)});
+  spv::Id inside = builder_->createBinOp(
+      spv::OpLogicalAnd, type_bool_,
+      builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+                            builder_->createBinOp(spv::OpSGreaterThanEqual, type_bool_, y,
+                                                  builder_->makeIntConstant(0)),
+                            builder_->createBinOp(spv::OpSLessThan, type_bool_, x,
+                                                  builder_->createCompositeExtract(
+                                                      size, type_int_, 0))),
+      builder_->createBinOp(spv::OpSLessThan, type_bool_, y,
+                            builder_->createCompositeExtract(size, type_int_, 1)));
+  SpirvBuilder::IfBuilder if_inside(inside, spv::SelectionControlMaskNone, *builder_);
+  {
+    // Host depth (float24 surfaces keep it halved; the swap pass scales it
+    // as the camera's depth copy does).
+    spv::Id depth = builder_->createUnaryOp(
+        spv::OpConvertFToU, type_uint_,
+        builder_->createBinOp(spv::OpFMul, type_float_,
+                              builder_->createCompositeExtract(frag_coord, type_float_, 2),
+                              builder_->makeFloatConstant(16777215.0f)));
+    spv::Id key = builder_->createBinOp(
+        spv::OpBitwiseOr, type_uint_,
+        builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, depth,
+                              builder_->makeUintConstant(8)),
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot,
+                              builder_->makeUintConstant(0xFF)));
+    spv::Id pointer = builder_->createOp(
+        spv::OpImageTexelPointer, builder_->makePointer(spv::StorageClassImage, type_uint_),
+        std::vector<spv::Id>{image, coordinates, const_uint_0_});
+    builder_->createOp(spv::OpAtomicUMax, type_uint_,
+                       std::vector<spv::Id>{pointer, builder_->makeUintConstant(spv::ScopeDevice),
+                                            const_uint_0_, key});
+  }
+  if_inside.makeEndIf();
 }
 
 }  // namespace rex::graphics

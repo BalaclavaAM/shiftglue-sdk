@@ -162,6 +162,26 @@ class Fh1NativeExecutor {
   // Whether the current draw goes to the scene's color and depth surfaces,
   // and if so this frame's jitter, in host pixels of the surface.
   bool GetSceneJitter(float& x, float& y) const;
+  // UP-1.7 per-object motion: scene draws write a slot per distinct object
+  // reprojection to the object slot image, and the swap pass reprojects
+  // each pixel's depth with its slot's matrix.
+  static constexpr uint32_t kMaxObjectSlots = 256;
+  void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
+  // Whether the current draw should write its slot: a draw testing and
+  // writing the scene's depth whose vertex shader reads the camera's matrix
+  // or an object's own (DrawObjectMatrixRegister).
+  bool IsSceneObjectDraw(const Shader& vertex_shader) const;
+  // The current draw's slot, after NoteCameraDraw (0: the camera's motion).
+  uint32_t current_object_slot() const { return current_object_slot_; }
+  // The full-frame row of the current surface's first row, in host pixels.
+  int32_t ObjectRowOffset() const;
+  // The swapped frame's reprojections by slot (row-major, slot 0 unused);
+  // empty without object motion or on a cut.
+  const std::vector<std::array<float, 16>>& object_reprojections_ready() const {
+    return object_reprojections_ready_;
+  }
+  // Host depth to the camera depth copy's (float24 depth is kept halved).
+  float camera_depth_scale() const { return camera_depth_scale_; }
 
   void LogStats(uint64_t frame);
   // Native surfaces alive and the device memory their images take (LS-0.4).
@@ -485,6 +505,30 @@ class Fh1NativeExecutor {
   uint32_t jitter_phases_ = 0;
   // Whether the current draw's vertex shader reads the camera matrix.
   bool draw_uses_camera_matrix_ = false;
+  // UP-1.7: whether it is a car on the scene (SceneObjectMatrixRegister c0).
+  bool draw_is_scene_car_ = false;
+  // UP-1.7: this frame's reprojections by slot, the slots by matrix hash and
+  // by object, and the swapped frame's table.
+  bool object_motion_enabled_ = false;
+  float camera_depth_scale_ = 1.0f;
+  uint32_t current_object_slot_ = 0;
+  std::vector<std::array<float, 16>> object_reprojections_;
+  std::unordered_map<uint64_t, uint32_t> object_slot_by_matrix_;
+  // Draws of each mesh so far this frame, and each draw's matrix by mesh
+  // and order this frame and the last.
+  std::unordered_map<uint64_t, uint32_t> object_occurrences_;
+  std::unordered_map<uint64_t, std::array<float, 16>> object_current_wvp_;
+  std::unordered_map<uint64_t, std::array<float, 16>> object_previous_wvp_;
+  std::vector<std::array<float, 16>> object_reprojections_ready_;
+  uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp);
+  // The first register of the draw's world-view-projection (c128 the
+  // camera's, c0 a car's own), UINT32_MAX without one.
+  uint32_t DrawObjectMatrixRegister(const Shader& vertex_shader) const;
+  // As DrawObjectMatrixRegister, for draws testing and writing the scene's
+  // depth while the camera is tracked; UINT32_MAX for others.
+  uint32_t SceneObjectMatrixRegister(const Shader& vertex_shader) const;
+  uint32_t CurrentDepthKey() const;
+  uint64_t DrawObjectKey(const Fh1DrawInfo& draw) const;
   uint32_t jitter_index_ = 0;
   float jitter_x_ = 0.0f;
   float jitter_y_ = 0.0f;

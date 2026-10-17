@@ -458,14 +458,24 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"object_slot", offsetof(SystemConstants, object_slot), type_uint_},
+      {"object_row_offset", offsetof(SystemConstants, object_row_offset), type_int_},
   };
+  // UP-1.7: the object slot constants (last) only in the shaders that write
+  // it, so the others translate as before.
+  const size_t system_constant_count =
+      rex::countof(system_constants) -
+      (is_pixel_shader() && !edram_fragment_shader_interlock_ &&
+               GetSpirvShaderModification().pixel.object_slot_output
+           ? 0
+           : 2);
   id_vector_temp_.clear();
-  id_vector_temp_.reserve(rex::countof(system_constants));
-  for (size_t i = 0; i < rex::countof(system_constants); ++i) {
+  id_vector_temp_.reserve(system_constant_count);
+  for (size_t i = 0; i < system_constant_count; ++i) {
     id_vector_temp_.push_back(system_constants[i].type);
   }
   spv::Id type_system_constants = builder_->makeStructType(id_vector_temp_, "XeSystemConstants");
-  for (size_t i = 0; i < rex::countof(system_constants); ++i) {
+  for (size_t i = 0; i < system_constant_count; ++i) {
     const SystemConstant& system_constant = system_constants[i];
     builder_->addMemberName(type_system_constants, static_cast<unsigned int>(i),
                             system_constant.name);
@@ -3147,8 +3157,11 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // (per-sample if supported).
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  const bool object_slot_output =
+      !edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output;
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
+      object_slot_output) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,

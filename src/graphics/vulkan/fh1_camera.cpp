@@ -26,6 +26,8 @@ namespace {
 
 // The registers of the world-view-projection rows.
 constexpr uint32_t kCameraFirstRegister = 128;
+// UP-1.7: the first register of a car's own world-view-projection.
+constexpr uint32_t kObjectFirstRegister = 0;
 // Fewer draws in the largest group: no recognisable world (menus, loads).
 constexpr size_t kCameraMinWorldDraws = 16;
 
@@ -143,6 +145,8 @@ struct MatrixHash {
 
 void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   draw_uses_camera_matrix_ = false;
+  draw_is_scene_car_ = false;
+  current_object_slot_ = 0;
   if (!camera_tracking_enabled_ || !initialized_ || !draw.vertex_shader || !draw.rasterization_done ||
       draw.memexport) {
     return;
@@ -150,6 +154,19 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
   if (((map.float_bitmap[kCameraFirstRegister / 64] >> (kCameraFirstRegister % 64)) & 0xF) !=
       0xF) {
+    // UP-1.7: a car, with its own matrix in c0-c3. Jittered with the scene
+    // (it draws to its own colour target, so GetSceneJitter's colour check
+    // left cars unjittered and aliased before).
+    if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) return;
+    draw_is_scene_car_ = true;
+    if (object_motion_enabled_) {
+      std::array<float, 16> wvp;
+      std::memcpy(wvp.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                         kObjectFirstRegister * 4],
+                  sizeof(wvp));
+      current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+    }
     return;
   }
   draw_uses_camera_matrix_ = true;
@@ -158,6 +175,16 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   std::memcpy(noted.wvp.data(),
               &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + kCameraFirstRegister * 4],
               sizeof(noted.wvp));
+  noted.object = DrawObjectKey(draw);
+  noted.depth_key = CurrentDepthKey();
+  noted.color_key = CurrentColorKey();
+  if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
+  if (object_motion_enabled_ && IsSceneObjectDraw(*draw.vertex_shader)) {
+    current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp);
+  }
+}
+
+uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
   // The object: the shader and its first vertex buffer.
   uint64_t object = draw.vertex_shader->ucode_data_hash();
   const auto& bindings = draw.vertex_shader->vertex_bindings();
@@ -166,16 +193,94 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
         register_file_.GetVertexFetch(bindings.front().fetch_constant);
     object ^= (uint64_t(fetch.address) << 2) * 0x9E3779B97F4A7C15ull;
   }
-  noted.object = object;
+  return object;
+}
+
+uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp) {
+  // One mesh drawn several times a frame (a car's four wheels, or each
+  // predicated tile's band) is told apart by its order among the draws of
+  // that mesh, which a frame repeats.
+  const uint64_t key = object ^ (uint64_t(object_occurrences_[object]++) + 1) *
+                                    0xC2B2AE3D27D4EB4Full;
+  object_current_wvp_.emplace(key, wvp);
+  uint32_t slot = 0;
+  // Objects new this frame keep the camera's motion (slot 0).
+  auto previous = object_previous_wvp_.find(key);
+  Matrix current_inverse;
+  if (previous != object_previous_wvp_.end() && Invert(ToMatrix(wvp), current_inverse)) {
+    const Matrix reprojection = Multiply(ToMatrix(previous->second), current_inverse);
+    std::array<float, 16> matrix;
+    for (size_t i = 0; i < 16; ++i) matrix[i] = float(reprojection[i]);
+    // Objects that move with the world (most props and the world's own
+    // pieces) reproject as the camera does up to rounding: one slot for all,
+    // at 1/4096 of clip space (under 0.1 pixel at 1280x720).
+    uint64_t hash = 1469598103934665603ull;
+    for (double element : reprojection) {
+      hash ^= uint64_t(std::llround(element * 4096.0));
+      hash *= 1099511628211ull;
+    }
+    auto same = object_slot_by_matrix_.find(hash);
+    if (same != object_slot_by_matrix_.end()) {
+      slot = same->second;
+    } else {
+      if (object_reprojections_.empty()) object_reprojections_.emplace_back();
+      if (object_reprojections_.size() < kMaxObjectSlots) {
+        slot = uint32_t(object_reprojections_.size());
+        object_reprojections_.push_back(matrix);
+        object_slot_by_matrix_.emplace(hash, slot);
+      } else {
+        Count("object_slots_full");
+      }
+    }
+  }
+  return slot;
+}
+
+bool Fh1NativeExecutor::IsSceneObjectDraw(const Shader& vertex_shader) const {
+  return object_motion_enabled_ && SceneObjectMatrixRegister(vertex_shader) != UINT32_MAX;
+}
+
+uint32_t Fh1NativeExecutor::SceneObjectMatrixRegister(const Shader& vertex_shader) const {
+  if (!camera_tracking_enabled_ || !camera_scene_depth_valid_) return UINT32_MAX;
+  const uint32_t matrix_register = DrawObjectMatrixRegister(vertex_shader);
+  if (matrix_register == UINT32_MAX) return UINT32_MAX;
+  // Only draws that write the scene's depth: what the swap pass compares the
+  // slot's depth with. Transparency without depth writes keeps what is
+  // behind it.
+  const auto depth_control = register_file_.Get<reg::RB_DEPTHCONTROL>();
+  if (!depth_control.z_enable || !depth_control.z_write_enable ||
+      CurrentDepthKey() != camera_scene_depth_) {
+    return UINT32_MAX;
+  }
+  return matrix_register;
+}
+
+uint32_t Fh1NativeExecutor::DrawObjectMatrixRegister(const Shader& vertex_shader) const {
+  // The world's draws read the camera's world-view-projection at c128-c131;
+  // cars (body, wheels, interior: 60-odd vertex shaders a frame on the
+  // Fujimi drive) read their own at c0-c3 instead.
+  const Shader::ConstantRegisterMap& map = vertex_shader.constant_register_map();
+  if (((map.float_bitmap[kCameraFirstRegister / 64] >> (kCameraFirstRegister % 64)) & 0xF) ==
+      0xF) {
+    return kCameraFirstRegister;
+  }
+  if ((map.float_bitmap[0] & 0xF) == 0xF) return kObjectFirstRegister;
+  return UINT32_MAX;
+}
+
+uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  noted.depth_key = MakeDepthKey(depth_info.depth_base,
-                                 Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                                 depth_info.depth_format)
-                        .Pack();
-  noted.color_key = CurrentColorKey();
-  if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
+  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                      depth_info.depth_format)
+      .Pack();
+}
+
+int32_t Fh1NativeExecutor::ObjectRowOffset() const {
+  if (untile_height_) return 0;
+  return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
+         int32_t(scale_);
 }
 
 uint64_t Fh1NativeExecutor::CurrentColorKey() const {
@@ -207,7 +312,13 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
   // Only draws placed by the camera matrix: a screen-space pass in the
   // scene (a quad ending at the screen edge) would leave a strip of the
   // edge unwritten when moved, which showed as flickering stale colours.
-  if (!jitter_phases_ || !camera_scene_depth_valid_ || !draw_uses_camera_matrix_) return false;
+  if (!jitter_phases_ || !camera_scene_depth_valid_) return false;
+  if (draw_is_scene_car_) {
+    x = jitter_x_;
+    y = jitter_y_;
+    return true;
+  }
+  if (!draw_uses_camera_matrix_) return false;
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
@@ -225,6 +336,13 @@ bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
 void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_valid_ = false;
   camera_depth_dirty_ = false;
+  std::vector<std::array<float, 16>> object_reprojections = std::move(object_reprojections_);
+  object_reprojections_.clear();
+  object_slot_by_matrix_.clear();
+  object_occurrences_.clear();
+  object_previous_wvp_ = std::move(object_current_wvp_);
+  object_current_wvp_.clear();
+  object_reprojections_ready_.clear();
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
     camera_draws_.clear();
@@ -334,6 +452,14 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_ = camera;
   camera_ready_valid_ = true;
   camera_previous_objects_ = std::move(objects);
+  if (!camera.cut) {
+    if (object_reprojections.size() > 1) Count("camera_object_frame");
+    if ((frame_ % 600) == 0) {
+      REXGPU_INFO("FH1 camera: {} object reprojections",
+                  object_reprojections.empty() ? 0 : object_reprojections.size() - 1);
+    }
+    object_reprojections_ready_ = std::move(object_reprojections);
+  }
 }
 
 bool Fh1NativeExecutor::EnsureCameraDepthPipelines() {
@@ -517,6 +643,7 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
                      ? 2.0f
                      : 1.0f,
                  dest_row};
+  camera_depth_scale_ = constants.scale;
   command_buffer.CmdVkPushConstants(camera_depth_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                     sizeof(constants), &constants);
   command_processor_.BindExternalComputePipeline(camera_depth_pipelines_[surface->samples > 1]);

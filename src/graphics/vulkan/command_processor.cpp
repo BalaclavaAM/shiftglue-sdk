@@ -66,6 +66,13 @@ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 2
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
 // On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
+REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
+                    "Give a temporal upscaler the motion of each moving object (UP-1.7), "
+                    "not only the camera's");
+
+REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
+                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's)");
+
 REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
                     "tile's objects over the whole surface height and the later tiles only "
@@ -1565,7 +1572,7 @@ bool VulkanCommandProcessor::SetupContext() {
     }
     REXGPU_INFO("Shared memory reads use one texel buffer");
   }
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[3];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[4];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1603,6 +1610,19 @@ bool VulkanCommandProcessor::SetupContext() {
     texel_buffer_binding.stageFlags = guest_shader_stages;
     texel_buffer_binding.pImmutableSamplers = nullptr;
   }
+  // UP-1.7: the object slot image, written by scene pixel shaders with host
+  // render targets.
+  object_slot_set_binding_ = !edram_fragment_shader_interlock;
+  if (object_slot_set_binding_) {
+    VkDescriptorSetLayoutBinding& object_slot_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    object_slot_binding.binding = SpirvShaderTranslator::kObjectSlotImageBinding;
+    object_slot_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    object_slot_binding.descriptorCount = 1;
+    object_slot_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    object_slot_binding.pImmutableSamplers = nullptr;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1613,18 +1633,26 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[2];
+  VkDescriptorPoolSize descriptor_pool_sizes[3];
+  uint32_t descriptor_pool_size_count = 1;
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
-  descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-  descriptor_pool_sizes[1].descriptorCount = 1;
+  if (shared_memory_texel_buffer) {
+    descriptor_pool_sizes[descriptor_pool_size_count].type =
+        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+  }
+  if (object_slot_set_binding_) {
+    descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+  }
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
   descriptor_pool_create_info.flags = 0;
   descriptor_pool_create_info.maxSets = 1;
-  descriptor_pool_create_info.poolSizeCount = 1 + uint32_t(shared_memory_texel_buffer);
+  descriptor_pool_create_info.poolSizeCount = descriptor_pool_size_count;
   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
                                  &shared_memory_and_edram_descriptor_pool_) != VK_SUCCESS) {
@@ -1644,6 +1672,10 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to allocate the Vulkan descriptor set for shared memory and "
         "EDRAM");
+    return false;
+  }
+  // A placeholder until the swap knows the guest output size.
+  if (!CreateObjectSlotImage(1, 1)) {
     return false;
   }
   WriteSharedMemoryAndEdramDescriptorSet();
@@ -2549,7 +2581,7 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[3];
+  VkWriteDescriptorSet write_descriptor_sets[4];
   uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2594,6 +2626,19 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_descriptor_set_texel_buffer.pImageInfo = nullptr;
     write_descriptor_set_texel_buffer.pBufferInfo = nullptr;
     write_descriptor_set_texel_buffer.pTexelBufferView = &shared_memory_texel_buffer_view_;
+  }
+  VkDescriptorImageInfo object_slot_image_info = {VK_NULL_HANDLE, object_slot_image_view_,
+                                                  VK_IMAGE_LAYOUT_GENERAL};
+  if (object_slot_set_binding_ && object_slot_image_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_descriptor_set_object_slots =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_descriptor_set_object_slots = {};
+    write_descriptor_set_object_slots.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_object_slots.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_object_slots.dstBinding = SpirvShaderTranslator::kObjectSlotImageBinding;
+    write_descriptor_set_object_slots.descriptorCount = 1;
+    write_descriptor_set_object_slots.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write_descriptor_set_object_slots.pImageInfo = &object_slot_image_info;
   }
   vulkan_device->functions().vkUpdateDescriptorSets(
       vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
@@ -2870,6 +2915,14 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          swap_hudless_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_camera_pipeline_);
+  DestroyObjectSlotImage();
+  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           swap_object_table_buffers_[i]);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           swap_object_table_memories_[i]);
+    swap_object_table_mappings_[i] = nullptr;
+  }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          swap_camera_pipeline_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
@@ -3464,10 +3517,18 @@ layout(push_constant) uniform SwapCameraConstants {
   layout(row_major) mat4 reprojection;
   uvec2 size;
   vec2 size_inv;
+  // UP-1.7: the slots in the table (0: camera motion only), and the object
+  // slot depth (host) to the source depth's scale.
+  uint object_count;
+  float object_depth_scale;
 } c;
 layout(set = 0, binding = 0) uniform texture2D source_depth;
 layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
 layout(set = 0, binding = 2, rg16f) writeonly uniform image2D motion;
+layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
+layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
+  layout(row_major) mat4 object_reprojections[];
+};
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
@@ -3479,10 +3540,38 @@ void main() {
   // Its depth is reversed (1 near) by the viewport, not the matrix: the
   // matrix's clip z is the usual D3D depth, 1 minus the stored one, which is
   // also what the providers take.
-  float z = 1.0 - texelFetch(source_depth, ivec2(c.size) - 1 - pixel, 0).r;
+  ivec2 scene_pixel = ivec2(c.size) - 1 - pixel;
+  float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
+  float z = 1.0 - stored_z;
+  // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
+  // depth holds (not something drawn over it without a slot), moves with
+  // its own reprojection.
+  mat4 reprojection = c.reprojection;
+  uint object_count = c.object_count & 0xFFFFu;
+  if (((c.object_count >> 16u) & 1u) != 0u) {
+    uint key = all(lessThan(scene_pixel, imageSize(object_slots)))
+                   ? imageLoad(object_slots, scene_pixel).r : 0u;
+    bool match = abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
+                 (1.0 / 65536.0);
+    imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+    imageStore(motion, pixel,
+               vec4(key != 0u ? vec2(float(key & 0xFFu) / 255.0 * 0.2, match ? 0.1 : -0.1)
+                              : vec2(0.0), 0.0, 0.0));
+    return;
+  }
+  if (object_count != 0u &&
+      all(lessThan(scene_pixel, imageSize(object_slots)))) {
+    uint key = imageLoad(object_slots, scene_pixel).r;
+    uint slot = key & 0xFFu;
+    if (slot != 0u && slot < object_count &&
+        abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
+            (1.0 / 65536.0)) {
+      reprojection = object_reprojections[slot];
+    }
+  }
   vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  vec4 previous = c.reprojection * vec4(-ndc, z, 1.0);
+  vec4 previous = reprojection * vec4(-ndc, z, 1.0);
   vec2 motion_uv = vec2(0.0);
   if (previous.w > 1.0e-6) {
     vec2 previous_ndc = -previous.xy / previous.w;
@@ -3502,17 +3591,18 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  VkDescriptorSetLayoutBinding bindings[5] = {};
+  for (uint32_t i = 0; i < 5; ++i) {
     bindings[i].binding = i;
-    bindings[i].descriptorType =
-        i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                 : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                        : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[i].descriptorCount = 1;
     bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 3;
+  set_layout_info.bindingCount = 5;
   set_layout_info.pBindings = bindings;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &swap_camera_set_layout_) != VK_SUCCESS) {
@@ -3520,7 +3610,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(float) * 16 + sizeof(uint32_t) * 4};
+                                             sizeof(float) * 16 + sizeof(uint32_t) * 6};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -3532,14 +3622,15 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
     REXGPU_WARN("Failed to create the swap camera pipeline layout");
     return false;
   }
-  VkDescriptorPoolSize pool_sizes[2] = {
+  VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxFramesInFlight},
   };
   VkDescriptorPoolCreateInfo pool_info = {};
   pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool_info.maxSets = kMaxFramesInFlight;
-  pool_info.poolSizeCount = 2;
+  pool_info.poolSizeCount = 3;
   pool_info.pPoolSizes = pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_camera_descriptor_pool_) !=
       VK_SUCCESS) {
@@ -3556,6 +3647,19 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_camera_sets_.data()) != VK_SUCCESS) {
     REXGPU_WARN("Failed to allocate the swap camera descriptor sets");
     return false;
+  }
+  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device,
+            VkDeviceSize(sizeof(float) * 16 * Fh1NativeExecutor::kMaxObjectSlots),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kUpload,
+            swap_object_table_buffers_[i], swap_object_table_memories_[i],
+            &swap_object_table_memory_types_[i]) ||
+        dfn.vkMapMemory(device, swap_object_table_memories_[i], 0, VK_WHOLE_SIZE, 0,
+                        &swap_object_table_mappings_[i]) != VK_SUCCESS) {
+      REXGPU_WARN("Failed to create the swap camera object reprojection buffers");
+      return false;
+    }
   }
   std::vector<uint32_t> spirv;
   std::string compile_error;
@@ -3578,6 +3682,22 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   DrawCostFrame();
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Settings that rebuild host objects apply between frames.
+  if (object_slot_wanted_width_ &&
+      (object_slot_wanted_width_ != object_slot_image_width_ ||
+       object_slot_wanted_height_ != object_slot_image_height_) &&
+      !device_lost_) {
+    // The shared memory set refers to the image, so nothing may be using it.
+    if (AwaitAllQueueOperationsCompletion()) {
+      AwaitSubmissionWorker();
+      DestroyObjectSlotImage();
+      if (CreateObjectSlotImage(object_slot_wanted_width_, object_slot_wanted_height_)) {
+        WriteSharedMemoryAndEdramDescriptorSet();
+        ResetCachedDrawState();
+        REXGPU_INFO("Object slot image: {}x{}", object_slot_image_width_,
+                    object_slot_image_height_);
+      }
+    }
+  }
   SwitchDrawResolutionScaleIfRequested();
   RecreateSamplersIfMipLodBiasChanged();
 }
@@ -3786,6 +3906,16 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
     fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    // UP-1.7: once the object slot image is the guest output's size (made
+    // between frames, IssueSwap) and initialised by a camera pass.
+    const bool object_motion_wanted =
+        camera_wanted && object_slot_set_binding_ && REXCVAR_GET(present_upscaler_object_motion);
+    object_slot_wanted_width_ = object_motion_wanted ? guest_output_width : 0;
+    object_slot_wanted_height_ = object_motion_wanted ? guest_output_height : 0;
+    fh1_native_executor_->SetObjectMotionEnabled(
+        object_motion_wanted && object_slot_image_initialized_ &&
+        object_slot_image_width_ == guest_output_width &&
+        object_slot_image_height_ == guest_output_height);
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     if (camera_wanted) {
@@ -4358,22 +4488,65 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             }
             SubmitBarriers(true);
             VkDescriptorSet camera_set = swap_camera_sets_[swap_frame_index];
-            VkDescriptorImageInfo camera_infos[3] = {
+            // UP-1.7: the object slots the scene's draws wrote, made
+            // readable (or, the first time, initialised: no objects).
+            const VkImageSubresourceRange object_slot_range =
+                ui::vulkan::util::InitializeSubresourceRange();
+            const bool object_slots_readable = object_slot_image_initialized_;
+            if (object_slots_readable) {
+              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED, false);
+            } else {
+              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_GENERAL);
+            }
+            SubmitBarriers(true);
+            const std::vector<std::array<float, 16>>& object_table =
+                fh1_native_executor_->object_reprojections_ready();
+            const uint32_t object_count =
+                object_slots_readable
+                    ? uint32_t(std::min<size_t>(object_table.size(),
+                                                Fh1NativeExecutor::kMaxObjectSlots))
+                    : 0;
+            if (object_count) {
+              std::memcpy(swap_object_table_mappings_[swap_frame_index], object_table.data(),
+                          sizeof(float) * 16 * object_count);
+              ui::vulkan::util::FlushMappedMemoryRange(
+                  GetVulkanDevice(), swap_object_table_memories_[swap_frame_index],
+                  swap_object_table_memory_types_[swap_frame_index]);
+            }
+            VkDescriptorImageInfo camera_infos[4] = {
                 {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                 {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, object_slot_image_view_, VK_IMAGE_LAYOUT_GENERAL},
             };
-            VkWriteDescriptorSet camera_writes[3] = {};
-            for (uint32_t i = 0; i < 3; ++i) {
+            const VkDescriptorBufferInfo object_table_info = {
+                swap_object_table_buffers_[swap_frame_index], 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet camera_writes[5] = {};
+            for (uint32_t i = 0; i < 5; ++i) {
               camera_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
               camera_writes[i].dstSet = camera_set;
               camera_writes[i].dstBinding = i;
               camera_writes[i].descriptorCount = 1;
-              camera_writes[i].descriptorType =
-                  i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-              camera_writes[i].pImageInfo = &camera_infos[i];
+              camera_writes[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              if (i == 4) {
+                camera_writes[i].pBufferInfo = &object_table_info;
+              } else {
+                camera_writes[i].pImageInfo = &camera_infos[i];
+              }
             }
-            dfn.vkUpdateDescriptorSets(device, 3, camera_writes, 0, nullptr);
+            dfn.vkUpdateDescriptorSets(device, 5, camera_writes, 0, nullptr);
             deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                              swap_camera_pipeline_layout_, 0, 1,
                                                              &camera_set, 0, nullptr);
@@ -4381,6 +4554,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
               float reprojection[16];
               uint32_t size[2];
               float size_inv[2];
+              uint32_t object_count;
+              float object_depth_scale;
             } camera_constants;
             std::memcpy(camera_constants.reprojection, camera.reprojection,
                         sizeof(camera_constants.reprojection));
@@ -4388,6 +4563,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             camera_constants.size[1] = guest_output_height;
             camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
             camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
+            camera_constants.object_count =
+                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug)) << 16;
+            if ((frame_current_ % 600) == 0) {
+              REXGPU_INFO("Object motion: {} slots, {} slot draws, {} without the variant",
+                          object_count, object_slot_draws_, object_slot_fallback_draws_);
+            }
+            camera_constants.object_depth_scale = fh1_native_executor_->camera_depth_scale();
+            object_slot_draws_ = 0;
+            object_slot_fallback_draws_ = 0;
             deferred_command_buffer_.CmdVkPushConstants(swap_camera_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(camera_constants),
@@ -4395,6 +4579,26 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             BindExternalComputePipeline(swap_camera_pipeline_);
             deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
                                                    (guest_output_height + 7) / 8, 1);
+            // Cleared for the next frame's scene.
+            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                                   VK_QUEUE_FAMILY_IGNORED, false);
+            SubmitBarriers(true);
+            const VkClearColorValue object_slot_clear = {};
+            deferred_command_buffer_.CmdVkClearColorImage(
+                object_slot_image_, VK_IMAGE_LAYOUT_GENERAL, &object_slot_clear, 1,
+                &object_slot_range);
+            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            object_slot_image_initialized_ = true;
             for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -5775,6 +5979,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // Shader modifications, and the translations, which with the same
     // register state and shaders are the last draw's.
     const uint32_t guest_prim_type = uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
+    // UP-1.7: scene draws write their object slot.
+    const bool object_slot = pixel_shader && fh1_native_executor_ &&
+                             fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
+    object_slot_draws_ += uint32_t(object_slot && !i);
     TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
         memo_state, uint64_t(uintptr_t(vertex_shader)),
         uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
@@ -5786,7 +5994,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             uint32_t(primitive_processing_result.host_vertex_shader_type) &&
         translation_memo.interpolator_mask == interpolator_mask &&
         translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
-        translation_memo.depth_control == normalized_depth_control.value) {
+        translation_memo.depth_control == normalized_depth_control.value &&
+        translation_memo.object_slot == object_slot) {
       vertex_shader_modification = translation_memo.vertex_modification;
       pixel_shader_modification = translation_memo.pixel_modification;
       vertex_shader_translation = translation_memo.vertex_translation;
@@ -5800,6 +6009,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                              *pixel_shader, interpolator_mask, ps_param_gen_pos,
                              normalized_depth_control)
                        : SpirvShaderTranslator::Modification(0);
+      if (object_slot) {
+        pixel_shader_modification.pixel.object_slot_output = 1;
+      }
 
       // Translate the shaders now to obtain the sampler bindings.
       vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -5808,9 +6020,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
                              pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                        : nullptr;
-      const VulkanPipelineCache::TranslationRequest translation_request =
+      VulkanPipelineCache::TranslationRequest translation_request =
           pipeline_cache_->RequestShadersTranslated(vertex_shader_translation,
                                                     pixel_shader_translation);
+      bool memo_translation = true;
+      if (object_slot &&
+          translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+        // The slot-writing variant is translated for the first time: drawn
+        // without the slot (camera motion) until it is ready.
+        pixel_shader_modification.pixel.object_slot_output = 0;
+        pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value));
+        translation_request = pipeline_cache_->RequestShadersTranslated(
+            vertex_shader_translation, pixel_shader_translation);
+        memo_translation = false;
+        ++object_slot_fallback_draws_;
+      }
       if (translation_request != VulkanPipelineCache::TranslationRequest::kReady) {
         translation_memo.state_epoch = 0;
         if (translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
@@ -5821,7 +6046,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
         return draw_fail("shader_translation");
       }
-      translation_memo.state_epoch = memo_state;
+      translation_memo.state_epoch = memo_translation ? memo_state : 0;
+      translation_memo.object_slot = object_slot;
       translation_memo.vertex_shader = vertex_shader;
       translation_memo.pixel_shader = pixel_shader;
       translation_memo.host_vertex_shader_type =
@@ -8489,6 +8715,58 @@ bool VulkanCommandProcessor::EnsureSwapFxaaSourceImage(uint32_t width, uint32_t 
   return true;
 }
 
+bool VulkanCommandProcessor::CreateObjectSlotImage(uint32_t width, uint32_t height) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = VK_FORMAT_R32_UINT;
+  image_create_info.extent = {width, height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          object_slot_image_, object_slot_image_memory_)) {
+    REXGPU_ERROR("Failed to create the object slot image");
+    return false;
+  }
+  VkImageViewCreateInfo image_view_create_info = {};
+  image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  image_view_create_info.image = object_slot_image_;
+  image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  image_view_create_info.format = image_create_info.format;
+  image_view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &object_slot_image_view_) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create the object slot image view");
+    DestroyObjectSlotImage();
+    return false;
+  }
+  object_slot_image_width_ = width;
+  object_slot_image_height_ = height;
+  object_slot_image_initialized_ = false;
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyObjectSlotImage() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, object_slot_image_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, object_slot_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, object_slot_image_memory_);
+  object_slot_image_width_ = 0;
+  object_slot_image_height_ = 0;
+  object_slot_image_initialized_ = false;
+}
+
 void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -8782,6 +9060,16 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
   dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
   system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+
+  // UP-1.7: the draw's object slot, per draw like the textures above.
+  if (fh1_native_executor_) {
+    const uint32_t object_slot = fh1_native_executor_->current_object_slot();
+    const int32_t object_row_offset = fh1_native_executor_->ObjectRowOffset();
+    dirty |= system_constants_.object_slot != object_slot ||
+             system_constants_.object_row_offset != object_row_offset;
+    system_constants_.object_slot = object_slot;
+    system_constants_.object_row_offset = object_row_offset;
+  }
 
   // Texture host swizzle in the shader.
   if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
