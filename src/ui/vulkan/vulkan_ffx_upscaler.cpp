@@ -360,7 +360,10 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     dispatch_desc.commandList = command_buffer;
     dispatch_desc.color = Resource(inputs.color, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                    FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    dispatch_desc.depth = Resource(depth, FFX_API_RESOURCE_USAGE_DEPTHTARGET,
+    // The depth is an R32_SFLOAT colour image (the camera pass's copy, or
+    // the stand-in): FFX would view a DEPTHTARGET as D32_SFLOAT with the
+    // depth aspect, which only Metal (MoltenVK) refuses.
+    dispatch_desc.depth = Resource(depth, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                    FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     dispatch_desc.motionVectors = Resource(motion_vectors, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                            FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
