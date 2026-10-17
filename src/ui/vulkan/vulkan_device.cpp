@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,6 +26,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/upscaler.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
@@ -498,6 +500,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
+
+  // Upscaler providers' extensions (DLSS's NGX on NVIDIA), enabled when
+  // supported.
+  std::deque<bool> upscaler_extensions_enabled;
+  for (const char* name : GetVulkanUpscalerDeviceExtensions(vulkan_instance->instance(),
+                                                            physical_device,
+                                                            properties.vendorID)) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
 
   std::vector<const char*> enabled_extensions;
   {

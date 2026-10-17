@@ -39,6 +39,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/single_layout_descriptor_set_pool.cpp
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
+    vulkan/vulkan_dlss_upscaler.cpp
     vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
@@ -153,6 +154,12 @@ endif()
 if(REXGLUE_USE_VULKAN AND REXGLUE_FFX_API_INCLUDE_DIR)
     target_include_directories(rexui PRIVATE "${REXGLUE_FFX_API_INCLUDE_DIR}")
     target_compile_definitions(rexui PRIVATE REX_HAS_FFX_API=1)
+endif()
+# The DLSS provider, when the build opted in (cmake/rexglue_dlss.cmake).
+if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_INCLUDE_DIR AND REXGLUE_DLSS_LIBRARY)
+    target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_DLSS=1)
+    target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_LIBRARY}")
 endif()
 
 if(REXGLUE_USE_VULKAN)

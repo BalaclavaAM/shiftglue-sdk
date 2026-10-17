@@ -60,6 +60,17 @@ class VulkanUpscaler {
 // The temporal providers built into this build, available or not.
 std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(const VulkanDevice* device);
 
+// DLSS through NGX, or null when the build has no DLSS (REX_HAS_DLSS).
+std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice* device);
+
+// Extensions the providers need on the instance, and on a device of this
+// vendor (NGX for DLSS). Instance and device creation enable those that are
+// supported. The names stay valid for the life of the process.
+std::vector<const char*> GetVulkanUpscalerInstanceExtensions();
+std::vector<const char*> GetVulkanUpscalerDeviceExtensions(VkInstance instance,
+                                                           VkPhysicalDevice physical_device,
+                                                           uint32_t vendor_id);
+
 }  // namespace vulkan
 }  // namespace ui
 }  // namespace rex

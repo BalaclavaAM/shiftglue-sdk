@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <deque>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -20,6 +21,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
@@ -188,6 +190,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
+  }
+
+  // Upscaler providers' extensions (DLSS's NGX), enabled when supported.
+  std::deque<bool> upscaler_extensions_enabled;
+  for (const char* name : GetVulkanUpscalerInstanceExtensions()) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
 
   std::vector<const char*> enabled_extensions;

@@ -529,6 +529,9 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
 std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(
     [[maybe_unused]] const VulkanDevice* device) {
   std::vector<std::unique_ptr<VulkanUpscaler>> upscalers;
+  if (std::unique_ptr<VulkanUpscaler> dlss = CreateVulkanDlssUpscaler(device)) {
+    upscalers.push_back(std::move(dlss));
+  }
 #if defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 3));
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 2));
