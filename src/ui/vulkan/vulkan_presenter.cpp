@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -47,6 +48,12 @@
 REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
                     "Time the temporal upscaler on the GPU and log the mean of every 300 "
                     "upscales");
+
+REXCVAR_DEFINE_STRING(present_upscaler_hud, "composite", "UI/Presenter",
+                      "What a temporal upscaler gets where the game draws its HUD: composite "
+                      "(the frame without the HUD, the HUD put back after the upscale), off "
+                      "(the frame with the HUD), debug (the frame without the HUD, shown so)")
+    .allowed({"composite", "off", "debug"});
 
 REXCVAR_DEFINE_BOOL(present_capture_readable, false, "UI/Presenter",
                     "Create the swapchain readable so render tests can capture the presented "
@@ -178,6 +185,7 @@ namespace shaders {
 // glslangValidator -V, from ../shaders/*.glsl.
 #include "../shaders/vulkan_spirv/hdr_output_ps.h"
 #include "../shaders/vulkan_spirv/hdr_ui_mask_ps.h"
+#include "../shaders/vulkan_spirv/upscale_hud_composite_cs.h"
 }  // namespace shaders
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
@@ -270,6 +278,14 @@ VulkanPresenter::~VulkanPresenter() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_hud_composite_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                             upscale_hud_composite_pipeline_layout_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                             upscale_hud_composite_descriptor_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                             upscale_hud_composite_set_layout_);
+
   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
   }
@@ -308,6 +324,109 @@ VulkanPresenter::~VulkanPresenter() {
   }
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                              guest_output_paint_image_descriptor_set_layout_);
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureHudlessImage() {
+  return guest_output_image_ && guest_output_image_->EnsureHudless();
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_image() const {
+  return guest_output_image_ ? guest_output_image_->hudless_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_image_view() const {
+  return guest_output_image_ ? guest_output_image_->hudless_view() : VK_NULL_HANDLE;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_ever_written_previously() const {
+  return guest_output_image_ && guest_output_image_->hudless_ever_written;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHudlessWritten() {
+  if (!guest_output_image_ || !hudless_written_out_ ||
+      guest_output_image_->hudless_image() == VK_NULL_HANDLE) {
+    return;
+  }
+  guest_output_image_->hudless_ever_written = true;
+  *hudless_written_out_ = true;
+}
+
+bool VulkanPresenter::EnsureUpscaleHudComposite() {
+  if (upscale_hud_composite_pipeline_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (upscale_hud_composite_failed_) {
+    return false;
+  }
+  upscale_hud_composite_failed_ = true;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &upscale_hud_composite_set_layout_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 6};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &upscale_hud_composite_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &upscale_hud_composite_pipeline_layout_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite pipeline layout");
+    return false;
+  }
+  const uint32_t set_count = uint32_t(upscale_hud_composite_sets_.size());
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * set_count},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, set_count},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = set_count;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr,
+                                 &upscale_hud_composite_descriptor_pool_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, PaintContext::kSubmissionCount> set_layouts;
+  set_layouts.fill(upscale_hud_composite_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = upscale_hud_composite_descriptor_pool_;
+  set_info.descriptorSetCount = set_count;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, upscale_hud_composite_sets_.data()) !=
+      VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to allocate the upscale HUD composite descriptor sets");
+    return false;
+  }
+  upscale_hud_composite_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_hud_composite_cs,
+      sizeof(shaders::upscale_hud_composite_cs));
+  if (upscale_hud_composite_pipeline_ == VK_NULL_HANDLE) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite pipeline");
+    return false;
+  }
+  upscale_hud_composite_failed_ = false;
+  return true;
 }
 
 std::vector<UpscalerInfo> VulkanPresenter::GetUpscalers() const {
@@ -1287,13 +1406,16 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
     image_instance.SetToNewImage(std::move(new_image), guest_output_image_next_version_++);
   }
 
-  VulkanGuestOutputRefreshContext context(is_8bpc_out_ref, image_instance.image->image(),
-                                          image_instance.image->view(), image_instance.version,
-                                          image_instance.ever_successfully_refreshed);
+  bool hudless_written = false;
+  VulkanGuestOutputRefreshContext context(
+      is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
+      image_instance.version, image_instance.ever_successfully_refreshed,
+      image_instance.image.get(), &hudless_written);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
+  image_instance.hudless_valid = refresher_succeeded && hudless_written;
   // Deferred: the refresher's work reaches the queue later, and the step
   // signals after it.
   if (!IsGuestOutputPublishDeferred()) {
@@ -1833,6 +1955,9 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
 VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
   if (view_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_, nullptr);
   }
@@ -1845,6 +1970,26 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
 }
 
 bool VulkanPresenter::GuestOutputImage::Initialize() {
+  return CreateImage(image_, memory_, view_);
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureHudless() {
+  if (hudless_image_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (CreateImage(hudless_image_, hudless_memory_, hudless_view_)) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
+  return false;
+}
+
+bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemory& memory,
+                                                    VkImageView& view) {
   VkImageCreateInfo image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
@@ -1865,8 +2010,8 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
-          vulkan_device_, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image_,
-          memory_)) {
+          vulkan_device_, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
+          memory)) {
     REXLOG_ERROR("VulkanPresenter: Failed to create a guest output image");
     return false;
   }
@@ -1878,7 +2023,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   image_view_create_info.pNext = nullptr;
   image_view_create_info.flags = 0;
-  image_view_create_info.image = image_;
+  image_view_create_info.image = image;
   image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
   image_view_create_info.format = kGuestOutputFormat;
   image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -1890,7 +2035,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_view_create_info.subresourceRange.levelCount = 1;
   image_view_create_info.subresourceRange.baseArrayLayer = 0;
   image_view_create_info.subresourceRange.layerCount = 1;
-  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &view_) != VK_SUCCESS) {
+  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &view) != VK_SUCCESS) {
     REXLOG_ERROR("VulkanPresenter: Failed to create a guest output image view");
     return false;
   }
@@ -2009,6 +2154,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
   uint64_t guest_output_refresh_serial = 0;
+  bool guest_output_hudless = false;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
@@ -2017,6 +2163,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
+      guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -2251,6 +2398,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // The flow puts a temporal upscale in an EASU slot; without a usable
         // provider, the slot stays FSR 1 EASU.
         VulkanUpscaler* temporal_upscaler = GetTemporalUpscaler(guest_output_paint_config);
+        // UP-1.2: the upscaler reads the guest output without the HUD when
+        // the refresher wrote that copy, which it can only do for the guest
+        // output itself (the temporal slot first in the flow).
+        const std::string& hud_mode = REXCVAR_GET(present_upscaler_hud);
+        const bool hudless_allowed = hud_mode != "off";
+        hudless_guest_output_wanted_.store(
+            hudless_allowed && temporal_upscaler && guest_output_flow.effect_count > 1 &&
+                guest_output_flow.effects[0] == GuestOutputPaintEffect::kFsrEasu,
+            std::memory_order_relaxed);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
@@ -2283,7 +2439,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             const GuestOutputImage& source =
                 i ? *paint_context_.guest_output_intermediate_images[i - 1] : *guest_output_image;
             const GuestOutputImage& output = *paint_context_.guest_output_intermediate_images[i];
-            VkImage source_image = source.image();
+            const bool use_hudless = hudless_allowed && i == 0 && guest_output_hudless &&
+                                     source.hudless_image() != VK_NULL_HANDLE;
+            VkImage source_image = use_hudless ? source.hudless_image() : source.image();
+            VkImageView source_view = use_hudless ? source.hudless_view() : source.view();
             VkImage output_image = output.image();
             uint32_t effect_input_width = 0, effect_input_height = 0;
             guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
@@ -2321,10 +2480,69 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                      nullptr, 1, &barrier_to_uav);
 
             if (DispatchTemporalUpscaler(draw_command_buffer, *temporal_upscaler, source_image,
-                                         source.view(), effect_input_width, effect_input_height,
+                                         source_view, effect_input_width, effect_input_height,
                                          output_image, output.view(), effect_rect_size.first,
                                          effect_rect_size.second, guest_output_refresh_serial,
                                          guest_output_paint_config)) {
+              if (use_hudless && hud_mode == "composite" && EnsureUpscaleHudComposite()) {
+                VkImageMemoryBarrier barrier_to_composite = {};
+                barrier_to_composite.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier_to_composite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_composite.dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_composite.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_composite.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_composite.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_composite.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_composite.image = output_image;
+                barrier_to_composite.subresourceRange = util::InitializeSubresourceRange();
+                dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                         nullptr, 1, &barrier_to_composite);
+                VkDescriptorSet composite_set =
+                    upscale_hud_composite_sets_[current_paint_submission_index %
+                                                upscale_hud_composite_sets_.size()];
+                const VkSampler linear_sampler =
+                    ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
+                VkDescriptorImageInfo composite_images[3] = {
+                    {linear_sampler, source.view(), kGuestOutputInternalLayout},
+                    {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
+                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
+                };
+                VkWriteDescriptorSet composite_writes[3] = {};
+                for (uint32_t j = 0; j < 3; ++j) {
+                  composite_writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                  composite_writes[j].dstSet = composite_set;
+                  composite_writes[j].dstBinding = j;
+                  composite_writes[j].descriptorCount = 1;
+                  composite_writes[j].descriptorType =
+                      j == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                             : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                  composite_writes[j].pImageInfo = &composite_images[j];
+                }
+                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, composite_writes, 0,
+                                           nullptr);
+                struct {
+                  uint32_t output_size[2];
+                  float output_size_inv[2];
+                  float source_uv_scale[2];
+                } composite_constants = {
+                    {effect_rect_size.first, effect_rect_size.second},
+                    {1.0f / float(effect_rect_size.first), 1.0f / float(effect_rect_size.second)},
+                    {float(effect_input_width) / float(source.extent().width),
+                     float(effect_input_height) / float(source.extent().height)}};
+                dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      upscale_hud_composite_pipeline_);
+                dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            upscale_hud_composite_pipeline_layout_, 0, 1,
+                                            &composite_set, 0, nullptr);
+                dfn.vkCmdPushConstants(draw_command_buffer,
+                                       upscale_hud_composite_pipeline_layout_,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(composite_constants), &composite_constants);
+                dfn.vkCmdDispatch(draw_command_buffer, (effect_rect_size.first + 15) / 16,
+                                  (effect_rect_size.second + 7) / 8, 1);
+              }
               VkImageMemoryBarrier barrier_to_shader_read = {};
               barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
               barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

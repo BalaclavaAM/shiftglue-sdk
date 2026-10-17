@@ -383,6 +383,10 @@ class Presenter {
 
   // What the guest output can be scaled with on this presenter.
   virtual std::vector<UpscalerInfo> GetUpscalers() const { return GetSpatialUpscalerInfos(); }
+  // Whether painting would use a copy of the guest output without the game's
+  // HUD (a temporal upscaler, UP-1.2); the refresher then writes one where it
+  // can tell the HUD apart. Read by the refresher at any time.
+  virtual bool WantsHudlessGuestOutput() const { return false; }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }

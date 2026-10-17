@@ -92,16 +92,25 @@ class VulkanPresenter final : public Presenter {
   static constexpr VkImageLayout kGuestOutputInternalLayout =
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+  // Defined below; refresh contexts point at one.
+ private:
+  class GuestOutputImage;
+
+ public:
   // The callback must use the graphics and compute queue 0 of the device.
   class VulkanGuestOutputRefreshContext final : public GuestOutputRefreshContext {
    public:
     VulkanGuestOutputRefreshContext(bool& is_8bpc_out_ref, VkImage image, VkImageView image_view,
-                                    uint64_t image_version, bool image_ever_written_previously)
+                                    uint64_t image_version, bool image_ever_written_previously,
+                                    GuestOutputImage* guest_output_image = nullptr,
+                                    bool* hudless_written_out = nullptr)
         : GuestOutputRefreshContext(is_8bpc_out_ref),
           image_(image),
           image_view_(image_view),
           image_version_(image_version),
-          image_ever_written_previously_(image_ever_written_previously) {}
+          image_ever_written_previously_(image_ever_written_previously),
+          guest_output_image_(guest_output_image),
+          hudless_written_out_(hudless_written_out) {}
 
     // The format is kGuestOutputFormat.
     // Supports usage as a color attachment and as a sampled image, as well as
@@ -112,11 +121,24 @@ class VulkanPresenter final : public Presenter {
     // Whether a proper barrier must be done to acquire the image.
     bool image_ever_written_previously() const { return image_ever_written_previously_; }
 
+    // UP-1.2, when WantsHudlessGuestOutput: the guest output without the
+    // game's HUD, with the HUD's coverage (0 or 1) in alpha. Same format,
+    // usage and release state as the guest output; created on first use.
+    // After writing it, the refresher calls SetHudlessWritten, or painting
+    // ignores it for this frame.
+    bool EnsureHudlessImage();
+    VkImage hudless_image() const;
+    VkImageView hudless_image_view() const;
+    bool hudless_ever_written_previously() const;
+    void SetHudlessWritten();
+
    private:
     VkImage image_;
     VkImageView image_view_;
     uint64_t image_version_;
     bool image_ever_written_previously_;
+    GuestOutputImage* guest_output_image_;
+    bool* hudless_written_out_;
   };
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
@@ -141,6 +163,9 @@ class VulkanPresenter final : public Presenter {
   bool CaptureGuestOutput(RawImage& image_out) override;
   bool CapturePresentedOutput(RawImage& image_out) override;
   std::vector<UpscalerInfo> GetUpscalers() const override;
+  bool WantsHudlessGuestOutput() const override {
+    return hudless_guest_output_wanted_.load(std::memory_order_relaxed);
+  }
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -187,6 +212,12 @@ class VulkanPresenter final : public Presenter {
     VkDeviceMemory memory() const { return memory_; }
     VkImageView view() const { return view_; }
 
+    // The HUD-less copy (VulkanGuestOutputRefreshContext::EnsureHudlessImage).
+    bool EnsureHudless();
+    VkImage hudless_image() const { return hudless_image_; }
+    VkImageView hudless_view() const { return hudless_view_; }
+    bool hudless_ever_written = false;
+
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
                      const uint32_t height)
@@ -196,6 +227,7 @@ class VulkanPresenter final : public Presenter {
     }
 
     bool Initialize();
+    bool CreateImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view);
 
     const VulkanDevice* vulkan_device_;
 
@@ -203,6 +235,9 @@ class VulkanPresenter final : public Presenter {
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
+    VkImage hudless_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory hudless_memory_ = VK_NULL_HANDLE;
+    VkImageView hudless_view_ = VK_NULL_HANDLE;
   };
 
   struct GuestOutputImageInstance {
@@ -212,6 +247,8 @@ class VulkanPresenter final : public Presenter {
     uint64_t version = UINT64_MAX;
     // Which refresh wrote the image last (guest_output_refresh_serial_).
     uint64_t refresh_serial = 0;
+    // Whether that refresh also wrote the HUD-less copy.
+    bool hudless_valid = false;
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
@@ -223,6 +260,7 @@ class VulkanPresenter final : public Presenter {
       version = new_version;
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
+      hudless_valid = false;
     }
   };
 
@@ -581,6 +619,18 @@ class VulkanPresenter final : public Presenter {
     uint64_t repeat_count = 0;
   };
   TemporalUpscaleState temporal_upscale_;
+  // UP-1.2: whether the last paint fed a temporal upscaler the guest output
+  // directly, so the refresher should write the HUD-less copy.
+  std::atomic<bool> hudless_guest_output_wanted_ = false;
+  // UP-1.2: draws the HUD over the upscale of the HUD-less copy
+  // (upscale_hud_composite.cs.glsl), created on first use.
+  bool EnsureUpscaleHudComposite();
+  bool upscale_hud_composite_failed_ = false;
+  VkDescriptorSetLayout upscale_hud_composite_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout upscale_hud_composite_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline upscale_hud_composite_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool upscale_hud_composite_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, PaintContext::kSubmissionCount> upscale_hud_composite_sets_ = {};
   VkQueryPool temporal_upscale_query_pool_ = VK_NULL_HANDLE;
   std::array<uint64_t, 8> temporal_upscale_query_submissions_ = {};
   double temporal_upscale_gpu_ns_ = 0.0;

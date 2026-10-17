@@ -1145,6 +1145,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // UP-1.2: the guest output without the HUD for a temporal upscaler (the
+  // pre-HUD snapshot through the gamma ramp, the HUD mask in alpha), with
+  // its own descriptor sets so it can run beside present_hdr's mask.
+  bool EnsureSwapHudless();
+  bool swap_hudless_failed_ = false;
+  VkDescriptorPool swap_hudless_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_source_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_destination_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_mask_sets_{};
   // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
   // the HUD left alone, told apart with the pre-HUD snapshot.
   bool EnsureSwapScenePost();

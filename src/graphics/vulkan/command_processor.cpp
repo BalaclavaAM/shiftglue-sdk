@@ -2867,6 +2867,8 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_hud_mask_pipeline_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          swap_hud_mask_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_hudless_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_hud_mask_set_layout_);
   // Into the destroy queues, emptied below.
@@ -3396,6 +3398,52 @@ bool VulkanCommandProcessor::EnsureSwapHudMask() {
   return true;
 }
 
+bool VulkanCommandProcessor::EnsureSwapHudless() {
+  if (swap_hudless_descriptor_pool_ != VK_NULL_HANDLE) return true;
+  if (swap_hudless_failed_ || !EnsureSwapHudMask()) return false;
+  swap_hudless_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // The gamma pass's source and destination, and the mask pass (two sampled
+  // images and a storage image).
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = 3 * kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_hudless_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HUD-less guest output descriptor pool");
+    return false;
+  }
+  const auto allocate = [&](VkDescriptorSetLayout layout,
+                            std::array<VkDescriptorSet, kMaxFramesInFlight>& sets) {
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
+    layouts.fill(layout);
+    VkDescriptorSetAllocateInfo set_info = {};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = swap_hudless_descriptor_pool_;
+    set_info.descriptorSetCount = kMaxFramesInFlight;
+    set_info.pSetLayouts = layouts.data();
+    return dfn.vkAllocateDescriptorSets(device, &set_info, sets.data()) == VK_SUCCESS;
+  };
+  if (!allocate(swap_descriptor_set_layout_sampled_image_, swap_hudless_source_sets_) ||
+      !allocate(swap_descriptor_set_layout_storage_image_, swap_hudless_destination_sets_) ||
+      !allocate(swap_hud_mask_set_layout_, swap_hudless_mask_sets_)) {
+    REXGPU_WARN("Failed to allocate the HUD-less guest output descriptor sets");
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                           swap_hudless_descriptor_pool_);
+    return false;
+  }
+  swap_hudless_failed_ = false;
+  return true;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   DrawCostFrame();
@@ -3592,13 +3640,16 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   // of it HUD, and the scene-only post does not run.
   VkImageView hud_snapshot_view = VK_NULL_HANDLE;
   bool hdr_active = false;
+  // UP-1.2: a temporal upscaler reads the guest output without the HUD.
+  const bool hudless_wanted = presenter->WantsHudlessGuestOutput();
   const bool scene_fxaa =
       swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
   const bool scene_lut =
       !REXCVAR_GET(scene_lut_path).empty() && REXCVAR_GET(scene_lut_strength) > 0;
   if (fh1_native_executor_) {
     hdr_active = ui::vulkan::GetHdrOutputState().active;
-    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut);
+    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut ||
+                                                hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
   }
@@ -3607,8 +3658,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view, hdr_active, scene_fxaa,
-       scene_lut](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
+       hudless_wanted](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4052,6 +4103,103 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                         sizeof(hud_mask_size), hud_mask_size);
             BindExternalComputePipeline(swap_hud_mask_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          }
+
+          // UP-1.2: the guest output without the HUD, for a temporal
+          // upscaler: the scene before the HUD through the same gamma ramp,
+          // then the HUD's coverage into its alpha. Not where a frame has no
+          // snapshot (menus), whose guest output is all HUD.
+          VkPipeline hudless_gamma_pipeline = use_pwl_gamma_ramp
+                                                  ? swap_apply_gamma_compute_pwl_pipeline_
+                                                  : swap_apply_gamma_compute_256_entry_table_pipeline_;
+          if (hudless_wanted && hud_snapshot_view != VK_NULL_HANDLE &&
+              hudless_gamma_pipeline != VK_NULL_HANDLE && EnsureSwapHudless() &&
+              vulkan_context.EnsureHudlessImage()) {
+            const VkImage hudless_image = vulkan_context.hudless_image();
+            const VkImageView hudless_view = vulkan_context.hudless_image_view();
+            const bool hudless_written_before = vulkan_context.hudless_ever_written_previously();
+            PushImageMemoryBarrier(
+                hudless_image, guest_output_subresource_range,
+                hudless_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                                       : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                hudless_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
+                                       : 0,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            VkDescriptorSet hudless_source_set = swap_hudless_source_sets_[swap_frame_index];
+            VkDescriptorSet hudless_destination_set =
+                swap_hudless_destination_sets_[swap_frame_index];
+            VkDescriptorSet hudless_mask_set = swap_hudless_mask_sets_[swap_frame_index];
+            VkDescriptorImageInfo hudless_infos[5] = {
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hudless_view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hudless_view, VK_IMAGE_LAYOUT_GENERAL},
+            };
+            const VkDescriptorSet hudless_write_sets[5] = {
+                hudless_source_set, hudless_destination_set, hudless_mask_set, hudless_mask_set,
+                hudless_mask_set};
+            const uint32_t hudless_write_bindings[5] = {0, 0, 0, 1, 2};
+            VkWriteDescriptorSet hudless_writes[5] = {};
+            for (uint32_t i = 0; i < 5; ++i) {
+              hudless_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              hudless_writes[i].dstSet = hudless_write_sets[i];
+              hudless_writes[i].dstBinding = hudless_write_bindings[i];
+              hudless_writes[i].descriptorCount = 1;
+              hudless_writes[i].descriptorType = (i == 1 || i == 4)
+                                                     ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              hudless_writes[i].pImageInfo = &hudless_infos[i];
+            }
+            dfn.vkUpdateDescriptorSets(device, 5, hudless_writes, 0, nullptr);
+
+            std::array<VkDescriptorSet, kSwapApplyGammaComputeDescriptorSetCount>
+                hudless_gamma_sets{};
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetRamp] =
+                swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
+                                             uint32_t(use_pwl_gamma_ramp)];
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetSource] = hudless_source_set;
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetDestination] =
+                hudless_destination_set;
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_apply_gamma_compute_pipeline_layout_, 0,
+                uint32_t(hudless_gamma_sets.size()), hudless_gamma_sets.data(), 0, nullptr);
+            SwapApplyGammaConstants hudless_gamma_constants = {
+                {guest_output_width, guest_output_height}};
+            deferred_command_buffer_.CmdVkPushConstants(
+                swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                sizeof(hudless_gamma_constants), &hudless_gamma_constants);
+            BindExternalComputePipeline(hudless_gamma_pipeline);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                &hudless_mask_set, 0, nullptr);
+            const uint32_t hudless_mask_size[2] = {guest_output_width, guest_output_height};
+            deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(hudless_mask_size),
+                                                        hudless_mask_size);
+            BindExternalComputePipeline(swap_hud_mask_pipeline_);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_IMAGE_LAYOUT_GENERAL,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            vulkan_context.SetHudlessWritten();
           }
 
           // Insert the release barrier.
