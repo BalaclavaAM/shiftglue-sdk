@@ -18,6 +18,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
+#include <rex/session_probe.h>
 
 #include <span>
 
@@ -155,14 +156,15 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
+          auto* read_buffer = buffer_physical_heap
+              ? memory()->TranslatePhysical(buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+              : memory()->TranslateVirtual(buffer_guest_address);
+          result = file_->ReadSync(std::span<uint8_t>(read_buffer, buffer_length),
               size_t(byte_offset), &bytes_read);
+          if (session_probe::Enabled()) {
+            session_probe::Scalar(session_probe::Kind::kIoData, (uint64_t(handle()) << 32) | buffer_guest_address,
+                                  session_probe::Digest(read_buffer, bytes_read));
+          }
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
@@ -180,6 +182,10 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     }
   }
 
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kIoRead, (uint64_t(handle()) << 32) | uint32_t(result), bytes_read);
+    session_probe::Scalar(session_probe::Kind::kIoRead, buffer_guest_address, byte_offset);
+  }
   if (out_bytes_read) {
     *out_bytes_read = uint32_t(bytes_read);
   }
@@ -266,6 +272,12 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   X_STATUS result = file_->WriteSync(
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kIoWrite, (uint64_t(handle()) << 32) | uint32_t(result), bytes_written);
+    session_probe::Scalar(session_probe::Kind::kIoWrite, buffer_guest_address, byte_offset);
+    session_probe::Scalar(session_probe::Kind::kIoData, handle(),
+        session_probe::Digest(memory()->TranslateVirtual(buffer_guest_address), bytes_written));
+  }
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
   }

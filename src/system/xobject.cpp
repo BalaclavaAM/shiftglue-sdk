@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/session_probe.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -202,10 +203,11 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  session_probe::SyncBoundary trace(handle(), opt_timeout ? *opt_timeout : UINT64_MAX);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
-    return X_STATUS_SUCCESS;
+    return trace.Finish(X_STATUS_SUCCESS);
   }
 
   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
@@ -218,23 +220,25 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       WaitCallback();
-      return X_STATUS_SUCCESS;
+      return trace.Finish(X_STATUS_SUCCESS);
     case rex::thread::WaitResult::kUserCallback:
       // Or X_STATUS_ALERTED?
-      return X_STATUS_USER_APC;
+      return trace.Finish(X_STATUS_USER_APC);
     case rex::thread::WaitResult::kTimeout:
       rex::thread::MaybeYield();
-      return X_STATUS_TIMEOUT;
+      return trace.Finish(X_STATUS_TIMEOUT);
     default:
     case rex::thread::WaitResult::kAbandoned:
     case rex::thread::WaitResult::kFailed:
-      return X_STATUS_ABANDONED_WAIT_0;
+      return trace.Finish(X_STATUS_ABANDONED_WAIT_0);
   }
 }
 
 X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
                                 uint32_t processor_mode, uint32_t alertable,
                                 uint64_t* opt_timeout) {
+  session_probe::SyncBoundary trace((uint64_t(signal_object->handle()) << 32) | wait_object->handle(),
+                                    opt_timeout ? *opt_timeout : UINT64_MAX);
   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
@@ -245,23 +249,28 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       wait_object->WaitCallback();
-      return X_STATUS_SUCCESS;
+      return trace.Finish(X_STATUS_SUCCESS);
     case rex::thread::WaitResult::kUserCallback:
       // Or X_STATUS_ALERTED?
-      return X_STATUS_USER_APC;
+      return trace.Finish(X_STATUS_USER_APC);
     case rex::thread::WaitResult::kTimeout:
       rex::thread::MaybeYield();
-      return X_STATUS_TIMEOUT;
+      return trace.Finish(X_STATUS_TIMEOUT);
     default:
     case rex::thread::WaitResult::kAbandoned:
     case rex::thread::WaitResult::kFailed:
-      return X_STATUS_ABANDONED_WAIT_0;
+      return trace.Finish(X_STATUS_ABANDONED_WAIT_0);
   }
 }
 
 X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  uint64_t key = (uint64_t(wait_type) << 32) | count;
+  if (session_probe::Enabled()) {
+    for (uint32_t i = 0; i < count; ++i) key = (key ^ objects[i]->handle()) * UINT64_C(1099511628211);
+  }
+  session_probe::SyncBoundary trace(key, opt_timeout ? *opt_timeout : UINT64_MAX);
   std::vector<rex::thread::WaitHandle*> wait_handles(count);
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
@@ -281,18 +290,18 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
       case rex::thread::WaitResult::kSuccess:
         objects[result.second]->WaitCallback();
 
-        return X_STATUS(result.second);
+        return trace.Finish(X_STATUS(result.second));
       case rex::thread::WaitResult::kUserCallback:
         // Or X_STATUS_ALERTED?
-        return X_STATUS_USER_APC;
+        return trace.Finish(X_STATUS_USER_APC);
       case rex::thread::WaitResult::kTimeout:
         rex::thread::MaybeYield();
-        return X_STATUS_TIMEOUT;
+        return trace.Finish(X_STATUS_TIMEOUT);
       default:
       case rex::thread::WaitResult::kAbandoned:
-        return X_STATUS(X_STATUS_ABANDONED_WAIT_0 + result.second);
+        return trace.Finish(X_STATUS(X_STATUS_ABANDONED_WAIT_0 + result.second));
       case rex::thread::WaitResult::kFailed:
-        return X_STATUS_UNSUCCESSFUL;
+        return trace.Finish(X_STATUS_UNSUCCESSFUL);
     }
   } else {
     auto result =
@@ -304,17 +313,17 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
           objects[i]->WaitCallback();
         }
 
-        return X_STATUS_SUCCESS;
+        return trace.Finish(X_STATUS_SUCCESS);
       case rex::thread::WaitResult::kUserCallback:
         // Or X_STATUS_ALERTED?
-        return X_STATUS_USER_APC;
+        return trace.Finish(X_STATUS_USER_APC);
       case rex::thread::WaitResult::kTimeout:
         rex::thread::MaybeYield();
-        return X_STATUS_TIMEOUT;
+        return trace.Finish(X_STATUS_TIMEOUT);
       default:
       case rex::thread::WaitResult::kAbandoned:
       case rex::thread::WaitResult::kFailed:
-        return X_STATUS_ABANDONED_WAIT_0;
+        return trace.Finish(X_STATUS_ABANDONED_WAIT_0);
     }
   }
 }

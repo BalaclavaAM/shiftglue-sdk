@@ -752,6 +752,10 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+  // CS-0.1, decoder-owned: headers (including IB links), payloads and nested
+  // packets in decode order; reset on each XE_SWAP.
+  uint64_t session_pm4_hash_ = UINT64_C(14695981039346656037);
+  uint64_t session_pm4_words_ = 0;
 };
 
 }  // namespace rex::graphics

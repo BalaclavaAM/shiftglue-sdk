@@ -13,6 +13,7 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmutant.h>
+#include <rex/session_probe.h>
 #include <rex/system/xthread.h>
 
 namespace rex::system {
@@ -38,6 +39,7 @@ void XMutant::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
 }
 
 X_STATUS XMutant::ReleaseMutant(uint32_t priority_increment, bool abandon, bool wait) {
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), 5);
   // Call should succeed if we own the mutant, so go ahead and do this.
   if (owning_thread_ == XThread::GetCurrentThread()) {
     owning_thread_ = nullptr;

@@ -12,6 +12,7 @@
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/system/xevent.h>
+#include <rex/session_probe.h>
 
 namespace rex::system {
 
@@ -74,21 +75,25 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
 }
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), 1);
   event_->Set();
   return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), 2);
   event_->Pulse();
   return 1;
 }
 
 int32_t XEvent::Reset() {
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), 3);
   event_->Reset();
   return 1;
 }
 
 void XEvent::Clear() {
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), 4);
   event_->Reset();
 }
 

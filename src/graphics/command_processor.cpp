@@ -40,6 +40,7 @@
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
+#include <rex/session_probe.h>
 #include <rex/system/d3d_census.h>
 #include <rex/system/d3d_draw.h>
 #include <rex/system/gpu_write_signal.h>
@@ -2149,6 +2150,26 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  if (session_probe::Enabled()) {
+    uint32_t words = 1;
+    if (packet && (packet_type == 0 || packet_type == 3)) words += ((packet >> 16) & 0x3FFF) + 1;
+    else if (packet_type == 1) words += 2;
+    memory::RingBuffer copy = *reader;
+    copy.set_read_offset(packet_offset);
+    auto range = copy.BeginRead(size_t(words) * 4);
+    if (range.first_length + range.second_length != size_t(words) * 4)
+      rex::FatalError("CS-0.1 cannot hash a truncated PM4 packet");
+    session_pm4_hash_ = session_probe::Digest(range.first, range.first_length, session_pm4_hash_);
+    session_pm4_hash_ = session_probe::Digest(range.second, range.second_length, session_pm4_hash_);
+    session_pm4_words_ += words;
+    if (packet_type == 3 && ((packet >> 8) & 0x7F) == PM4_XE_SWAP) {
+      session_probe::Scalar(session_probe::Kind::kPm4Frame, counter_, session_pm4_hash_);
+      session_probe::Scalar(session_probe::Kind::kPm4Words, counter_, session_pm4_words_);
+      session_probe::Flush();
+      session_pm4_hash_ = UINT64_C(14695981039346656037);
+      session_pm4_words_ = 0;
+    }
+  }
   if (packet == 0) {
     return true;
   }
@@ -2555,7 +2576,8 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
-  RecordCall([this, cpu_mask]() {
+  RecordCall([this, cpu_mask, frame = counter_]() {
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuInterrupt, frame, cpu_mask);
     AwaitGuestGpuCompletionIfRequested();
     if (record_split_) {
       FlushCpuVisibleResults();
@@ -2974,11 +2996,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   data_value = GpuSwap(data_value, endianness);
   if (!record_split_) {
     AwaitGuestGpuCompletionIfRequested();
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
     memory::store(memory_->TranslatePhysical(address), data_value);
     return true;
   }
   RecordCall([this, address, data_value]() {
     AwaitGuestGpuCompletionIfRequested();
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
     FlushCpuVisibleResults();
     memory::store(memory_->TranslatePhysical(address), data_value);
     system::SignalGpuWrite();

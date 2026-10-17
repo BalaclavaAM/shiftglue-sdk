@@ -16,6 +16,7 @@ add_library(rexcore OBJECT
     memory.cpp
     mutex.cpp
     ring_buffer.cpp
+    session_probe.cpp
     string_buffer.cpp
     sync_census.cpp
     threading.cpp

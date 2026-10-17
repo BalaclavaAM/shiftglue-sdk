@@ -39,6 +39,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
+#include <rex/session_probe.h>
 #include <rex/thread.h>
 #include <rex/vec128.h>
 
@@ -607,6 +608,7 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_CREATED();
 
     // Execute user code.
+    session_probe::SetThreadTag(thread_id_);
     current_xthread_tls_ = this;
     running_ = true;
     Execute();

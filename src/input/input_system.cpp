@@ -24,6 +24,7 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/ui/keybinds.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
@@ -250,7 +251,13 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  return GetMergedState(user_index, false, out_state);
+  const auto result = GetMergedState(user_index, false, out_state);
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kInputResult, user_index, result);
+    if (result == X_ERROR_SUCCESS)
+      session_probe::Blob(session_probe::Kind::kInputState, user_index, out_state, sizeof(*out_state));
+  }
+  return result;
 }
 
 X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state) {
