@@ -2535,6 +2535,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
         }
         guest_output_jitter_phases_.store(jitter_phases, std::memory_order_relaxed);
+        SetTemporalUpscalerActive(temporal_reads_guest_output);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];

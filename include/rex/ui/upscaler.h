@@ -60,6 +60,12 @@ struct UpscalerInfo {
 // The spatial providers every presenter has.
 std::vector<UpscalerInfo> GetSpatialUpscalerInfos();
 
+// Whether the presenter's last paint fed the guest output to a temporal
+// provider (UP-1.6): games turn off effects that fight its history, such as
+// motion blur and depth of field. Any thread.
+bool IsTemporalUpscalerActive();
+void SetTemporalUpscalerActive(bool active);
+
 // Per-frame description of a temporal upscale, for every graphics API.
 // The game camera of a frame, for a temporal upscaler's depth and motion.
 struct UpscalerCamera {

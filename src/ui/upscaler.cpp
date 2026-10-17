@@ -1,5 +1,7 @@
 #include <rex/ui/upscaler.h>
 
+#include <atomic>
+
 namespace rex {
 namespace ui {
 
@@ -37,6 +39,18 @@ const char* GetUpscalerModeName(UpscalerMode mode) {
     default:
       return "";
   }
+}
+
+namespace {
+std::atomic<bool> temporal_upscaler_active = false;
+}  // namespace
+
+bool IsTemporalUpscalerActive() {
+  return temporal_upscaler_active.load(std::memory_order_relaxed);
+}
+
+void SetTemporalUpscalerActive(bool active) {
+  temporal_upscaler_active.store(active, std::memory_order_relaxed);
 }
 
 std::vector<UpscalerInfo> GetSpatialUpscalerInfos() {
