@@ -6425,6 +6425,36 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
+  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder &&
+      pixel_shader_modification.pixel.object_slot_output) {
+    // UP-1.7: the slot-writing variant's pipeline is new even when the base
+    // one is cached, so waiting for it stalled the frame (up to the wait per
+    // draw, over a second a frame driving into new areas). Draw with the base
+    // pipeline (camera motion) until the variant is built.
+    SpirvShaderTranslator::Modification base_modification = pixel_shader_modification;
+    base_modification.pixel.object_slot_output = 0;
+    auto* base_translation = static_cast<VulkanShader::VulkanTranslation*>(
+        pixel_shader->GetOrCreateTranslation(base_modification.value));
+    VkPipeline base_pipeline;
+    const VulkanPipelineCache::PipelineLayoutProvider* base_layout_provider = nullptr;
+    void* base_handle = nullptr;
+    bool base_is_placeholder = true;
+    if (pipeline_cache_->RequestShadersTranslated(vertex_shader_translation, base_translation) ==
+            VulkanPipelineCache::TranslationRequest::kReady &&
+        pipeline_cache_->ConfigurePipeline(vertex_shader_translation, base_translation,
+                                           primitive_processing_result, normalized_depth_control,
+                                           normalized_color_mask, pipeline_render_pass_key,
+                                           base_pipeline, base_layout_provider, &base_handle)) {
+      pipeline_cache_->GetPipelineAndLayoutByHandle(base_handle, base_pipeline,
+                                                    base_layout_provider, &base_is_placeholder);
+    }
+    if (!base_is_placeholder) {
+      pipeline = base_pipeline;
+      pipeline_layout_provider = base_layout_provider;
+      pipeline_is_placeholder = false;
+      ++object_slot_fallback_draws_;
+    }
+  }
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     // A skipped draw is missing from its render targets, and a resolve of
     // them keeps the gap in a texture until the title draws that texture
