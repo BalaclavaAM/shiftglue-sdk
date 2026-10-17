@@ -158,6 +158,12 @@ REXCVAR_DEFINE_BOOL(gpu_trace_wait_reg_mem_writers, false, "GPU",
                     "Diagnostics: while WAIT_REG_MEM waits on a guest memory word, watch its "
                     "page and log the guest threads (and their link register) that write it")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(gpu_log_long_wait_reg_mem_ms, 0, "GPU",
+                     "Diagnostics: log each WAIT_REG_MEM that waits at least this many "
+                     "milliseconds (what it polled, the compare, the value before and after); "
+                     "0 turns it off")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(gpu_idle_spin_count, 500, "GPU",
                      "How many times the GPU commands thread yields, when the ring is empty, "
                      "before it waits for the guest to write more (each yield is a busy spin "
@@ -2669,6 +2675,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool matched = false;
   bool slept = false;
   std::chrono::steady_clock::time_point wait_start{};
+  uint32_t first_value = 0, last_value = 0;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -2708,9 +2715,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+    last_value = value;
     if (!matched) {
       if (wait_start == std::chrono::steady_clock::time_point{}) {
         wait_start = std::chrono::steady_clock::now();
+        first_value = value;
         if (is_memory && REXCVAR_GET(gpu_trace_wait_reg_mem_writers)) {
           static std::atomic<uint32_t> wait_logs{0};
           if (wait_logs.fetch_add(1, std::memory_order_relaxed) < 200) {
@@ -2770,12 +2779,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
   if (wait_start != std::chrono::steady_clock::time_point{}) {
+    const auto waited = std::chrono::steady_clock::now() - wait_start;
     PERF_counter_inc(kGpuRegMemWaitCount);
     if (slept) PERF_counter_inc(kGpuRegMemSleptCount);
     PERF_counter_add(kGpuThreadRegMemWaitNs,
-                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - wait_start)
-                         .count());
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
+    if (const int32_t log_ms = REXCVAR_GET(gpu_log_long_wait_reg_mem_ms);
+        log_ms > 0 && waited >= std::chrono::milliseconds(log_ms)) {
+      REXGPU_WARN("WAIT_REG_MEM waited {:.1f} ms on {} {:08X} (function {}, ref {:08X}, mask "
+                  "{:08X}): {:08X} -> {:08X}",
+                  std::chrono::duration<double, std::milli>(waited).count(),
+                  is_memory ? "memory" : "register", poll_reg_addr, wait_info & 7, ref, mask,
+                  first_value, last_value);
+    }
   }
 
   return true;
