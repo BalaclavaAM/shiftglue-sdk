@@ -483,6 +483,8 @@ class Fh1NativeExecutor {
   // UP-1.5 jitter: the sequence length, the position in it, and this
   // frame's offset in surface pixels.
   uint32_t jitter_phases_ = 0;
+  // Whether the current draw's vertex shader reads the camera matrix.
+  bool draw_uses_camera_matrix_ = false;
   uint32_t jitter_index_ = 0;
   float jitter_x_ = 0.0f;
   float jitter_y_ = 0.0f;

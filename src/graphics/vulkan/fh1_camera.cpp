@@ -142,8 +142,9 @@ struct MatrixHash {
 }  // namespace
 
 void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
+  draw_uses_camera_matrix_ = false;
   if (!camera_tracking_enabled_ || !initialized_ || !draw.vertex_shader || !draw.rasterization_done ||
-      draw.memexport || !draw.normalized_depth_control.z_enable) {
+      draw.memexport) {
     return;
   }
   const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
@@ -151,6 +152,8 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
       0xF) {
     return;
   }
+  draw_uses_camera_matrix_ = true;
+  if (!draw.normalized_depth_control.z_enable) return;
   CameraDraw& noted = camera_draws_.emplace_back();
   std::memcpy(noted.wvp.data(),
               &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + kCameraFirstRegister * 4],
@@ -201,7 +204,10 @@ void Fh1NativeExecutor::AdvanceJitter() {
 }
 
 bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
-  if (!jitter_phases_ || !camera_scene_depth_valid_) return false;
+  // Only draws placed by the camera matrix: a screen-space pass in the
+  // scene (a quad ending at the screen edge) would leave a strip of the
+  // edge unwritten when moved, which showed as flickering stale colours.
+  if (!jitter_phases_ || !camera_scene_depth_valid_ || !draw_uses_camera_matrix_) return false;
   const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
   const uint32_t msaa = uint32_t(surface_info.msaa_samples);
