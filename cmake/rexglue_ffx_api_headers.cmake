@@ -3,8 +3,9 @@
 #
 # The FSR 2/3 provider (src/ui/vulkan/ffx_upscaler.cpp) calls the FidelityFX
 # API through five entry points. Without REXGLUE_ENABLE_FIDELITYFX (the SDK
-# built from source), it loads them at run time from AMD's signed runtime
-# (amd_fidelityfx_vk.dll), which setup fetches; nothing is committed. Only
+# built from source), it loads them at run time: on Windows from AMD's signed
+# runtime (amd_fidelityfx_vk.dll), which setup fetches, elsewhere from the
+# library thirdparty/fidelityfx-vk builds from source. Only
 # the headers are needed at build time, downloaded here from the same pinned
 # fork commit as rexglue_fidelityfx.cmake.
 #
@@ -19,7 +20,7 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR)
         CACHE INTERNAL "")
     return()
 endif()
-if(NOT REXGLUE_FFX_API_LOADER OR NOT REXGLUE_USE_VULKAN OR ANDROID OR APPLE)
+if(NOT REXGLUE_FFX_API_LOADER OR NOT REXGLUE_USE_VULKAN)
     return()
 endif()
 

@@ -40,9 +40,10 @@
 #endif
 
 REXCVAR_DEFINE_STRING(present_ffx_runtime, "", "UI/Presenter",
-                      "Path to the FidelityFX runtime (amd_fidelityfx_vk.dll) for FSR 2 and 3; "
-                      "empty searches upscalers/fidelityfx/<version> next to the executable, "
-                      "newest first");
+                      "Path to the FidelityFX runtime (amd_fidelityfx_vk.dll, or "
+                      "libamd_fidelityfx_vk.so/.dylib) for FSR 2 and 3; empty searches "
+                      "upscalers/fidelityfx/<version> next to the executable, newest first "
+                      "(and the package's libraries on Android)");
 
 namespace rex {
 namespace ui {
@@ -90,6 +91,8 @@ const FfxRuntime& GetFfxRuntime() {
 #else
 #if REX_PLATFORM_WIN32
     const char* const kName = "amd_fidelityfx_vk.dll";
+#elif defined(__APPLE__)
+    const char* const kName = "libamd_fidelityfx_vk.dylib";
 #else
     const char* const kName = "libamd_fidelityfx_vk.so";
 #endif
@@ -117,10 +120,15 @@ const FfxRuntime& GetFfxRuntime() {
       }
       candidates.push_back(provider_folder / kName);
       candidates.push_back(folder / kName);
+#if defined(__ANDROID__)
+      // The package's native library folder, which the linker searches for
+      // a bare name (thirdparty/fidelityfx-vk builds it for arm64).
+      candidates.emplace_back(kName);
+#endif
     }
     for (const std::filesystem::path& path : candidates) {
       std::error_code error;
-      if (!std::filesystem::is_regular_file(path, error)) {
+      if (path.has_parent_path() && !std::filesystem::is_regular_file(path, error)) {
         continue;
       }
 #if REX_PLATFORM_WIN32

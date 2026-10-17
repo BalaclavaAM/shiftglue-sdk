@@ -8,6 +8,77 @@
 #==========================================================
 include_guard(GLOBAL)
 
+option(REXGLUE_FIDELITYFX_RUNTIME
+    "Build AMD's FidelityFX library (FSR 2 and 3) from source beside the game on Linux and macOS"
+    ON)
+
+# The FidelityFX library the FSR provider loads, built from source by
+# thirdparty/fidelityfx-vk (a separate CMake project) and staged in
+# upscalers/fidelityfx/<version>/ beside the executable. Windows uses AMD's
+# signed runtime and Android packages its own build (tools/pinyon_android.py).
+function(_rexglue_stage_fidelityfx_runtime target_name)
+    set(_source "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../thirdparty/fidelityfx-vk")
+    if(NOT REXGLUE_FIDELITYFX_RUNTIME OR WIN32 OR ANDROID OR NOT REXGLUE_USE_VULKAN
+       OR NOT REXGLUE_FFX_API_INCLUDE_DIR OR NOT EXISTS "${_source}/CMakeLists.txt"
+       OR TARGET rexglue_fidelityfx_runtime)
+        return()
+    endif()
+    include(ExternalProject)
+    set(_binary "${CMAKE_BINARY_DIR}/fidelityfx-vk")
+    set(_arguments
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+    if(CMAKE_MAKE_PROGRAM)
+        list(APPEND _arguments -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+    endif()
+    set(_depends "")
+    if(APPLE)
+        set(_library_name libamd_fidelityfx_vk.dylib)
+        list(APPEND _arguments
+            -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+        # The loader the game stages in vulkan/lib (install name
+        # @rpath/libvulkan.1.dylib, found through the library's rpath).
+        foreach(_loader Vulkan::Loader rex::vulkan-loader)
+            if(TARGET ${_loader})
+                list(APPEND _arguments "-DVulkan_LIBRARY=$<TARGET_FILE:${_loader}>")
+                get_target_property(_imported ${_loader} IMPORTED)
+                if(NOT _imported)
+                    list(APPEND _depends ${_loader})
+                endif()
+                break()
+            endif()
+        endforeach()
+    else()
+        set(_library_name libamd_fidelityfx_vk.so)
+    endif()
+    ExternalProject_Add(rexglue_fidelityfx_runtime
+        SOURCE_DIR "${_source}"
+        BINARY_DIR "${_binary}"
+        CMAKE_ARGS ${_arguments}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target amd_fidelityfx_vk
+        BUILD_BYPRODUCTS "${_binary}/ffx-api/${_library_name}"
+        INSTALL_COMMAND ""
+        DEPENDS ${_depends}
+        BUILD_ALWAYS ON
+        USES_TERMINAL_BUILD ON)
+    # SDK 1.1.4: FSR 3.1.4 and FSR 2.3.3. Staged whenever the library
+    # changes, not only when the executable relinks.
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-stage-fidelityfx.stamp")
+    add_custom_command(OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${target_name}>/upscalers/fidelityfx/1.1.4"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_binary}/ffx-api/${_library_name}"
+            "$<TARGET_FILE_DIR:${target_name}>/upscalers/fidelityfx/1.1.4/${_library_name}"
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS "${_binary}/ffx-api/${_library_name}" rexglue_fidelityfx_runtime
+        VERBATIM)
+    add_custom_target(${target_name}-stage-fidelityfx DEPENDS ${_stamp})
+    add_dependencies(${target_name} ${target_name}-stage-fidelityfx)
+endfunction()
+
 function(_rexglue_stage_macos_vulkan_runtime target_name)
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
         set(_rexglue_vulkan_loader Vulkan::Loader)
@@ -212,6 +283,7 @@ function(rexglue_configure_target target_name)
     if(APPLE AND REXGLUE_USE_VULKAN)
         _rexglue_stage_macos_vulkan_runtime(${target_name})
     endif()
+    _rexglue_stage_fidelityfx_runtime(${target_name})
 endfunction()
 
 #==========================================================
