@@ -316,6 +316,9 @@ class CommandProcessor {
   // (writes guest memory, raises an interrupt, swaps, advances the ring read
   // pointer): results the CPU may read from then on must be in guest memory.
   virtual void FlushCpuVisibleResults() {}
+  // CS-0.4: run on the recorder, before publishing a guest completion.
+  virtual bool AwaitGuestGpuCompletion() { return false; }
+  void AwaitGuestGpuCompletionIfRequested();
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

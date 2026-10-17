@@ -382,6 +382,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
+  bool AwaitGuestGpuCompletion() override {
+    const bool completed = AwaitAllQueueOperationsCompletion();
+    return completed && !device_lost_;
+  }
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;

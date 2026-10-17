@@ -64,6 +64,10 @@ REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "resolves (-1: off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(gpu_true_fence_completion, false, "GPU",
+                    "CS-0.4 probe: submit and await host GPU work before guest fence writes, "
+                    "scratch writebacks, command-stream interrupts and WAIT_FOR_IDLE")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // FH1's race polls through WAIT_REG_MEM about 1.5 ms per frame on the GPU
 // commands thread, its bottleneck; yielding first ends those waits sooner
 // (NP-9.3: race frames 16.76-16.92 against 17.05-17.23 ms mean over three
@@ -1379,6 +1383,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
+      AwaitGuestGpuCompletionIfRequested();
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
     }
   } else {
@@ -1703,6 +1708,12 @@ void CommandProcessor::MakeCoherent() {
 }
 
 void CommandProcessor::PrepareForWait() {}
+
+void CommandProcessor::AwaitGuestGpuCompletionIfRequested() {
+  if (REXCVAR_GET(gpu_true_fence_completion) && !AwaitGuestGpuCompletion()) {
+    rex::FatalError("CS-0.4 could not await host GPU completion; refusing an early guest signal");
+  }
+}
 
 void CommandProcessor::ReturnFromWait() {}
 
@@ -2468,6 +2479,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       assert_true(count == 1);
       uint32_t value = reader->ReadAndSwap<uint32_t>();
       REXGPU_INFO("GPU wait for idle = {:08X}", value);
+      if (REXCVAR_GET(gpu_true_fence_completion)) {
+        RecordCall([this]() { AwaitGuestGpuCompletionIfRequested(); });
+        PublishRecordBatch();
+      }
       result = true;
       break;
     }
@@ -2541,6 +2556,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   RecordCall([this, cpu_mask]() {
+    AwaitGuestGpuCompletionIfRequested();
     if (record_split_) {
       FlushCpuVisibleResults();
     }
@@ -2957,10 +2973,12 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   if (!record_split_) {
+    AwaitGuestGpuCompletionIfRequested();
     memory::store(memory_->TranslatePhysical(address), data_value);
     return true;
   }
   RecordCall([this, address, data_value]() {
+    AwaitGuestGpuCompletionIfRequested();
     FlushCpuVisibleResults();
     memory::store(memory_->TranslatePhysical(address), data_value);
     system::SignalGpuWrite();
