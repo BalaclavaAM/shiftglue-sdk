@@ -387,6 +387,9 @@ class Presenter {
   // HUD (a temporal upscaler, UP-1.2); the refresher then writes one where it
   // can tell the HUD apart. Read by the refresher at any time.
   virtual bool WantsHudlessGuestOutput() const { return false; }
+  // Whether painting would use the game's depth and camera motion with the
+  // guest output (a temporal upscaler, UP-1.3 and UP-1.4).
+  virtual bool WantsGuestOutputCamera() const { return false; }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }

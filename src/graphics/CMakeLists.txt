@@ -63,6 +63,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_frame_dump.cpp
     vulkan/fh1_native_executor.cpp
+    vulkan/fh1_camera.cpp
     vulkan/command_processor.cpp
     vulkan/scene_post.cpp
     vulkan/pipeline_cache.cpp

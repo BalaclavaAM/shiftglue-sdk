@@ -55,6 +55,15 @@ REXCVAR_DEFINE_STRING(present_upscaler_hud, "composite", "UI/Presenter",
                       "(the frame with the HUD), debug (the frame without the HUD, shown so)")
     .allowed({"composite", "off", "debug"});
 
+REXCVAR_DEFINE_BOOL(present_upscaler_camera, true, "UI/Presenter",
+                    "Give a temporal upscaler the game's depth and camera motion, taken from "
+                    "its draws (false: far depth and no motion)");
+
+REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
+                      "Show a temporal upscaler's output (upscale) or one of its inputs instead: "
+                      "depth (near white, far black) or motion (red and green around grey)")
+    .allowed({"upscale", "depth", "motion"});
+
 REXCVAR_DEFINE_BOOL(present_capture_readable, false, "UI/Presenter",
                     "Create the swapchain readable so render tests can capture the presented "
                     "image (CapturePresentedOutput)")
@@ -185,6 +194,7 @@ namespace shaders {
 // glslangValidator -V, from ../shaders/*.glsl.
 #include "../shaders/vulkan_spirv/hdr_output_ps.h"
 #include "../shaders/vulkan_spirv/hdr_ui_mask_ps.h"
+#include "../shaders/vulkan_spirv/upscale_debug_view_cs.h"
 #include "../shaders/vulkan_spirv/upscale_hud_composite_cs.h"
 }  // namespace shaders
 
@@ -279,6 +289,7 @@ VulkanPresenter::~VulkanPresenter() {
   const VkDevice device = vulkan_device_->device();
 
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_hud_composite_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_debug_view_pipeline_);
   util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                              upscale_hud_composite_pipeline_layout_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
@@ -351,6 +362,41 @@ void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHudlessWritten() {
   *hudless_written_out_ = true;
 }
 
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureCameraImages() {
+  return guest_output_image_ && guest_output_image_->EnsureCamera();
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::depth_image() const {
+  return guest_output_image_ ? guest_output_image_->depth_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::depth_image_view() const {
+  return guest_output_image_ ? guest_output_image_->depth_view() : VK_NULL_HANDLE;
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::motion_image() const {
+  return guest_output_image_ ? guest_output_image_->motion_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::motion_image_view() const {
+  return guest_output_image_ ? guest_output_image_->motion_view() : VK_NULL_HANDLE;
+}
+
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::camera_ever_written_previously() const {
+  return guest_output_image_ && guest_output_image_->camera_ever_written;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetCameraWritten(
+    const UpscalerCamera& camera) {
+  if (!guest_output_image_ || !camera_out_ || !camera_written_out_ ||
+      guest_output_image_->depth_image() == VK_NULL_HANDLE) {
+    return;
+  }
+  guest_output_image_->camera_ever_written = true;
+  *camera_out_ = camera;
+  *camera_written_out_ = true;
+}
+
 bool VulkanPresenter::EnsureUpscaleHudComposite() {
   if (upscale_hud_composite_pipeline_ != VK_NULL_HANDLE) {
     return true;
@@ -378,8 +424,9 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
     REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite set layout");
     return false;
   }
+  // The debug view's constants are the larger.
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(uint32_t) * 6};
+                                             sizeof(uint32_t) * 12};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -421,7 +468,11 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
   upscale_hud_composite_pipeline_ = util::CreateComputePipeline(
       vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_hud_composite_cs,
       sizeof(shaders::upscale_hud_composite_cs));
-  if (upscale_hud_composite_pipeline_ == VK_NULL_HANDLE) {
+  upscale_debug_view_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_debug_view_cs,
+      sizeof(shaders::upscale_debug_view_cs));
+  if (upscale_hud_composite_pipeline_ == VK_NULL_HANDLE ||
+      upscale_debug_view_pipeline_ == VK_NULL_HANDLE) {
     REXLOG_ERROR("VulkanPresenter: Failed to create the upscale HUD composite pipeline");
     return false;
   }
@@ -511,7 +562,8 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     VkCommandBuffer command_buffer, VulkanUpscaler& upscaler, VkImage source_image,
     VkImageView source_view, uint32_t source_width, uint32_t source_height, VkImage output_image,
     VkImageView output_view, uint32_t output_width, uint32_t output_height,
-    uint64_t guest_output_refresh_serial, const GuestOutputPaintConfig& config) {
+    uint64_t guest_output_refresh_serial, const GuestOutputPaintConfig& config,
+    const GuestOutputImage* camera_source, const UpscalerCamera* camera) {
   TemporalUpscaleState& state = temporal_upscale_;
   const bool same_target = state.output_valid && state.upscaler == &upscaler &&
                            state.output_image == output_image &&
@@ -549,7 +601,12 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
           : 16.667f;
   // The history is dropped only when it cannot be continued: a new provider,
   // source or output size, or a recreated output image.
-  frame.reset = !same_target;
+  frame.reset = !same_target || (camera && camera->cut);
+  if (camera) {
+    frame.camera_near = camera->near_plane;
+    frame.camera_far = camera->far_plane;
+    frame.camera_fov_y = camera->fov_y;
+  }
   frame.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
 
   VulkanUpscalerInputs inputs;
@@ -560,6 +617,15 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
                   kGuestOutputUsage};
   inputs.output = {output_image, output_view, kGuestOutputFormat, output_width, output_height,
                    kGuestOutputUsage};
+  if (camera_source) {
+    constexpr VkImageUsageFlags kCameraUsage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    inputs.depth = {camera_source->depth_image(), camera_source->depth_view(),
+                    kGuestOutputDepthFormat, source_width, source_height, kCameraUsage};
+    inputs.motion_vectors = {camera_source->motion_image(), camera_source->motion_view(),
+                             kGuestOutputMotionFormat, source_width, source_height,
+                             kCameraUsage};
+  }
   inputs.frame = frame;
   const uint32_t query_slot = BeginTemporalUpscaleTiming(command_buffer, upscaler, frame);
   if (!upscaler.Dispatch(command_buffer, inputs)) {
@@ -1407,15 +1473,19 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   }
 
   bool hudless_written = false;
+  bool camera_written = false;
+  UpscalerCamera camera;
   VulkanGuestOutputRefreshContext context(
       is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
       image_instance.version, image_instance.ever_successfully_refreshed,
-      image_instance.image.get(), &hudless_written);
+      image_instance.image.get(), &hudless_written, &camera, &camera_written);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
   image_instance.hudless_valid = refresher_succeeded && hudless_written;
+  image_instance.camera_valid = refresher_succeeded && camera_written;
+  image_instance.camera = camera;
   // Deferred: the refresher's work reaches the queue later, and the step
   // signals after it.
   if (!IsGuestOutputPublishDeferred()) {
@@ -1958,6 +2028,12 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
   if (view_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, view_, nullptr);
   }
@@ -1988,14 +2064,40 @@ bool VulkanPresenter::GuestOutputImage::EnsureHudless() {
   return false;
 }
 
+bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
+  if (depth_image_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  constexpr VkImageUsageFlags kUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  // R16G16_SFLOAT storage is an extended storage format.
+  VkFormatProperties motion_properties;
+  vulkan_device_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+      vulkan_device_->physical_device(), kGuestOutputMotionFormat, &motion_properties);
+  if ((motion_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
+      CreateImage(depth_image_, depth_memory_, depth_view_, kGuestOutputDepthFormat, kUsage) &&
+      CreateImage(motion_image_, motion_memory_, motion_view_, kGuestOutputMotionFormat, kUsage)) {
+    return true;
+  }
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, motion_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, motion_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, motion_memory_);
+  return false;
+}
+
 bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemory& memory,
-                                                    VkImageView& view) {
+                                                    VkImageView& view, VkFormat format,
+                                                    VkImageUsageFlags usage) {
   VkImageCreateInfo image_create_info;
   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  image_create_info.format = kGuestOutputFormat;
+  image_create_info.format = format;
   image_create_info.extent.width = extent_.width;
   image_create_info.extent.height = extent_.height;
   image_create_info.extent.depth = 1;
@@ -2003,8 +2105,7 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   image_create_info.arrayLayers = 1;
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.usage = usage;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -2025,7 +2126,7 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
   image_view_create_info.flags = 0;
   image_view_create_info.image = image;
   image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  image_view_create_info.format = kGuestOutputFormat;
+  image_view_create_info.format = format;
   image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -2155,6 +2256,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   std::shared_ptr<GuestOutputImage> guest_output_image;
   uint64_t guest_output_refresh_serial = 0;
   bool guest_output_hudless = false;
+  bool guest_output_camera_valid = false;
+  UpscalerCamera guest_output_camera;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
@@ -2164,6 +2267,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
+      guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
+      guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -2403,10 +2508,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // output itself (the temporal slot first in the flow).
         const std::string& hud_mode = REXCVAR_GET(present_upscaler_hud);
         const bool hudless_allowed = hud_mode != "off";
-        hudless_guest_output_wanted_.store(
-            hudless_allowed && temporal_upscaler && guest_output_flow.effect_count > 1 &&
-                guest_output_flow.effects[0] == GuestOutputPaintEffect::kFsrEasu,
-            std::memory_order_relaxed);
+        const bool temporal_reads_guest_output =
+            temporal_upscaler && guest_output_flow.effect_count > 1 &&
+            guest_output_flow.effects[0] == GuestOutputPaintEffect::kFsrEasu;
+        const bool camera_allowed = REXCVAR_GET(present_upscaler_camera);
+        hudless_guest_output_wanted_.store(hudless_allowed && temporal_reads_guest_output,
+                                           std::memory_order_relaxed);
+        guest_output_camera_wanted_.store(camera_allowed && temporal_reads_guest_output,
+                                          std::memory_order_relaxed);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
@@ -2441,6 +2550,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             const GuestOutputImage& output = *paint_context_.guest_output_intermediate_images[i];
             const bool use_hudless = hudless_allowed && i == 0 && guest_output_hudless &&
                                      source.hudless_image() != VK_NULL_HANDLE;
+            const bool use_camera = camera_allowed && i == 0 && guest_output_camera_valid &&
+                                    source.depth_image() != VK_NULL_HANDLE;
             VkImage source_image = use_hudless ? source.hudless_image() : source.image();
             VkImageView source_view = use_hudless ? source.hudless_view() : source.view();
             VkImage output_image = output.image();
@@ -2483,8 +2594,78 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                          source_view, effect_input_width, effect_input_height,
                                          output_image, output.view(), effect_rect_size.first,
                                          effect_rect_size.second, guest_output_refresh_serial,
-                                         guest_output_paint_config)) {
-              if (use_hudless && hud_mode == "composite" && EnsureUpscaleHudComposite()) {
+                                         guest_output_paint_config, use_camera ? &source : nullptr,
+                                         use_camera ? &guest_output_camera : nullptr)) {
+              const std::string& view_mode = REXCVAR_GET(present_upscaler_view);
+              const uint32_t debug_view =
+                  !use_camera ? 0u : view_mode == "depth" ? 1u : view_mode == "motion" ? 2u : 0u;
+              if (debug_view && EnsureUpscaleHudComposite()) {
+                VkImageMemoryBarrier barrier_to_view = {};
+                barrier_to_view.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier_to_view.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_view.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_view.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_view.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_view.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_view.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_view.image = output_image;
+                barrier_to_view.subresourceRange = util::InitializeSubresourceRange();
+                dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                         nullptr, 1, &barrier_to_view);
+                VkDescriptorSet view_set =
+                    upscale_hud_composite_sets_[current_paint_submission_index %
+                                                upscale_hud_composite_sets_.size()];
+                const VkSampler nearest_sampler =
+                    ui_samplers_->samplers()[UISamplers::kSamplerIndexNearestClampToEdge];
+                VkDescriptorImageInfo view_images[3] = {
+                    {nearest_sampler, source.depth_view(), kGuestOutputInternalLayout},
+                    {nearest_sampler, source.motion_view(), kGuestOutputInternalLayout},
+                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
+                };
+                VkWriteDescriptorSet view_writes[3] = {};
+                for (uint32_t j = 0; j < 3; ++j) {
+                  view_writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                  view_writes[j].dstSet = view_set;
+                  view_writes[j].dstBinding = j;
+                  view_writes[j].descriptorCount = 1;
+                  view_writes[j].descriptorType = j == 2
+                                                      ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                      : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                  view_writes[j].pImageInfo = &view_images[j];
+                }
+                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, view_writes, 0, nullptr);
+                struct {
+                  uint32_t output_size[2];
+                  float output_size_inv[2];
+                  float source_uv_scale[2];
+                  float render_size[2];
+                  float near_plane;
+                  float far_plane;
+                  float motion_gain;
+                  uint32_t mode;
+                } view_constants = {
+                    {effect_rect_size.first, effect_rect_size.second},
+                    {1.0f / float(effect_rect_size.first), 1.0f / float(effect_rect_size.second)},
+                    {float(effect_input_width) / float(source.extent().width),
+                     float(effect_input_height) / float(source.extent().height)},
+                    {float(effect_input_width), float(effect_input_height)},
+                    guest_output_camera.near_plane,
+                    guest_output_camera.far_plane,
+                    0.05f,
+                    debug_view};
+                dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      upscale_debug_view_pipeline_);
+                dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            upscale_hud_composite_pipeline_layout_, 0, 1,
+                                            &view_set, 0, nullptr);
+                dfn.vkCmdPushConstants(draw_command_buffer,
+                                       upscale_hud_composite_pipeline_layout_,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(view_constants),
+                                       &view_constants);
+                dfn.vkCmdDispatch(draw_command_buffer, (effect_rect_size.first + 15) / 16,
+                                  (effect_rect_size.second + 7) / 8, 1);
+              } else if (use_hudless && hud_mode == "composite" && EnsureUpscaleHudComposite()) {
                 VkImageMemoryBarrier barrier_to_composite = {};
                 barrier_to_composite.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 barrier_to_composite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

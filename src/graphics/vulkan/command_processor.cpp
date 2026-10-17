@@ -2869,6 +2869,13 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_hud_mask_descriptor_pool_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          swap_hudless_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_camera_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_camera_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_camera_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_camera_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_hud_mask_set_layout_);
   // Into the destroy queues, emptied below.
@@ -3444,6 +3451,128 @@ bool VulkanCommandProcessor::EnsureSwapHudless() {
   return true;
 }
 
+namespace {
+
+// UP-1.4: each pixel's place in the previous frame, from its depth and the
+// reprojection of the current clip space into the previous one. Motion is in
+// UV units (previous minus current), what the upscalers take with a motion
+// vector scale of the render size.
+const char* const kSwapCameraSource = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform SwapCameraConstants {
+  layout(row_major) mat4 reprojection;
+  uvec2 size;
+  vec2 size_inv;
+} c;
+layout(set = 0, binding = 0) uniform texture2D source_depth;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
+layout(set = 0, binding = 2, rg16f) writeonly uniform image2D motion;
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(pixel), c.size))) {
+    return;
+  }
+  // FH1 draws the scene turned 180 degrees in clip space (the post pass
+  // turns it back), so the scene depth of a screen pixel is at the opposite
+  // one, and its clip x and y are the screen's negated.
+  // Its depth is reversed (1 near) by the viewport, not the matrix: the
+  // matrix's clip z is the usual D3D depth, 1 minus the stored one, which is
+  // also what the providers take.
+  float z = 1.0 - texelFetch(source_depth, ivec2(c.size) - 1 - pixel, 0).r;
+  vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 previous = c.reprojection * vec4(-ndc, z, 1.0);
+  vec2 motion_uv = vec2(0.0);
+  if (previous.w > 1.0e-6) {
+    vec2 previous_ndc = -previous.xy / previous.w;
+    motion_uv = vec2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5) - uv;
+  }
+  imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+  imageStore(motion, pixel, vec4(motion_uv, 0.0, 0.0));
+}
+)";
+
+}  // namespace
+
+bool VulkanCommandProcessor::EnsureSwapCamera() {
+  if (swap_camera_pipeline_ != VK_NULL_HANDLE) return true;
+  if (swap_camera_failed_) return false;
+  swap_camera_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &swap_camera_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera descriptor set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(float) * 16 + sizeof(uint32_t) * 4};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &swap_camera_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &swap_camera_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera pipeline layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_camera_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
+  set_layouts.fill(swap_camera_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = swap_camera_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_camera_sets_.data()) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to allocate the swap camera descriptor sets");
+    return false;
+  }
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSwapCameraSource, spirv, compile_error)) {
+    REXGPU_WARN("Failed to compile the swap camera shader: {}", compile_error);
+    return false;
+  }
+  swap_camera_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, swap_camera_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+  if (swap_camera_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("Failed to create the swap camera pipeline");
+    return false;
+  }
+  swap_camera_failed_ = false;
+  return true;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   DrawCostFrame();
@@ -3642,6 +3771,10 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   bool hdr_active = false;
   // UP-1.2: a temporal upscaler reads the guest output without the HUD.
   const bool hudless_wanted = presenter->WantsHudlessGuestOutput();
+  // UP-1.3: and the depth and camera motion.
+  const bool camera_wanted = presenter->WantsGuestOutputCamera();
+  VkImageView camera_depth_view = VK_NULL_HANDLE;
+  Fh1NativeExecutor::Camera camera = {};
   const bool scene_fxaa =
       swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
   const bool scene_lut =
@@ -3652,14 +3785,19 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    if (camera_wanted) {
+      camera_depth_view =
+          fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
+    }
   }
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
-       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut,
-       hudless_wanted](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
+       camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4200,6 +4338,76 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_IMAGE_LAYOUT_GENERAL,
                                    ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
             vulkan_context.SetHudlessWritten();
+          }
+
+          // UP-1.3 and UP-1.4: the depth and camera motion beside it.
+          if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
+              vulkan_context.EnsureCameraImages()) {
+            const bool camera_written_before = vulkan_context.camera_ever_written_previously();
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+              PushImageMemoryBarrier(
+                  image, guest_output_subresource_range,
+                  camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                                        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
+                                        : 0,
+                  VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            }
+            SubmitBarriers(true);
+            VkDescriptorSet camera_set = swap_camera_sets_[swap_frame_index];
+            VkDescriptorImageInfo camera_infos[3] = {
+                {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+            };
+            VkWriteDescriptorSet camera_writes[3] = {};
+            for (uint32_t i = 0; i < 3; ++i) {
+              camera_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              camera_writes[i].dstSet = camera_set;
+              camera_writes[i].dstBinding = i;
+              camera_writes[i].descriptorCount = 1;
+              camera_writes[i].descriptorType =
+                  i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              camera_writes[i].pImageInfo = &camera_infos[i];
+            }
+            dfn.vkUpdateDescriptorSets(device, 3, camera_writes, 0, nullptr);
+            deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                             swap_camera_pipeline_layout_, 0, 1,
+                                                             &camera_set, 0, nullptr);
+            struct {
+              float reprojection[16];
+              uint32_t size[2];
+              float size_inv[2];
+            } camera_constants;
+            std::memcpy(camera_constants.reprojection, camera.reprojection,
+                        sizeof(camera_constants.reprojection));
+            camera_constants.size[0] = guest_output_width;
+            camera_constants.size[1] = guest_output_height;
+            camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
+            camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
+            deferred_command_buffer_.CmdVkPushConstants(swap_camera_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(camera_constants),
+                                                        &camera_constants);
+            BindExternalComputePipeline(swap_camera_pipeline_);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
+                                                   (guest_output_height + 7) / 8, 1);
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+              PushImageMemoryBarrier(image, guest_output_subresource_range,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                     VK_ACCESS_SHADER_WRITE_BIT,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                     VK_IMAGE_LAYOUT_GENERAL,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            }
+            ui::UpscalerCamera upscaler_camera;
+            upscaler_camera.near_plane = camera.near_plane;
+            upscaler_camera.far_plane = camera.far_plane;
+            upscaler_camera.fov_y = camera.fov_y;
+            upscaler_camera.cut = camera.cut;
+            vulkan_context.SetCameraWritten(upscaler_camera);
           }
 
           // Insert the release barrier.

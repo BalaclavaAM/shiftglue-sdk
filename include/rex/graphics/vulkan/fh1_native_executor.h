@@ -128,6 +128,31 @@ class Fh1NativeExecutor {
   // After OnSwap: the swapped frame's snapshot, made readable from compute
   // shaders, if it covers width x height; null otherwise.
   VkImageView TakeHudSnapshot(uint32_t width, uint32_t height);
+
+  // UP-1.3: the camera and depth a temporal upscaler needs (fh1_camera.cpp).
+  // While enabled, every scene draw's world-view-projection (vertex float
+  // constants c128-c131, one row each) is noted, and the scene depth is
+  // copied at the first HUD draw. At the swap, the static world (the
+  // largest group of draws sharing one matrix) is matched with the previous
+  // frame's by object, which gives the camera's motion without the world
+  // matrix: for static geometry WVP_prev * WVP_cur^-1 = VP_prev * VP_cur^-1.
+  struct Camera {
+    // Current clip space to the previous frame's, row-major.
+    float reprojection[16];
+    float near_plane;
+    float far_plane;
+    // Vertical field of view, radians.
+    float fov_y;
+    // No continuation of the previous frame (a cut, a load, a rebase): the
+    // reprojection is the identity and the upscaler's history should go.
+    bool cut;
+  };
+  void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
+  // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
+  // readable from compute shaders) and camera, if the depth covers width x
+  // height; null otherwise.
+  VkImageView TakeCameraFrame(uint32_t width, uint32_t height, Camera& camera_out);
+
   void LogStats(uint64_t frame);
   // Native surfaces alive and the device memory their images take (LS-0.4).
   size_t surface_count() const { return surfaces_.size(); }
@@ -416,6 +441,45 @@ class Fh1NativeExecutor {
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;
   void DestroyHudSnapshot();
+
+  // UP-1.3 camera tracking (fh1_camera.cpp).
+  struct CameraDraw {
+    uint64_t object;
+    uint32_t depth_key;
+    std::array<float, 16> wvp;
+  };
+  void NoteCameraDraw(const Fh1DrawInfo& draw);
+  // Copies the scene depth's band at screen row band_row (predicated
+  // tiling) or all of it (band_row 0, untiled) into camera_depth_.
+  void SnapshotCameraDepth(uint32_t band_row);
+  void FinishCameraFrame();
+  bool EnsureCameraDepthPipelines();
+  void DestroyCamera();
+  bool camera_tracking_enabled_ = false;
+  std::vector<CameraDraw> camera_draws_;
+  // The previous frame's scene objects and their matrices.
+  std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;
+  Camera camera_ready_ = {};
+  bool camera_ready_valid_ = false;
+  // The previous frame's scene depth: the one most matrix draws tested.
+  uint32_t camera_scene_depth_ = 0;
+  bool camera_scene_depth_valid_ = false;
+  // A scene draw since the last band copy.
+  bool camera_depth_dirty_ = false;
+  // This frame's scene depth copy (R32_SFLOAT), the screen rows it covers,
+  // and those of the frame swapped next (0: none).
+  Surface camera_depth_;
+  uint32_t camera_depth_rows_ = 0;
+  uint32_t camera_depth_rows_ready_ = 0;
+  // The rows the bands need; the copy is resized to it between frames.
+  uint32_t camera_depth_wanted_height_ = 0;
+  bool camera_depth_failed_ = false;
+  VkDescriptorSetLayout camera_depth_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout camera_depth_pipeline_layout_ = VK_NULL_HANDLE;
+  // Single-sampled and multisampled sources.
+  std::array<VkPipeline, 2> camera_depth_pipelines_ = {};
+  VkDescriptorPool camera_depth_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, 4> camera_depth_sets_ = {};
 
   // Descriptor set layouts (set 0): source images (bindings 16 and 17) with
   // the storage buffer (binding 32) for compute, the source images for

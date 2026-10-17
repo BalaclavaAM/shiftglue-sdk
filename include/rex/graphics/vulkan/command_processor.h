@@ -1154,6 +1154,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_source_sets_{};
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_destination_sets_{};
   std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_mask_sets_{};
+  // UP-1.3 and UP-1.4: the guest output's depth and camera motion from the
+  // executor's depth snapshot and reprojection (fh1_camera.cpp), written by
+  // swap_camera_pipeline_ (EnsureSwapCamera, command_processor.cpp).
+  bool EnsureSwapCamera();
+  bool swap_camera_failed_ = false;
+  VkDescriptorSetLayout swap_camera_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_camera_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_camera_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_camera_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_camera_sets_{};
   // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
   // the HUD left alone, told apart with the pre-HUD snapshot.
   bool EnsureSwapScenePost();

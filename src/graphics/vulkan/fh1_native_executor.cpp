@@ -540,6 +540,7 @@ void Fh1NativeExecutor::Shutdown() {
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
+  DestroyCamera();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
   specialized_transfer_pipelines_ = 0;
@@ -2924,6 +2925,19 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                                                          .window_y_offset)))
                      : 0u;
   if (untile_height_ && !untile_band) EndUntiledTiling();
+  // UP-1.3: each predicated tile's resolve ends a band of the scene depth
+  // (the window offset moves its screen rows to the top of EDRAM).
+  if (!untile_height_ && camera_tracking_enabled_ && camera_scene_depth_valid_) {
+    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+    if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
+                     msaa, depth_info.depth_format)
+            .Pack() == camera_scene_depth_) {
+      SnapshotCameraDepth(uint32_t(
+          std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
+    }
+  }
   CopyPlan plan;
   if (!PlanCopy(plan)) {
     if (plan.empty) {
@@ -3230,6 +3244,9 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
   hud_scene_base_ = UINT32_MAX;
+  camera_depth_rows_ready_ = camera_depth_rows_;
+  camera_depth_rows_ = 0;
+  FinishCameraFrame();
   if (!initialized_) return;
   ReleaseRetiredImages(false);
   UpdateCoarseShading();
@@ -3247,6 +3264,7 @@ bool Fh1NativeExecutor::IsHudTarget() const {
 }
 
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
+  NoteCameraDraw(draw);
   hud_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
@@ -3264,6 +3282,8 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
     return;
   }
   hud_draw_ = true;
+  // Untiled, the scene depth is whole by the HUD.
+  if (untile_height_) SnapshotCameraDepth(0);
   if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
   hud_snapshot_taken_ = true;
   const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();

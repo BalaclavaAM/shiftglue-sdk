@@ -103,14 +103,18 @@ class VulkanPresenter final : public Presenter {
     VulkanGuestOutputRefreshContext(bool& is_8bpc_out_ref, VkImage image, VkImageView image_view,
                                     uint64_t image_version, bool image_ever_written_previously,
                                     GuestOutputImage* guest_output_image = nullptr,
-                                    bool* hudless_written_out = nullptr)
+                                    bool* hudless_written_out = nullptr,
+                                    UpscalerCamera* camera_out = nullptr,
+                                    bool* camera_written_out = nullptr)
         : GuestOutputRefreshContext(is_8bpc_out_ref),
           image_(image),
           image_view_(image_view),
           image_version_(image_version),
           image_ever_written_previously_(image_ever_written_previously),
           guest_output_image_(guest_output_image),
-          hudless_written_out_(hudless_written_out) {}
+          hudless_written_out_(hudless_written_out),
+          camera_out_(camera_out),
+          camera_written_out_(camera_written_out) {}
 
     // The format is kGuestOutputFormat.
     // Supports usage as a color attachment and as a sampled image, as well as
@@ -132,6 +136,19 @@ class VulkanPresenter final : public Presenter {
     bool hudless_ever_written_previously() const;
     void SetHudlessWritten();
 
+    // UP-1.3 and UP-1.4, when WantsGuestOutputCamera: the scene depth (guest
+    // z in [0, 1], kGuestOutputDepthFormat) and the motion of each pixel to
+    // its place in the previous frame (in UV units, kGuestOutputMotionFormat),
+    // at the guest output's size. Sampled and storage usage; released to
+    // kGuestOutputInternal* like the guest output. Created on first use.
+    bool EnsureCameraImages();
+    VkImage depth_image() const;
+    VkImageView depth_image_view() const;
+    VkImage motion_image() const;
+    VkImageView motion_image_view() const;
+    bool camera_ever_written_previously() const;
+    void SetCameraWritten(const UpscalerCamera& camera);
+
    private:
     VkImage image_;
     VkImageView image_view_;
@@ -139,6 +156,8 @@ class VulkanPresenter final : public Presenter {
     bool image_ever_written_previously_;
     GuestOutputImage* guest_output_image_;
     bool* hudless_written_out_;
+    UpscalerCamera* camera_out_;
+    bool* camera_written_out_;
   };
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
@@ -166,6 +185,12 @@ class VulkanPresenter final : public Presenter {
   bool WantsHudlessGuestOutput() const override {
     return hudless_guest_output_wanted_.load(std::memory_order_relaxed);
   }
+  bool WantsGuestOutputCamera() const override {
+    return guest_output_camera_wanted_.load(std::memory_order_relaxed);
+  }
+  // The formats of the guest output's camera images.
+  static constexpr VkFormat kGuestOutputDepthFormat = VK_FORMAT_R32_SFLOAT;
+  static constexpr VkFormat kGuestOutputMotionFormat = VK_FORMAT_R16G16_SFLOAT;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -217,6 +242,13 @@ class VulkanPresenter final : public Presenter {
     VkImage hudless_image() const { return hudless_image_; }
     VkImageView hudless_view() const { return hudless_view_; }
     bool hudless_ever_written = false;
+    // The camera images (VulkanGuestOutputRefreshContext::EnsureCameraImages).
+    bool EnsureCamera();
+    VkImage depth_image() const { return depth_image_; }
+    VkImageView depth_view() const { return depth_view_; }
+    VkImage motion_image() const { return motion_image_; }
+    VkImageView motion_view() const { return motion_view_; }
+    bool camera_ever_written = false;
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
@@ -227,7 +259,12 @@ class VulkanPresenter final : public Presenter {
     }
 
     bool Initialize();
-    bool CreateImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view);
+    bool CreateImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view,
+                     VkFormat format = kGuestOutputFormat,
+                     VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                               VK_IMAGE_USAGE_SAMPLED_BIT |
+                                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                               VK_IMAGE_USAGE_STORAGE_BIT);
 
     const VulkanDevice* vulkan_device_;
 
@@ -238,6 +275,12 @@ class VulkanPresenter final : public Presenter {
     VkImage hudless_image_ = VK_NULL_HANDLE;
     VkDeviceMemory hudless_memory_ = VK_NULL_HANDLE;
     VkImageView hudless_view_ = VK_NULL_HANDLE;
+    VkImage depth_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory_ = VK_NULL_HANDLE;
+    VkImageView depth_view_ = VK_NULL_HANDLE;
+    VkImage motion_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory motion_memory_ = VK_NULL_HANDLE;
+    VkImageView motion_view_ = VK_NULL_HANDLE;
   };
 
   struct GuestOutputImageInstance {
@@ -247,8 +290,11 @@ class VulkanPresenter final : public Presenter {
     uint64_t version = UINT64_MAX;
     // Which refresh wrote the image last (guest_output_refresh_serial_).
     uint64_t refresh_serial = 0;
-    // Whether that refresh also wrote the HUD-less copy.
+    // Whether that refresh also wrote the HUD-less copy, and the camera
+    // images with this camera.
     bool hudless_valid = false;
+    bool camera_valid = false;
+    UpscalerCamera camera;
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
@@ -261,6 +307,7 @@ class VulkanPresenter final : public Presenter {
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
       hudless_valid = false;
+      camera_valid = false;
     }
   };
 
@@ -557,7 +604,9 @@ class VulkanPresenter final : public Presenter {
                                 VkImage output_image, VkImageView output_view,
                                 uint32_t output_width, uint32_t output_height,
                                 uint64_t guest_output_refresh_serial,
-                                const GuestOutputPaintConfig& config);
+                                const GuestOutputPaintConfig& config,
+                                const GuestOutputImage* camera_source = nullptr,
+                                const UpscalerCamera* camera = nullptr);
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -622,6 +671,8 @@ class VulkanPresenter final : public Presenter {
   // UP-1.2: whether the last paint fed a temporal upscaler the guest output
   // directly, so the refresher should write the HUD-less copy.
   std::atomic<bool> hudless_guest_output_wanted_ = false;
+  // UP-1.3: whether it would use the depth and camera motion.
+  std::atomic<bool> guest_output_camera_wanted_ = false;
   // UP-1.2: draws the HUD over the upscale of the HUD-less copy
   // (upscale_hud_composite.cs.glsl), created on first use.
   bool EnsureUpscaleHudComposite();
@@ -629,6 +680,8 @@ class VulkanPresenter final : public Presenter {
   VkDescriptorSetLayout upscale_hud_composite_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout upscale_hud_composite_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline upscale_hud_composite_pipeline_ = VK_NULL_HANDLE;
+  // present_upscaler_view (upscale_debug_view.cs.glsl), same layout.
+  VkPipeline upscale_debug_view_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool upscale_hud_composite_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, PaintContext::kSubmissionCount> upscale_hud_composite_sets_ = {};
   VkQueryPool temporal_upscale_query_pool_ = VK_NULL_HANDLE;

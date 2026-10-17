@@ -61,6 +61,16 @@ struct UpscalerInfo {
 std::vector<UpscalerInfo> GetSpatialUpscalerInfos();
 
 // Per-frame description of a temporal upscale, for every graphics API.
+// The game camera of a frame, for a temporal upscaler's depth and motion.
+struct UpscalerCamera {
+  float near_plane = 0.1f;
+  float far_plane = 1000.0f;
+  // Vertical, radians.
+  float fov_y = 1.0472f;
+  // No continuation of the previous frame: the history should be dropped.
+  bool cut = false;
+};
+
 struct UpscalerFrame {
   uint32_t render_width = 0;
   uint32_t render_height = 0;
