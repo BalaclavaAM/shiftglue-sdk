@@ -184,10 +184,10 @@ bool QueryTemporalFsrRenderResolutionFromQualityMode(uint32_t display_width,
 void LogTemporalFsrCompatibilityPathOnce() {
   static std::atomic<bool> temporal_fsr_compatibility_logged = false;
   if (!temporal_fsr_compatibility_logged.exchange(true)) {
-    REXLOG_WARN(
-        "present_effect=fsr2/fsr3: temporal FSR without depth, motion vectors or "
-        "jitter yet (docs/UPSCALING_BACKLOG.md UP-1); FSR 1 when the FidelityFX "
-        "runtime is unavailable");
+    REXLOG_INFO(
+        "present_effect=fsr2/fsr3: temporal FSR with the game's depth, camera motion "
+        "and jitter where the title provides them; FSR 1 when the FidelityFX runtime "
+        "is unavailable");
   }
 }
 
