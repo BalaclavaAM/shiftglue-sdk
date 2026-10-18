@@ -1758,6 +1758,10 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   bool hdr_offered = false;
   bool hdr_pq = false;
   bool hdr_pq_dataspace = false;
+#if REX_PLATFORM_ANDROID
+  // Log the display even when Vulkan offers HDR10 directly or lacks metadata.
+  const AndroidDisplayHdr& display_hdr = GetAndroidDisplayHdr();
+#endif
   if (vulkan_device->vulkan_instance()->extensions().ext_EXT_swapchain_colorspace) {
     const VkSurfaceFormatKHR* hdr_format = nullptr;
     for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
@@ -1780,7 +1784,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 #if REX_PLATFORM_ANDROID
     // Android 13 lists no HDR10 color space even for an HDR10 display; the
     // window still composes BT.2020 PQ buffers, as video players use.
-    if (!hdr_format && GetAndroidDisplayHdr().hdr10) {
+    if (!hdr_format && display_hdr.hdr10) {
       for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
         if (surface_format.format == kHdrPqFormat &&
             surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -3152,10 +3156,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // Mostly the largest channel: a red brake light (luminance 0.21) expands
     // nearly as a white one; deep colored surfaces stay below the knee.
     hdr_constants.max_channel_weight = 0.75f;
-    hdr_constants.compare_x =
-        REXCVAR_GET(present_hdr_compare) ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
     hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+    // Compare returns before drawing patterns in the shader; calibration must
+    // cover both halves without changing the player's compare setting.
+    hdr_constants.compare_x =
+        REXCVAR_GET(present_hdr_compare) && !hdr_constants.pattern
+            ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
     hdr_constants.pattern_value = float(peak_nits / 80.0);
+    static thread_local HdrOutputConstants logged_pattern = {};
+    if (hdr_constants.pattern &&
+        (hdr_constants.pattern != logged_pattern.pattern ||
+         hdr_constants.paper_white_scale != logged_pattern.paper_white_scale ||
+         hdr_constants.pattern_value != logged_pattern.pattern_value ||
+         hdr_constants.gamma != logged_pattern.gamma)) {
+      REXLOG_INFO("VulkanPresenter: HDR calibration pattern {}, paper white {} nits, "
+                  "peak {} nits, gamma {}; compare suspended; levels are signal values",
+                  hdr_constants.pattern, paper_white_nits, peak_nits, hdr_constants.gamma);
+    }
+    logged_pattern = hdr_constants;
     hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
                                  (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);

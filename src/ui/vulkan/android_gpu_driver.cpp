@@ -253,6 +253,9 @@ bool CallAndroidActivityMethod(const char* method) {
 const AndroidDisplayHdr& GetAndroidDisplayHdr() {
   static const AndroidDisplayHdr hdr = [] {
     AndroidDisplayHdr result;
+    if (const char* diagnostics = std::getenv("REX_ANDROID_DISPLAY_DIAGNOSTICS")) {
+      REXLOG_INFO("Android display environment (launch snapshot): {}", diagnostics);
+    }
     auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
     auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
     if (!env || !activity) return result;
