@@ -527,6 +527,11 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   }
   tiles_.Reset();
   initialized_ = true;
+#if !defined(__ANDROID__)
+  const auto& properties = command_processor_.GetVulkanDevice()->properties();
+  command_processor_.frame_inspector()->SetCapabilities(
+      {bool(properties.fillModeNonSolid), bool(properties.independentBlend), true});
+#endif
   REXGPU_INFO("FH1 native executor enabled: native (Vulkan)");
   return true;
 }
@@ -547,6 +552,7 @@ void Fh1NativeExecutor::Shutdown() {
     command_processor_.Fh1AwaitAllQueueOperations();
   }
   initialized_ = false;
+  DestroyInspector();
   StopSpecializeThread();
   ReleaseRetiredImages(true);
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
@@ -2480,6 +2486,11 @@ void Fh1NativeExecutor::BeginDrawRendering() {
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
+  if (inspection_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (bound_bits_ & (1u << i)) ++inspection_draws_[pending_keys_[i].Pack()];
+    }
+  }
   pending_targets_valid_ = false;
   if (draw.occlusion_query_active) Count("draw_in_occlusion_query");
   ++draws_;
@@ -3013,6 +3024,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     return false;
   }
   bool succeeded = true;
+  if (inspection_ && plan.copy) InspectResolve(plan, untile_band);
   const int32_t x0 = plan.x0, y0 = plan.y0, x1 = plan.x1, y1 = plan.y1;
   const Rect rect = {x0, y0, x1, y1};
   const uint32_t msaa = plan.msaa;
@@ -3315,6 +3327,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 }
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
+  if (inspection_) FinishInspection(frame);
+  BeginInspection();
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
   hud_scene_base_ = UINT32_MAX;

@@ -21,6 +21,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/graphics/xenos.h>
@@ -128,6 +129,7 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+  void InspectActiveTextures(uint32_t mask, std::map<uint64_t, Fh1InspectionTexture>& out) const;
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 

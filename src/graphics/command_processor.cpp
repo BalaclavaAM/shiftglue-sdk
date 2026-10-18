@@ -395,6 +395,21 @@ void CommandProcessor::CallInWorkerThread(std::function<void()> fn) {
   pending_any_ = true;
 }
 
+void CommandProcessor::RestoreFrameDumpRegisters(std::span<const uint32_t> registers) {
+  assert_true(registers.size() == RegisterFile::kRegisterCount);
+  for (uint32_t i = 0; i < registers.size(); ++i) {
+    if (!IsPerDrawRegister(i) &&
+        !(i >= XE_GPU_REG_SHADER_CONSTANT_000_X && i <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
+      state_hash_ ^= StateHashTerm(i, register_file_->values[i]) ^ StateHashTerm(i, registers[i]);
+    }
+  }
+  ++state_epoch_;
+  ++render_state_epoch_;
+  std::memcpy(register_file_->values, registers.data(), registers.size_bytes());
+  active_vertex_shader_ = nullptr;
+  active_pixel_shader_ = nullptr;
+}
+
 void CommandProcessor::ClearCaches() {}
 
 void CommandProcessor::InvalidateGpuMemory() {}

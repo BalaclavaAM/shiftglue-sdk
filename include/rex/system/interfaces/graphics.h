@@ -15,9 +15,11 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 
 #include <rex/system/xtypes.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 
 // Forward declarations
 namespace rex::runtime {
@@ -248,6 +250,12 @@ class IGraphicsSystem {
   virtual void ReduceMemory() {}
 
   virtual void Shutdown() = 0;
+
+  // Optional desktop diagnostics. Snapshots contain CPU-owned data only.
+  virtual std::shared_ptr<graphics::Fh1FrameInspector> frame_inspector() const { return {}; }
+  virtual bool OpenInspectionDump(const std::filesystem::path&, graphics::Fh1InspectionView) {
+    return false;
+  }
 };
 
 }  // namespace rex::system

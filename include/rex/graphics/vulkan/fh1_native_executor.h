@@ -21,6 +21,7 @@
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/fh1_executor_counters.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -119,6 +120,10 @@ class Fh1NativeExecutor {
   // Copies one-off resolve read-backs into guest memory, waiting for the GPU.
   void FlushResolveReadbacks();
   void OnSwap(uint64_t frame);
+  void BeginInspection();
+  void InspectTextures(uint32_t mask);
+  bool inspection_active() const { return inspection_ != nullptr; }
+  const Fh1VulkanExecutorConfig& config() const { return config_; }
   // present_hdr: before PrepareTargets, notes the scene's 2_10_10_10 target
   // and, at the first HUD draw over it (through its 2_10_10_10_AS_10_10_10_10
   // view), copies it, so the swap can tell the HUD from the scene.
@@ -270,6 +275,23 @@ class Fh1NativeExecutor {
     Rect rect = {};
     bool unowned = false;
   };
+  void FinishInspection(uint64_t frame);
+  void DestroyInspector();
+  Fh1InspectionImage QueueInspectionImage(Surface& surface, Rect rect);
+  struct CopyPlan;
+  void InspectResolve(const CopyPlan& plan, uint32_t untile_band);
+  std::shared_ptr<Fh1FrameInspection> inspection_;
+  uint64_t inspection_generation_ = 0;
+  std::map<uint32_t, uint32_t> inspection_draws_;
+  std::map<uint64_t, Fh1InspectionTexture> inspection_textures_;
+  struct InspectionReadback {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+  };
+  std::vector<InspectionReadback> inspection_readbacks_;
+  VkDescriptorSetLayout inspection_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout inspection_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline inspection_pipelines_[2] = {};
   struct CopyPlan : Fh1ResolvePlan {
     std::vector<SourceRect> sources;
   };

@@ -1346,6 +1346,11 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
 }
 
 bool VulkanCommandProcessor::SetupContext() {
+  if (rex::cvar::GetFlagByName("fh1_frame_inspector_replay") == "true") {
+    // Replays execute host packets synchronously, with no title producing work.
+    rex::cvar::SetFlagByName("gpu_record_thread", "false");
+    rex::cvar::SetFlagByName("async_shader_compilation", "false");
+  }
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
@@ -5274,6 +5279,65 @@ VulkanCommandProcessor::GetShaderTranslationObserver() const {
 }
 
 void VulkanCommandProcessor::RunRequestedFrameReplay() {
+  const auto path = rex::to_path(rex::cvar::GetFlagByName("fh1_frame_replay"));
+  if (path.empty()) return;
+  const auto view = rex::cvar::GetFlagByName("fh1_frame_inspector_view");
+  RunFrameReplay(path, rex::cvar::GetFlagByName("fh1_frame_inspector_replay") == "true",
+                  view == "2" ? Fh1InspectionView::kOverdraw :
+                  view == "1" ? Fh1InspectionView::kWireframe : Fh1InspectionView::kColor);
+}
+
+void VulkanCommandProcessor::RestoreFrameDumpRegisters(std::span<const uint32_t> registers) {
+  CommandProcessor::RestoreFrameDumpRegisters(registers);
+  ResetCachedDrawState();
+  InvalidateAllVertexBufferResidency();
+  texture_cache_->TextureFetchConstantsWritten(0, 31);
+}
+
+bool VulkanCommandProcessor::OpenInspectionDump(const std::filesystem::path& path,
+                                                 Fh1InspectionView view) {
+#if !defined(__ANDROID__)
+  if (path.empty() || rex::cvar::GetFlagByName("fh1_frame_inspector_replay") != "true" ||
+      inspection_replay_pending_.exchange(true)) return false;
+  CallInThread([this, path, view] {
+    RunFrameReplay(path, true, view);
+    inspection_replay_pending_.store(false);
+  });
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool VulkanCommandProcessor::ResetInspectionReplay() {
+  if (!fh1_native_executor_) return false;
+  const auto config = fh1_native_executor_->config();
+  // A dump starts with fresh EDRAM ownership and all executor draw/tiling state.
+  fh1_native_executor_.reset();
+  auto executor = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
+  if (!executor->Initialize(config)) return false;
+  fh1_native_executor_ = std::move(executor);
+  ResetCachedDrawState();
+  return true;
+}
+
+void VulkanCommandProcessor::RunFrameReplay(const std::filesystem::path& path, bool inspect,
+                                            Fh1InspectionView view) {
+  if (inspect) {
+    // Raw dump writes do not fire guest CPU watches. Retire every cached
+    // texture before another dump can reuse its address with different bytes.
+    Fh1AwaitAllQueueOperations();
+    texture_cache_->ClearCache();
+    primitive_processor_->ClearCache();
+    shared_memory_->ClearCache();
+    if (!ResetInspectionReplay() ||
+        !inspector_->Request(view)) {
+      inspector_->SetStatus("Cannot inspect this replay with the current renderer or view");
+      return;
+    }
+    inspector_->SetStatus("Replaying " + rex::path_to_utf8(path));
+    fh1_native_executor_->BeginInspection();
+  }
   const int exit_code = RunFh1FrameReplay(
       *this, *register_file_, *memory_, *shared_memory_,
       [this](uint32_t address, uint32_t length, std::vector<uint8_t>& out) {
@@ -5312,9 +5376,18 @@ void VulkanCommandProcessor::RunRequestedFrameReplay() {
         dfn.vkDestroyBuffer(device, buffer, nullptr);
         dfn.vkFreeMemory(device, memory, nullptr);
         return read;
-      });
+      }, path);
   if (exit_code < 0) return;
   if (fh1_native_executor_) fh1_native_executor_->LogStats(0);
+  if (inspect) {
+    if (inspector_->busy()) {
+      ResetInspectionReplay();
+      inspector_->SetStatus("Replay failed: invalid, truncated or unsupported frame dump");
+    } else if (exit_code != 0) {
+      inspector_->SetStatus("Replay failed; see the GPU log for details");
+    }
+    return;
+  }
   // A replay is a tool run with the title suspended: end the process here.
   rex::FlushLogging();
   std::_Exit(exit_code);
@@ -6346,6 +6419,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   texture_cache_->set_skip_unchanged_requests(unchanged_inputs, unchanged_verify);
   const uint64_t texture_hits_before = texture_cache_->unchanged_request_hits();
   texture_cache_->RequestTextures(used_texture_mask);
+  if (fh1_native_executor_ && fh1_native_executor_->inspection_active())
+    fh1_native_executor_->InspectTextures(used_texture_mask);
   texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
   texture_section_skip_allowed_ = unchanged_inputs;
   texture_section_verify_ = unchanged_verify;

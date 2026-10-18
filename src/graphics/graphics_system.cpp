@@ -528,6 +528,14 @@ uint32_t GraphicsSystem::draw_resolution_scale() const {
   return command_processor_ ? command_processor_->draw_resolution_scale() : 0;
 }
 
+std::shared_ptr<Fh1FrameInspector> GraphicsSystem::frame_inspector() const {
+  return command_processor_ ? command_processor_->frame_inspector() : nullptr;
+}
+
+bool GraphicsSystem::OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) {
+  return command_processor_ && command_processor_->OpenInspectionDump(path, view);
+}
+
 bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,
                                      uint32_t* resolves) const {
   return command_processor_ && command_processor_->fh1_shadow_mask(base, length, resolves);

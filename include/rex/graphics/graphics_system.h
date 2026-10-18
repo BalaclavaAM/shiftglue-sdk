@@ -70,6 +70,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
+  std::shared_ptr<Fh1FrameInspector> frame_inspector() const override;
+  bool OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) override;
   void SetShaderTranslationObserver(
       system::GraphicsShaderTranslationObserver observer) override {
     shader_translation_observer_.store(observer, std::memory_order_release);

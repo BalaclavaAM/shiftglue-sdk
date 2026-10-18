@@ -187,6 +187,36 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 
 namespace rex::graphics {
 
+void TextureCache::InspectActiveTextures(
+    uint32_t mask, std::map<uint64_t, Fh1InspectionTexture>& out) const {
+  for (uint32_t slot = 0; slot < 32 && out.size() < 512; ++slot) {
+    if (!(mask & (1u << slot))) continue;
+    const auto* binding = GetValidTextureBinding(slot);
+    if (!binding) continue;
+    const auto& key = binding->key;
+    const uint64_t identity = TextureKey::Hasher()(key);
+    if (out.contains(identity)) continue;
+    Fh1InspectionTexture item;
+    item.address = key.base_page << 12;
+    item.width = key.GetWidth();
+    item.height = key.GetHeight();
+    item.format = uint32_t(key.format);
+    const auto layout = key.GetGuestLayout();
+    // Same byte domain as texture replacement names. Resolve-backed textures
+    // have no stable CPU payload; do not present their stale RAM as a hash.
+    const auto* texture = binding->texture ? binding->texture : binding->texture_signed;
+    if (key.base_page && !key.scaled_resolve && texture &&
+        layout.base.level_data_extent_bytes && layout.base.level_data_extent_bytes <= (16u << 20)) {
+      std::vector<uint8_t> data(layout.base.level_data_extent_bytes);
+      if (shared_memory_.CopyCpuRange(item.address, data)) {
+        item.hash = XXH3_64bits(data.data(), data.size());
+        item.hash_valid = true;
+      }
+    }
+    out.emplace(identity, item);
+  }
+}
+
 // critical_region_census (NN-3.10): this file's global lock acquisitions.
 constexpr auto kTextureCacheLockSource = rex::thread::LockSource::kTextureCache;
 

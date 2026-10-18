@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <vector>
 
@@ -25,6 +26,7 @@ using Fh1FrameReplayReadback =
     std::function<bool(uint32_t address, uint32_t length, std::vector<uint8_t>& out)>;
 int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& register_file,
                       memory::Memory& memory, SharedMemory& shared_memory,
-                      const Fh1FrameReplayReadback& read_front_buffer);
+                      const Fh1FrameReplayReadback& read_front_buffer,
+                      const std::filesystem::path& requested_path = {});
 
 }  // namespace rex::graphics

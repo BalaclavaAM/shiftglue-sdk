@@ -295,6 +295,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
   // ends the process.
   void RunRequestedFrameReplay() override;
+  void RestoreFrameDumpRegisters(std::span<const uint32_t> registers) override;
+  std::shared_ptr<Fh1FrameInspector> frame_inspector() const override { return inspector_; }
+  bool OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) override;
+  Fh1InspectionView inspection_view() const { return inspection_view_; }
+  void SetInspectionView(Fh1InspectionView view) {
+    inspection_view_ = view;
+    std::fill_n(pipeline_memos_.get(), kStateMemoCount, PipelineMemo());
+  }
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -1074,6 +1082,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
   // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
   std::unique_ptr<Fh1FrameDump> frame_dump_;
+  std::shared_ptr<Fh1FrameInspector> inspector_ = std::make_shared<Fh1FrameInspector>();
+  Fh1InspectionView inspection_view_ = Fh1InspectionView::kColor;
+  std::atomic<bool> inspection_replay_pending_{false};
+  void RunFrameReplay(const std::filesystem::path& path, bool inspect, Fh1InspectionView view);
+  bool ResetInspectionReplay();
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
   bool debug_labels_ = false;

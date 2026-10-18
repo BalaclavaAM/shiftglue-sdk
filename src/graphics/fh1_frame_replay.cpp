@@ -39,18 +39,27 @@ bool Get(std::ifstream& in, T& value) {
 
 }  // namespace
 
-int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& register_file,
+int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& /*register_file*/,
                       memory::Memory& memory, SharedMemory& shared_memory,
-                      const Fh1FrameReplayReadback& read_front_buffer) {
-  const std::filesystem::path path(REXCVAR_GET(fh1_frame_replay));
+                      const Fh1FrameReplayReadback& read_front_buffer,
+                      const std::filesystem::path& requested_path) {
+  const std::filesystem::path path = requested_path.empty()
+      ? rex::to_path(REXCVAR_GET(fh1_frame_replay)) : requested_path;
   if (path.empty()) return -1;
+  std::error_code file_error;
+  const auto file_size = std::filesystem::file_size(path, file_error);
+  if (file_error || file_size > (1ull << 30)) return 2;
   std::ifstream in(path, std::ios::binary);
+  auto remaining = [&]() -> uint64_t {
+    const auto position = in.tellg();
+    return position < 0 || uint64_t(position) > file_size ? 0 : file_size - uint64_t(position);
+  };
   char magic[8] = {};
   uint64_t frame = 0;
   uint32_t register_count = 0;
   if (!in.read(magic, sizeof(magic)) || std::memcmp(magic, kMagic, sizeof(kMagic)) ||
       !Get(in, frame) || !Get(in, register_count) ||
-      register_count > RegisterFile::kRegisterCount) {
+      register_count != RegisterFile::kRegisterCount) {
     REXGPU_ERROR("FH1 frame replay: {} is not a frame dump", rex::path_to_utf8(path));
     return 2;
   }
@@ -59,11 +68,11 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   // Shaders active at the start, loaded like IM_LOAD_IMMEDIATE would.
   std::vector<uint32_t> packets;
   uint32_t shader_count = 0;
-  Get(in, shader_count);
+  if (!Get(in, shader_count) || shader_count > 2) return 2;
   for (uint32_t i = 0; i < shader_count; ++i) {
     uint32_t type = 0, size = 0;
-    Get(in, type);
-    Get(in, size);
+    if (!Get(in, type) || !Get(in, size) || type > 1 || !size || size > 0x3FFE ||
+        uint64_t(size) * 4 > remaining()) return 2;
     std::vector<uint32_t> ucode(size);
     in.read(reinterpret_cast<char*>(ucode.data()), size * 4);
     packets.push_back(Swap((3u << 30) | ((size + 2 - 1) << 16) |
@@ -73,17 +82,26 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
     for (uint32_t dword : ucode) packets.push_back(Swap(dword));
   }
   uint32_t packet_count = 0;
-  Get(in, packet_count);
+  if (!Get(in, packet_count) || packet_count > (64u << 20) ||
+      uint64_t(packet_count) * 4 > remaining()) return 2;
   const size_t recorded_first = packets.size();
   packets.resize(recorded_first + packet_count);
   in.read(reinterpret_cast<char*>(packets.data() + recorded_first), packet_count * 4);
+  for (size_t i = recorded_first; i < packets.size();) {
+    const uint32_t packet = Swap(packets[i]);
+    const uint32_t type = packet >> 30;
+    const uint32_t payload = type == 2 ? 0 : type == 1 ? 2 : ((packet >> 16) & 0x3FFF) + 1;
+    if (payload > packets.size() - i - 1) return 2;
+    i += 1 + payload;
+  }
   uint32_t block_count = 0;
-  Get(in, block_count);
+  if (!Get(in, block_count) || block_count > (kPhysicalSize >> 12)) return 2;
   uint64_t block_bytes = 0;
   for (uint32_t i = 0; i < block_count; ++i) {
     uint32_t address = 0, length = 0;
-    Get(in, address);
-    Get(in, length);
+    if (!Get(in, address) || !Get(in, length) || length > kPhysicalSize ||
+        block_bytes + length > kPhysicalSize || uint64_t(address) + length > kPhysicalSize ||
+        length > remaining()) return 2;
     uint8_t* destination = memory.TranslatePhysical(address);
     if (!destination || uint64_t(address) + length > kPhysicalSize) {
       in.seekg(length, std::ios::cur);
@@ -99,6 +117,9 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   Get(in, height);
   Get(in, format);
   Get(in, tiled);
+  if (!in || uint64_t(front_address) + front_length > kPhysicalSize ||
+      !front_length || front_length % 4 || !width || !height || width > 8192 || height > 8192 ||
+      front_length > remaining()) return 2;
   std::vector<uint8_t> expected(front_length);
   in.read(reinterpret_cast<char*>(expected.data()), front_length);
   if (!in) {
@@ -108,7 +129,7 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
 
   // Everything written above is new CPU data for the GPU mirror.
   shared_memory.InvalidateAllPages();
-  std::memcpy(register_file.values, registers.data(), registers.size() * 4);
+  command_processor.RestoreFrameDumpRegisters(registers);
   REXGPU_INFO("FH1 frame replay: frame {} from {} ({} packet dwords, {} blocks, {} MB)", frame,
               rex::path_to_utf8(path), packet_count, block_count, block_bytes >> 20);
   bool executed = true;
@@ -118,7 +139,8 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
 
   // Compare the front buffer the replay resolved with the recorded one.
   std::vector<uint8_t> actual(front_length);
-  if (front_length && !read_front_buffer(front_address, front_length, actual)) {
+  const bool readback = read_front_buffer(front_address, front_length, actual);
+  if (!readback) {
     REXGPU_ERROR("FH1 frame replay: the front buffer could not be read back");
   }
   uint64_t differing_words = 0;
@@ -132,6 +154,7 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   std::filesystem::path json = path;
   json += ".replay.json";
   std::ofstream(json) << "{\"frame\":" << frame << ",\"executed\":" << (executed ? "true" : "false")
+                      << ",\"readback\":" << (readback ? "true" : "false")
                       << ",\"packet_dwords\":" << packet_count << ",\"blocks\":" << block_count
                       << ",\"front_address\":" << front_address
                       << ",\"front_bytes\":" << front_length << ",\"width\":" << width
@@ -140,7 +163,12 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
                       << "}\n";
   REXGPU_INFO("FH1 frame replay: done, {} of {} front buffer words differ ({})", differing_words,
               front_length / 4, rex::path_to_utf8(json));
-  return executed ? 0 : 1;
+  if (auto inspector = command_processor.frame_inspector()) {
+    inspector->SetStatus("Replay: " + std::to_string(differing_words) + " / " +
+                         std::to_string(front_length / 4) + " front-buffer words differ" +
+                         (readback ? "" : " (readback failed)"));
+  }
+  return executed && readback ? 0 : 1;
 }
 
 }  // namespace rex::graphics

@@ -26,11 +26,13 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -166,6 +168,10 @@ class CommandProcessor {
   // Replays a frame dump requested at startup (fh1_frame_replay); called on
   // the command processor thread once shader storage is initialized.
   virtual void RunRequestedFrameReplay() {}
+  // Restore a full dump register file without triggering MMIO write effects.
+  virtual void RestoreFrameDumpRegisters(std::span<const uint32_t> registers);
+  virtual std::shared_ptr<Fh1FrameInspector> frame_inspector() const { return {}; }
+  virtual bool OpenInspectionDump(const std::filesystem::path&, Fh1InspectionView) { return false; }
 
   bool is_paused() const { return paused_; }
   void Pause();
