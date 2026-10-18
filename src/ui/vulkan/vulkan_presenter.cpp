@@ -42,7 +42,25 @@
 #include <rex/ui/surface_win.h>
 #endif
 #if REX_PLATFORM_MAC
+#include <CoreGraphics/CoreGraphics.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <rex/ui/surface_mac.h>
+
+namespace {
+void SyncMacMetalLayerDrawableSize(const void* metal_layer, const VkExtent2D& extent) {
+  if (!metal_layer || !extent.width || !extent.height) return;
+  id layer = static_cast<id>(const_cast<void*>(metal_layer));
+  const CGSize size = reinterpret_cast<CGSize (*)(id, SEL)>(objc_msgSend)(
+      layer, sel_registerName("drawableSize"));
+  if (size.width == extent.width && size.height == extent.height) return;
+  // SDL can update the view to 1x1 after swapchain creation on fullscreen
+  // changes. Restore the extent before MoltenVK acquires its next drawable.
+  reinterpret_cast<void (*)(id, SEL, CGSize)>(objc_msgSend)(
+      layer, sel_registerName("setDrawableSize:"),
+      CGSizeMake(CGFloat(extent.width), CGFloat(extent.height)));
+}
+}  // namespace
 #endif
 
 REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
@@ -1172,6 +1190,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.pLayer = metal_surface.layer();
         vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        paint_context_.mac_metal_layer = metal_surface.layer();
       } break;
 #endif
       default:
@@ -2025,6 +2044,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
 }
 
 void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+#if REX_PLATFORM_MAC
+  mac_metal_layer = nullptr;
+#endif
   VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
   if (old_swapchain != VK_NULL_HANDLE) {
     vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
@@ -2207,6 +2229,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // vkResetCommandPool resets from both initial and recording states, still
   // safe to return early from this function in case of an error.
 
+#if REX_PLATFORM_MAC
+  SyncMacMetalLayerDrawableSize(paint_context_.mac_metal_layer, paint_context_.swapchain_extent);
+#endif
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
   // Keep pumping window events even if an occluded surface stops making

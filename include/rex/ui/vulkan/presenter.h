@@ -551,6 +551,10 @@ class VulkanPresenter final : public Presenter {
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
     // The ANativeWindow of vulkan_surface on Android, for its data space.
     void* android_window = nullptr;
+#if REX_PLATFORM_MAC
+    // Borrowed from the connected surface, under the painting lock.
+    const void* mac_metal_layer = nullptr;
+#endif
     uint32_t present_queue_family = UINT32_MAX;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     // vulkan_present_wait: the last present ID given on `swapchain`, 0 for

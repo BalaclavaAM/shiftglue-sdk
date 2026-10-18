@@ -46,6 +46,9 @@ bool SDLWindowedAppContext::Initialize() {
   if (requested_driver.empty()) {
     requested_driver = "cocoa";
   }
+  // MoltenVK may present black in a separate fullscreen Space. Cocoa reads
+  // this before video init; default priority preserves environment overrides.
+  SDL_SetHintWithPriority(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0", SDL_HINT_DEFAULT);
 #endif
   if (!requested_driver.empty()) {
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());
