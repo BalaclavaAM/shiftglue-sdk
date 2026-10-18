@@ -36,6 +36,7 @@ add_executable(unit_tests
     graphics/vulkan_shader_overrides_test.cpp
     graphics/cube_lut_test.cpp
     graphics/texture_cache_test.cpp
+    graphics/fh1_edram_resolve_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -45,6 +46,11 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fh1_edram_resolve.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp

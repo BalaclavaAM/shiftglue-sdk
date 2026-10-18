@@ -29,7 +29,8 @@ FH1_PUSH_CONSTANTS cbuffer Fh1NativeResolveMemoryConstants FH1_CONSTANTS_REGISTE
                             // same place 30 (fh1_native_edram.hlsli)
   uint fh1_sample_select;   // sanitized xenos::CopySampleSelect
   // pack 0:2 (0: 8_8_8_8, 1: 2_10_10_10, 2: 32_FLOAT, 3: 16_16_16_16_FLOAT,
-  // 4: raw 32-bit word, 5: 16_16_16_16 unorm), endian 3:5, swap red/blue 6, float24 rounding 7,
+  // 4: raw 32-bit word, 5: 16_16_16_16 unorm, 6: 8 unorm), endian 3:5,
+  // swap red/blue 6, float24 rounding 7,
   // exp bias 8:15 (signed), bytes per texel log2 16:17, gamma targets hold
   // linear values 18, 16_16[_16_16] hosts keep the full range as snorm / 32 19,
   // resolution scale - 1 20:21 (the rectangle is then in host pixels and the
@@ -279,6 +280,15 @@ void main(uint3 thread : SV_DispatchThreadID) {
     StoreWord(address, host_pixel, EndianSwap32(EncodeColor(color, FORMAT_2_10_10_10), endian));
   } else if (pack == 2u) {
     StoreWord(address, host_pixel, EndianSwap32(asuint(color.r), endian));
+  } else if (pack == 6u) {
+    // R8 texels share words. Atomics preserve both neighbouring texels and
+    // bytes outside a partial resolve, including when threads run concurrently.
+    // Endianness permutes the byte address within a 32-bit word.
+    uint byte_xor = endian == 1u ? 1u : (endian == 2u ? 3u : (endian == 3u ? 2u : 0u));
+    uint shift = ((address ^ byte_xor) & 3u) * 8u;
+    uint value = uint(saturate(color.r) * 255.0f + 0.5f);
+    fh1_memory.InterlockedAnd(address & ~3u, ~(255u << shift));
+    fh1_memory.InterlockedOr(address & ~3u, value << shift);
   } else {
     uint2 words;
     if (pack == 5u) {
