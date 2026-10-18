@@ -254,7 +254,7 @@ namespace {
 template <typename T, typename Read>
 X_RESULT SessionInput(session_probe::Kind result_kind, session_probe::Kind data_kind,
                        uint64_t key, T* output, Read read) {
-  if (!session_probe::Enabled()) return read();
+  if (!session_probe::ExternalEnabled()) return read();
   X_RESULT result = X_ERROR_SUCCESS;
   if (!session_probe::Replaying()) {
     session_probe::Suppress native_input_clock;

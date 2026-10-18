@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  * @file        runtime/runtime.cpp
  * @brief       Runtime subsystem implementation
@@ -91,6 +92,7 @@ std::optional<EmbeddedMetadataAsset> Runtime::FindEmbeddedMetadata(
 }
 
 X_STATUS Runtime::Setup(RuntimeConfig config) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   if (instance_ != nullptr) {
     REXSYS_ERROR("Runtime::Setup() called but global instance already exists");
     return X_STATUS_UNSUCCESSFUL;
@@ -261,6 +263,7 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
 }
 
 void Runtime::Shutdown() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   if (!instance_ && !setup_complete_ && !memory_) {
     return;
   }
@@ -288,6 +291,7 @@ void Runtime::Shutdown() {
     input_system_->Shutdown();
     input_system_.reset();
   }
+  cs_scheduler::SetTimestampWriter({});
   kernel_state_.reset();
   function_dispatcher_.reset();
   export_resolver_.reset();
@@ -387,6 +391,7 @@ bool Runtime::SetupVfs() {
 }
 
 X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   REXSYS_DEBUG("Loading XEX image: {}", std::string(module_path));
 
   auto module = system::object_ref<system::UserModule>(new system::UserModule(kernel_state_.get()));
@@ -426,6 +431,7 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
 }
 
 system::object_ref<system::XThread> Runtime::PrepareModuleLaunch() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   auto executable = kernel_state_->GetExecutableModule();
   if (!executable) {
     REXSYS_ERROR("Runtime::PrepareModuleLaunch: No executable module loaded");
@@ -443,6 +449,7 @@ system::object_ref<system::XThread> Runtime::PrepareModuleLaunch() {
 }
 
 system::object_ref<system::XThread> Runtime::LaunchModule() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   auto thread = PrepareModuleLaunch();
   if (thread) {
     thread->Resume();

@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  * @file        core/threading_win.cpp
  * @brief       Windows platform threading implementations
@@ -139,6 +140,7 @@ void set_current_thread_name(const std::string_view name) {
 }
 
 void MaybeYield() {
+  if (cs_scheduler::InActor()) { cs_scheduler::Sleep(0); return; }
   SwitchToThread();
   MemoryBarrier();
 }
@@ -148,6 +150,7 @@ void SyncMemory() {
 }
 
 void Sleep(std::chrono::microseconds duration) {
+  if (cs_scheduler::InActor()) { cs_scheduler::Sleep(uint64_t(duration.count()) * 1000); return; }
   if (duration.count() < 100) {
     MaybeYield();
   } else {
@@ -220,6 +223,10 @@ void WaitUntil(std::chrono::steady_clock::time_point deadline) {
 }
 
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
+  if (cs_scheduler::InActor()) {
+    auto result = cs_scheduler::Wait([] { return uint32_t(SleepEx(0, TRUE) == WAIT_IO_COMPLETION ? WAIT_IO_COMPLETION : WAIT_TIMEOUT); }, uint64_t(duration.count()) * 1000);
+    return result == WAIT_IO_COMPLETION ? SleepResult::kAlerted : SleepResult::kSuccess;
+  }
   if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;
   }
@@ -258,8 +265,13 @@ class Win32Handle : public T {
 };
 
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
+  wait_handle = cs_scheduler::ResolveWait(wait_handle);
+  cs_scheduler::Waiting pending({wait_handle});
   HANDLE handle = wait_handle->native_handle();
-  DWORD result = WaitForSingleObjectEx(handle, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
+  DWORD result = cs_scheduler::InActor() ? cs_scheduler::Wait(
+      [&] { return uint32_t(WaitForSingleObjectEx(handle, 0, is_alertable ? TRUE : FALSE)); },
+      timeout == std::chrono::milliseconds::max() ? UINT64_MAX : uint64_t(timeout.count()) * 1000000) :
+      WaitForSingleObjectEx(handle, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
   switch (result) {
     case WAIT_OBJECT_0:
       return WaitResult::kSuccess;
@@ -277,10 +289,16 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
 
 WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_handle_to_wait_on,
                          bool is_alertable, std::chrono::milliseconds timeout) {
+  wait_handle_to_wait_on = cs_scheduler::ResolveWait(wait_handle_to_wait_on);
+  cs_scheduler::Waiting pending({wait_handle_to_wait_on});
   HANDLE handle_to_signal = wait_handle_to_signal->native_handle();
   HANDLE handle_to_wait_on = wait_handle_to_wait_on->native_handle();
-  DWORD result = SignalObjectAndWait(handle_to_signal, handle_to_wait_on, DWORD(timeout.count()),
-                                     is_alertable ? TRUE : FALSE);
+  bool first = true;
+  DWORD result = cs_scheduler::InActor() ? cs_scheduler::Wait([&] {
+    if (first) { first = false; const auto status=SignalObjectAndWait(handle_to_signal, handle_to_wait_on, 0, is_alertable ? TRUE : FALSE); cs_scheduler::Signal(wait_handle_to_signal); return uint32_t(status); }
+    return uint32_t(WaitForSingleObjectEx(handle_to_wait_on, 0, is_alertable ? TRUE : FALSE));
+  }, timeout == std::chrono::milliseconds::max() ? UINT64_MAX : uint64_t(timeout.count()) * 1000000) :
+      SignalObjectAndWait(handle_to_signal, handle_to_wait_on, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
   switch (result) {
     case WAIT_OBJECT_0:
       return WaitResult::kSuccess;
@@ -299,11 +317,21 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
                                            bool wait_all, bool is_alertable,
                                            std::chrono::milliseconds timeout) {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  std::vector<WaitHandle*> translated;
+  if (cs_scheduler::InActor()) {
+    for(size_t i=0;i<wait_handle_count;++i) translated.push_back(cs_scheduler::ResolveWait(wait_handles[i]));
+    wait_handles=translated.data();
+  }
+  cs_scheduler::Waiting pending(std::span<WaitHandle* const>(wait_handles,wait_handle_count));
+#endif
   std::vector<HANDLE> handles(wait_handle_count);
   for (size_t i = 0; i < wait_handle_count; ++i) {
     handles[i] = wait_handles[i]->native_handle();
   }
-  DWORD result =
+  DWORD result = cs_scheduler::InActor() ? cs_scheduler::Wait([&] {
+    return uint32_t(WaitForMultipleObjectsEx(DWORD(handles.size()), handles.data(), wait_all ? TRUE : FALSE, 0, is_alertable ? TRUE : FALSE));
+  }, timeout == std::chrono::milliseconds::max() ? UINT64_MAX : uint64_t(timeout.count()) * 1000000) :
       WaitForMultipleObjectsEx(DWORD(handles.size()), handles.data(), wait_all ? TRUE : FALSE,
                                DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
   if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + handles.size()) {
@@ -326,7 +354,7 @@ class Win32Event : public Win32Handle<Event> {
  public:
   explicit Win32Event(HANDLE handle) : Win32Handle(handle) {}
   ~Win32Event() override = default;
-  void Set() override { SetEvent(handle_); }
+  void Set() override { SetEvent(handle_); cs_scheduler::Signal(this); }
   void Reset() override { ResetEvent(handle_); }
   void Pulse() override { PulseEvent(handle_); }
 };
@@ -356,9 +384,9 @@ class Win32Semaphore : public Win32Handle<Semaphore> {
   explicit Win32Semaphore(HANDLE handle) : Win32Handle(handle) {}
   ~Win32Semaphore() override = default;
   bool Release(int release_count, int* out_previous_count) override {
-    return ReleaseSemaphore(handle_, release_count, reinterpret_cast<LPLONG>(out_previous_count))
-               ? true
-               : false;
+    const bool result=ReleaseSemaphore(handle_, release_count, reinterpret_cast<LPLONG>(out_previous_count))!=0;
+    if (result) cs_scheduler::Signal(this);
+    return result;
   }
 };
 
@@ -376,7 +404,7 @@ class Win32Mutant : public Win32Handle<Mutant> {
  public:
   explicit Win32Mutant(HANDLE handle) : Win32Handle(handle) {}
   ~Win32Mutant() = default;
-  bool Release() override { return ReleaseMutex(handle_) ? true : false; }
+  bool Release() override { const bool result=ReleaseMutex(handle_)!=0; if(result) cs_scheduler::Signal(this); return result; }
 };
 
 std::unique_ptr<Mutant> Mutant::Create(bool initial_owner) {

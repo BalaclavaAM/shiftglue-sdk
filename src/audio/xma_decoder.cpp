@@ -12,6 +12,7 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
+#include <rex/cs_scheduler.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -141,6 +142,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  cs_scheduler::Actor scheduled(UINT64_C(0x8000000000000007));
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
@@ -152,6 +154,7 @@ void XmaDecoder::WorkerThreadMain() {
         PROFILE_XMA_FRAME_DECODED();
       }
       did_work = did_work || worked;
+      cs_scheduler::Call(n);
     }
 
     if (paused_) {

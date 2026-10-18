@@ -25,6 +25,7 @@ enum class Kind : uint32_t {
 };
 #if defined(REXGLUE_ENABLE_CS_PROBES)
 bool Enabled();
+bool ExternalEnabled();
 bool Active();
 uint64_t ObjectKey(const system::XObject* object);
 bool Replaying();
@@ -51,6 +52,7 @@ struct LockGrant {
 };
 #else
 inline constexpr bool Enabled() { return false; }
+inline constexpr bool ExternalEnabled() { return false; }
 inline constexpr bool Active() { return false; }
 inline constexpr bool Replaying() { return false; }
 inline uint64_t ObjectKey(const system::XObject*) { return 0; }

@@ -41,6 +41,7 @@
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/system/d3d_census.h>
 #include <rex/system/d3d_draw.h>
 #include <rex/system/gpu_write_signal.h>
@@ -377,6 +378,7 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   if (!pending_any_ && system::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
@@ -387,6 +389,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
 }
 
 void CommandProcessor::CallInWorkerThread(std::function<void()> fn) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   std::lock_guard<std::mutex> lock(pending_mutex_);
   pending_fns_.push({std::move(fn), true});
   pending_any_ = true;
@@ -427,6 +430,7 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kGpu);
   if (session_probe::Enabled()) session_probe::SetHostRole(3);
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
@@ -478,6 +482,9 @@ void CommandProcessor::WorkerThreadMain() {
       const auto idle_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
+        if (cs_scheduler::InActor()) {
+          cs_scheduler::Point(0,cs_scheduler::PointKind::kWait,true,1000000);
+        } else {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > uint32_t(REXCVAR_GET(gpu_idle_spin_count))) {
           const int wait_time_ms = 5;
@@ -487,6 +494,7 @@ void CommandProcessor::WorkerThreadMain() {
 
         rex::thread::MaybeYield();
         loop_count++;
+        }
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && !pending_any_ &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -2175,11 +2183,12 @@ bool CommandProcessor::ExecuteHostPackets(const uint32_t* dwords, uint32_t count
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (cs_scheduler::Enabled()) cs_scheduler::Call(reader->read_offset());
   const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
 #if defined(REXGLUE_ENABLE_CS_PROBES)
-  if (session_probe::Enabled()) {
+  if (session_probe::Enabled() || (cs_scheduler::Enabled() && cs_scheduler::Mode() != 3)) {
     uint32_t words = 1;
     if (packet && (packet_type == 0 || packet_type == 3)) words += ((packet >> 16) & 0x3FFF) + 1;
     else if (packet_type == 1) words += 2;
@@ -2819,6 +2828,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           !wait_word_armed.exchange(true, std::memory_order_relaxed)) {
         memory_->EnablePhysicalMemoryAccessCallbacks(poll_reg_addr & 0x1FFFFFFC, 4, false, false,
                                                      true);
+      }
+      if (cs_scheduler::InActor()) {
+        cs_scheduler::Point(poll_reg_addr,cs_scheduler::PointKind::kWait,true,100000);
+        continue;
       }
       // Wait.
       if (wait >= 0x100) {

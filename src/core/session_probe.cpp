@@ -1,4 +1,5 @@
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -60,6 +61,7 @@ std::filesystem::path root;
 std::chrono::steady_clock::time_point epoch;
 uint32_t main_native_tid = 0;
 std::atomic<uint64_t> matched_frames{0};
+std::atomic<uint64_t> recorded_frames{0};
 std::map<uint64_t, uint64_t> lock_tickets, lock_turns;
 std::mutex grant_mutex;
 std::condition_variable grant_wake;
@@ -90,6 +92,9 @@ std::map<uint32_t, Record> last_stores;
     REXLOG_ERROR("CS_SESSION_STACK {} {:016X}", i, Site(frames[i]));
 #endif
   rex::FlushLogging();
+#if defined(_WIN32)
+  if(cs_scheduler::Enabled()) TerminateProcess(GetCurrentProcess(),86);
+#endif
   std::_Exit(86);
 }
 
@@ -136,11 +141,22 @@ Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
                 uint32_t size, bool replay_value) {
   const int mode = REXCVAR_GET(cs_session_mode);
   if (!mode) return {uint32_t(kind), size, thread_tag, 0, key, value, 0};
+  if (cs_scheduler::Enabled()) {
+    switch (kind) {
+      case Kind::kInputResult: case Kind::kInputState: case Kind::kInputCapsResult:
+      case Kind::kInputCapsData: case Kind::kInputKeyResult: case Kind::kInputKeyData:
+      case Kind::kIoRead: case Kind::kIoWrite: case Kind::kIoData:
+      case Kind::kIoReadRequest: case Kind::kIoReadData: case Kind::kIoResult: case Kind::kIoMetadata:
+      case Kind::kPm4Frame: case Kind::kPm4Words: case Kind::kAudioPump: case Kind::kHostHook: break;
+      default: return {uint32_t(kind),size,thread_tag,0,key,value,0};
+    }
+  }
   if (!thread_tag && main_native_tid && main_native_tid != rex::thread::current_thread_system_id())
     REXLOG_ERROR("CS_SESSION_UNTAGGED kind={} key={:016X}", uint32_t(kind), key);
   auto& stream = Open(mode);
   std::lock_guard stream_lock(stream.mutex);
   Record actual{uint32_t(kind),size,thread_tag,stream.sequence,key,value,
+      cs_scheduler::Enabled() ? cs_scheduler::Now() :
       uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now()-epoch).count())};
   if (size > 4096 || (size && !data)) Fail("invalid payload size",{},actual);
@@ -152,6 +168,9 @@ Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
     if (std::fwrite(&actual,sizeof(actual),1,stream.file)!=1 ||
         (size && std::fwrite(data,1,size,stream.file)!=size)) Fail("write boundary",{},actual);
     ++stream.sequence;
+    if(kind==Kind::kPm4Words) recorded_frames.fetch_add(1);
+    if(kind==Kind::kHostHook && key==UINT64_C(0x435343415054454E))
+      REXLOG_INFO("CS_SESSION_CAPTURE_END recorded_frames={} matched_frames=0",recorded_frames.load());
     return actual;
   }
   Record expected{};
@@ -163,15 +182,21 @@ Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
   if (size && std::fread(data,1,size,stream.file)!=size) Fail("truncated payload",expected,actual);
   if (size && Digest(data,size)!=expected.value) Fail("payload digest",expected,actual);
   ++stream.sequence;
-  if (replay_value || kind==Kind::kSyncResult || kind==Kind::kGpuFence || kind==Kind::kGpuInterrupt)
+  if (!cs_scheduler::Enabled() && (replay_value || kind==Kind::kSyncResult || kind==Kind::kGpuFence || kind==Kind::kGpuInterrupt))
     std::this_thread::sleep_until(epoch+std::chrono::nanoseconds(expected.host_ns));
-  if (kind==Kind::kPm4Words) matched_frames.fetch_add(1);
+  if (kind==Kind::kPm4Words) {
+    const auto matched=matched_frames.fetch_add(1)+1;
+    if (matched%600==0) REXLOG_INFO("CS_SESSION_MATCHED frames={} logical_ns={}",matched,cs_scheduler::Now());
+  }
+  if(kind==Kind::kHostHook && key==UINT64_C(0x435343415054454E))
+    REXLOG_INFO("CS_SESSION_CAPTURE_END recorded_frames=0 matched_frames={}",matched_frames.load());
   return expected;
 }
 }  // namespace
 
-bool Enabled() { return REXCVAR_GET(cs_session_mode)!=0 && !suppression_depth; }
-bool Active() { return REXCVAR_GET(cs_session_mode)!=0; }
+bool ExternalEnabled() { return REXCVAR_GET(cs_session_mode)!=0 && !suppression_depth; }
+bool Enabled() { return !cs_scheduler::Enabled() && ExternalEnabled(); }
+bool Active() { return !cs_scheduler::Enabled() && REXCVAR_GET(cs_session_mode)!=0; }
 bool Replaying() { return REXCVAR_GET(cs_session_mode)==2; }
 void Require(bool condition, const char* reason) { if (!condition) Fail(reason); }
 Suppress::Suppress() { ++suppression_depth; }
@@ -199,7 +224,7 @@ uint64_t CurrentTag() { return thread_tag; }
 void SetThreadTag(uint64_t tag, uint32_t entry) {
   if (thread_tag==tag) return;
   thread_tag=tag;current_stream=nullptr;
-  if (Enabled()) {
+  if (ExternalEnabled() && !cs_scheduler::Enabled()) {
     auto& stream=Open(REXCVAR_GET(cs_session_mode));
     std::lock_guard lock(stream.mutex);
     if (!stream.started) {
@@ -213,7 +238,7 @@ uint64_t Scalar(Kind kind, uint64_t key, uint64_t value, bool replay_value) {
   return Exchange(kind,key,value,nullptr,0,replay_value).value;
 }
 void Blob(Kind kind, uint64_t key, void* data, uint32_t size) {
-  if (!Enabled()) return;
+  if (!ExternalEnabled()) return;
   if (size>4096 || (size && !data)) Fail("invalid blob argument");
   Exchange(kind,key,Digest(data,size),data,size,true);
 }
@@ -230,7 +255,7 @@ void Delivery(Kind kind, uint64_t key, uint64_t value) {
   if (Replaying()) std::this_thread::sleep_until(epoch+std::chrono::nanoseconds(event.host_ns));
 }
 std::optional<uint32_t> PeekWaitResult(uint64_t key) {
-  if (!Replaying()) return std::nullopt;
+  if (!Enabled() || !Replaying()) return std::nullopt;
   auto& stream=Open(2);fpos_t position;
   std::lock_guard stream_lock(stream.mutex);
   if (std::fgetpos(stream.file,&position)) Fail("save wait lookahead position");
@@ -251,7 +276,9 @@ std::optional<uint32_t> PeekWaitResult(uint64_t key) {
   return uint32_t(record.value);
 }
 uint64_t Site(const void* return_address) {
-  if (!Enabled()) return 0;
+  if (!ExternalEnabled() && !cs_scheduler::Enabled()) return 0;
+  thread_local std::map<const void*,uint64_t> cached;
+  if (const auto found=cached.find(return_address); found!=cached.end()) return found->second;
   uintptr_t base=0; const char* name="unknown";
 #if defined(_WIN32)
   MEMORY_BASIC_INFORMATION info{};
@@ -263,10 +290,12 @@ uint64_t Site(const void* return_address) {
   if (dladdr(return_address,&info)) { base=reinterpret_cast<uintptr_t>(info.dli_fbase); name=info.dli_fname; }
 #endif
   for (const char* c=name;*c;++c) if (*c=='/' || *c=='\\') name=c+1;
-  return (uint64_t(uint32_t(Digest(name,std::strlen(name))))<<32)|uint32_t(reinterpret_cast<uintptr_t>(return_address)-base);
+  const auto value=(uint64_t(uint32_t(Digest(name,std::strlen(name))))<<32)|uint32_t(reinterpret_cast<uintptr_t>(return_address)-base);
+  cached.emplace(return_address,value); return value;
 }
 void Flush() {
-  if (!Enabled() || Replaying()) return;
+  cs_scheduler::Flush();
+  if (!ExternalEnabled() || Replaying()) return;
   std::lock_guard lock(streams_mutex);
   for (const auto& [tag,stream]:streams) {
     std::lock_guard stream_lock(stream->mutex);

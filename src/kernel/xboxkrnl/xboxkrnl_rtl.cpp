@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -685,6 +686,7 @@ REX_EXPORT(__imp__RtlInitializeCriticalSectionAndSpinCount,
 // Raw hooks: the current thread comes from the caller's r13 (see
 // CriticalSectionThread).
 extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
+  rex::cs_scheduler::Kernel scheduled(reinterpret_cast<uintptr_t>(&__imp__RtlEnterCriticalSection));
   REX_TRACE_IMPORT_REACH(__imp__RtlEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
   // GuestPtr adds the 0xE0000000 view's host offset (Apple silicon), as
@@ -696,6 +698,7 @@ extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlEnterCriticalSection(
     "__imp__RtlEnterCriticalSection", &__imp__RtlEnterCriticalSection);
 extern "C" REX_FUNC(__imp__RtlTryEnterCriticalSection) {
+  rex::cs_scheduler::Kernel scheduled(reinterpret_cast<uintptr_t>(&__imp__RtlTryEnterCriticalSection));
   REX_TRACE_IMPORT_REACH(__imp__RtlTryEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
   ctx.r3.u64 = RtlTryEnterCriticalSection(

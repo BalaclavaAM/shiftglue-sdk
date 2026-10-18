@@ -611,7 +611,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
-  const bool trace = session_probe::Enabled();
+  const bool trace = session_probe::ExternalEnabled();
   if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 3, obj_attribs.guest_address()); auto n = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr); auto path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), n); session_probe::Scalar(session_probe::Kind::kIoReadRequest, 0, session_probe::Digest(path.data(), path.size())); }
   auto live = [&]() -> u32 {
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
@@ -668,7 +668,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
-  const bool trace = session_probe::Enabled();
+  const bool trace = session_probe::ExternalEnabled();
   if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 4, (uint64_t(file_handle) << 32) | length); session_probe::Scalar(session_probe::Kind::kIoReadRequest, restart_scan, file_info_ptr.guest_address()); auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name); session_probe::Scalar(session_probe::Kind::kIoReadRequest, 0, session_probe::Digest(name.data(), name.size())); }
   auto live = [&]() -> u32 {
   if (length < 72) {

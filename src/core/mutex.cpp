@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -20,6 +21,11 @@
 #include <rex/perf/counter.h>
 #include <rex/thread/mutex.h>
 #include <rex/thread/sync_census.h>
+#if defined(REXGLUE_ENABLE_CS_PROBES) && defined(_WIN32)
+#include "cs_scheduler_internal.h"
+#include <windows.h>
+#include <set>
+#endif
 
 #if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
 #include <dlfcn.h>
@@ -46,6 +52,31 @@ REXCVAR_DEFINE_BOOL(guest_reservation_sections_unlocked, true, "Kernel",
 
 namespace rex::thread {
 namespace {
+#if defined(REXGLUE_ENABLE_CS_PROBES) && defined(_WIN32)
+void LockScheduled(std::recursive_mutex& mutex) {
+  while(!mutex.try_lock()) {
+    // shortcut: requires the pinned MSVC STL layout; replace on STL changes.
+    // Backend worker metadata locks may briefly
+    // overlap the permit. They must finish natively, without a guest switch.
+    static_assert(sizeof(std::recursive_mutex)==sizeof(_Mtx_internal_imp_t));
+    static_assert(alignof(std::recursive_mutex)==alignof(_Mtx_internal_imp_t));
+    static_assert(std::is_standard_layout_v<std::recursive_mutex>);
+    auto* native=reinterpret_cast<_Mtx_internal_imp_t*>(&mutex);
+    const auto owner=_InterlockedCompareExchange(&native->_Thread_id,0,0);
+    // MSVC clears/publishes the owner separately from the SRW lock.
+    // An unset owner is a native transition, never a guest scheduling point.
+    if(owner<=0) { std::this_thread::yield(); continue; }
+    if(!cs_scheduler::ParkedNativeThread(uint32_t(owner))) {
+      static std::set<long> reported;
+      if(reported.insert(owner).second) {
+        REXLOG_INFO("CS_NATIVE_LOCK external_owner={}",owner);
+      }
+      mutex.lock(); return;
+    }
+    cs_scheduler::Point(UINT64_C(0x43534D5554455801),cs_scheduler::PointKind::kWait,true);
+  }
+}
+#endif
 std::string DescribeSite(const void* site) {
 #ifdef REX_CRITICAL_REGION_DLADDR
   Dl_info info = {};
@@ -84,7 +115,11 @@ __attribute__((noinline))
 void global_critical_region::LockContended() {
   PROFILE_CRITICAL_REGION_CONTENTION();
   const auto start = std::chrono::steady_clock::now();
-  mutex().lock();
+#if defined(REXGLUE_ENABLE_CS_PROBES) && defined(_WIN32)
+  if (cs_scheduler::InActor()) LockScheduled(mutex());
+  else
+#endif
+    mutex().lock();
   const int64_t waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - start)
                                 .count();
@@ -110,7 +145,11 @@ void global_critical_region::LockCensus(LockSource source) {
   // As LockContended, without the wait log (its call-site depth is fixed).
   PROFILE_CRITICAL_REGION_CONTENTION();
   const auto start = std::chrono::steady_clock::now();
-  mutex().lock();
+#if defined(REXGLUE_ENABLE_CS_PROBES) && defined(_WIN32)
+  if (cs_scheduler::InActor()) LockScheduled(mutex());
+  else
+#endif
+    mutex().lock();
   const int64_t waited_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - start)
                                 .count();

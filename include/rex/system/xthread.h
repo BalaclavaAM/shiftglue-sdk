@@ -413,6 +413,9 @@ class XThread : public XObject {
   void RundownAPCs();
 
   rex::thread::WaitHandle* GetWaitHandle() override { return thread_.get(); }
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  std::unique_ptr<rex::thread::Event> verification_join_;
+#endif
 
   CreationParams creation_params_ = {0, 0, 0, 0, 0, 0};
 

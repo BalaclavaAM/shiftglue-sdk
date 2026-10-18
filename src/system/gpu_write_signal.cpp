@@ -1,4 +1,5 @@
 #include <rex/system/gpu_write_signal.h>
+#include <rex/cs_scheduler.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -29,6 +30,13 @@ void SignalGpuWrite() {
 }
 
 void WaitForGpuWrite(uint32_t seen, std::chrono::microseconds timeout) {
+  if (cs_scheduler::InActor()) {
+    const auto start=cs_scheduler::Now();
+    const auto ns=uint64_t(timeout.count())*1000;
+    while (g_sequence.load()==seen && cs_scheduler::Now()-start<ns)
+      cs_scheduler::Point(seen,cs_scheduler::PointKind::kWait,true,100000);
+    return;
+  }
   std::unique_lock<std::mutex> lock(g_mutex);
   g_waiters.fetch_add(1);
   g_condition.wait_for(lock, timeout, [seen] { return g_sequence.load() != seen; });

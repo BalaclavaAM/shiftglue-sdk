@@ -1,4 +1,5 @@
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -216,6 +217,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        if (cs_scheduler::Enabled()) {
+          cs_scheduler::Actor scheduled(cs_scheduler::kVblank);
+          const uint64_t period = 1000000000 / uint64_t(Fh1GuestVblankHzForRenderLimit(
+              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit), REXCVAR_GET(video_mode_refresh_rate)));
+          uint64_t next = cs_scheduler::Now() + period;
+          while (vsync_worker_running_) {
+            while (cs_scheduler::Now() >= next) { MarkVblank(); next += period; }
+            cs_scheduler::Point(0, cs_scheduler::PointKind::kWait, true, next - cs_scheduler::Now());
+          }
+          return 0;
+        }
         if (session_probe::Enabled()) session_probe::SetHostRole(2);
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);

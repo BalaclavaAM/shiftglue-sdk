@@ -113,7 +113,7 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {
-  const bool tracing = session_probe::Enabled();
+  const bool tracing = session_probe::ExternalEnabled();
   const uint64_t trace_key = (uint64_t(handle()) << 32) | buffer_guest_address;
   if (tracing) {
     session_probe::Scalar(session_probe::Kind::kIoReadRequest, trace_key, buffer_length);
@@ -286,7 +286,7 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   X_STATUS result = file_->WriteSync(
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);
-  if (session_probe::Enabled()) {
+  if (session_probe::ExternalEnabled()) {
     session_probe::Scalar(session_probe::Kind::kIoWrite, (uint64_t(handle()) << 32) | buffer_guest_address, byte_offset);
     session_probe::Scalar(session_probe::Kind::kIoData, buffer_length,
         session_probe::Digest(memory()->TranslateVirtual(buffer_guest_address), buffer_length));

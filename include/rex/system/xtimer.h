@@ -13,6 +13,10 @@
 #include <rex/system/xobject.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread.h>
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+#include <thread>
+#include <atomic>
+#endif
 
 namespace rex::system {
 
@@ -43,10 +47,20 @@ class XTimer : public XObject {
   X_STATUS Cancel();
 
  protected:
-  rex::thread::WaitHandle* GetWaitHandle() override { return timer_.get(); }
+  rex::thread::WaitHandle* GetWaitHandle() override {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    if (verification_event_) return verification_event_.get();
+#endif
+    return timer_.get();
+  }
 
  private:
   std::unique_ptr<rex::thread::Timer> timer_;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  std::unique_ptr<rex::thread::Event> verification_event_;
+  std::thread verification_timer_;
+  std::atomic<bool> verification_stop_{false}, verification_done_{true};
+#endif
 
   XThread* callback_thread_ = nullptr;
   uint32_t callback_routine_ = 0;

@@ -25,6 +25,7 @@
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
+#include <rex/cs_scheduler.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
@@ -404,6 +405,7 @@ void _translate_args_to_guest(PPCContext& ctx, uint8_t* base, std::tuple<TArgs..
 
 template <auto Func>
 __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
+  cs_scheduler::Kernel scheduled(reinterpret_cast<uintptr_t>(Func));
   using ret_t = decltype(std::apply(Func, function_args(Func)));
 
   auto args = function_args(Func);
@@ -439,6 +441,7 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
 
 template <typename T, typename TFunction, typename... TArgs>
 T GuestToHostFunction(const TFunction& func, TArgs&&... argv) {
+  cs_scheduler::Callback scheduled_callback;
   auto args = std::make_tuple(std::forward<TArgs>(argv)...);
 
   auto* ts = rex::runtime::ThreadState::Get();

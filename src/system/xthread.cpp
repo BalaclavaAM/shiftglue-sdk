@@ -40,6 +40,7 @@
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/thread.h>
 #include <rex/vec128.h>
 
@@ -257,6 +258,9 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
 }
 
 XThread::~XThread() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_join_) cs_scheduler::MapWait(thread_.get(),nullptr);
+#endif
   if (main_fiber_) {
     main_fiber_->Destroy();
     main_fiber_ = nullptr;
@@ -496,6 +500,7 @@ void XThread::FreeStack() {
 }
 
 X_STATUS XThread::Create() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   // Thread kernel object.
   if (!CreateNative<X_KTHREAD>()) {
     REXSYS_WARN("Unable to allocate thread object");
@@ -633,7 +638,7 @@ X_STATUS XThread::Create() {
     }
     session_probe::SetThreadTag(thread_id_, creation_params_.start_address);
     current_xthread_tls_ = this;
-    running_ = true;
+    if (!cs_scheduler::Enabled()) running_ = true;
     Execute();
     running_ = false;
     current_xthread_tls_ = nullptr;
@@ -645,6 +650,12 @@ X_STATUS XThread::Create() {
     ReleaseHandle();
   });
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (thread_ && cs_scheduler::Enabled()) {
+    verification_join_=rex::thread::Event::CreateManualResetEvent(false);
+    cs_scheduler::MapWait(thread_.get(),verification_join_.get());
+  }
+#endif
   if (!thread_) {
     // TODO(benvanik): translate error?
     REXSYS_ERROR("CreateThread failed");
@@ -687,6 +698,7 @@ X_STATUS XThread::Create() {
 }
 
 X_STATUS XThread::Exit(int exit_code) {
+  cs_scheduler::Actor exit_schedule(UINT64_C(0x8000000000010000) | thread_id_);
   // This may only be called on the thread itself.
   assert_true(XThread::GetCurrentThread() == this);
   // Keep the object alive until Thread::Exit() transitions the host thread
@@ -732,9 +744,13 @@ X_STATUS XThread::Exit(int exit_code) {
   PROFILE_THREAD_EXIT();
 
   running_ = false;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_join_) verification_join_->Set();
+#endif
   ReleaseHandle();
 
   // NOTE: this does not return!
+  cs_scheduler::Detach();
   rex::thread::Thread::Exit(exit_code);
   return X_STATUS_SUCCESS;
 }
@@ -756,9 +772,14 @@ X_STATUS XThread::Terminate(int exit_code) {
     auto self = retain_object(this);
     FreeStack();
     ReleaseHandle();
+    cs_scheduler::Detach();
     rex::thread::Thread::Exit(exit_code);
   } else {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    cs_scheduler::Terminate(thread_id_,[&] { thread_->Terminate(exit_code); });
+#else
     thread_->Terminate(exit_code);
+#endif
     FreeStack();
     ReleaseHandle();
   }
@@ -767,6 +788,8 @@ X_STATUS XThread::Terminate(int exit_code) {
 }
 
 void XThread::Execute() {
+  cs_scheduler::Actor scheduled(thread_id_);
+  if (cs_scheduler::Enabled()) running_ = true;
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
 
@@ -1210,6 +1233,17 @@ uint32_t XThread::suspend_count() {
 X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   uint32_t unused_host_suspend_count = 0;
+  if (cs_scheduler::Enabled()) {
+    const uint32_t previous=guest_thread->suspend_count;
+    if(out_suspend_count) *out_suspend_count=previous;
+    if(previous) guest_thread->suspend_count=previous-1;
+    if(previous==1) {
+      cs_scheduler::Resume(thread_id_);
+      // Initial CREATE_SUSPENDED still uses the native startup barrier.
+      if(!running_) thread_->Resume(&unused_host_suspend_count);
+    }
+    return X_STATUS_SUCCESS;
+  }
 
 #if REX_PLATFORM_WIN32
   uint8_t previous_suspend_count =
@@ -1261,6 +1295,11 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   uint32_t unused_host_suspend_count = 0;
   // Wrapped to 0 - treat as not suspended.
   if (guest_thread->suspend_count == 0) {
+    cs_scheduler::Resume(thread_id_);
+    return X_STATUS_SUCCESS;
+  }
+  if (cs_scheduler::Enabled()) {
+    cs_scheduler::Suspend(thread_id_);
     return X_STATUS_SUCCESS;
   }
   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
@@ -1732,7 +1771,11 @@ void XHostThread::Execute() {
                handle(), thread_name_, thread_->system_id());
 
   // Let the kernel know we are starting.
-  kernel_state_->OnThreadExecute(this);
+  {
+    cs_scheduler::Actor scheduled(UINT64_C(0x8000000000010000) | thread_id_);
+    if (cs_scheduler::Enabled()) running_ = true;
+    kernel_state_->OnThreadExecute(this);
+  }
 
   int ret = host_fn_();
 

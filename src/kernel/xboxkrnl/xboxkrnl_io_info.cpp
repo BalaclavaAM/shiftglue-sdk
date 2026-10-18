@@ -107,7 +107,7 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
-  const bool trace = session_probe::Enabled();
+  const bool trace = session_probe::ExternalEnabled();
   if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 1, (uint64_t(file_handle) << 32) | info_class); session_probe::Scalar(session_probe::Kind::kIoReadRequest, info_ptr.guest_address(), info_length); }
   auto live = [&]() -> u32 {
   uint32_t minimum_length = GetQueryFileInfoMinimumLength(info_class);
@@ -387,7 +387,7 @@ uint32_t GetQueryVolumeInfoMinimumLength(uint32_t info_class) {
 u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
                                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                        mapped_void info_ptr, u32 info_length, u32 info_class) {
-  const bool trace = session_probe::Enabled();
+  const bool trace = session_probe::ExternalEnabled();
   if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 2, (uint64_t(file_handle) << 32) | info_class); session_probe::Scalar(session_probe::Kind::kIoReadRequest, info_ptr.guest_address(), info_length); }
   auto live = [&]() -> u32 {
   uint32_t minimum_length = GetQueryVolumeInfoMinimumLength(info_class);

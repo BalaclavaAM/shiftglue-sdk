@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  * @file        kernel/crt/threading.cpp
  * @brief       rexcrt hooks for XAPI fiber functions
@@ -88,6 +89,7 @@ static void FiberEntryPoint(void* raw_arg) {
   // Fiber returned (shouldn't per XDK) -- safe fallback
   if (thread->main_fiber()) {
     PROFILE_FIBER_LEAVE;
+    cs_scheduler::Callback callback_schedule;
     rex::thread::Fiber::SwitchTo(thread->main_fiber());
   }
   REXKRNL_WARN("FiberEntryPoint: fiber function returned with no main fiber - terminating");
@@ -325,6 +327,7 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
   }
 
   // Host fiber switch -- suspends here, resumes when switched back
+  cs_scheduler::Callback callback_schedule;
   rex::thread::Fiber::SwitchTo(target_info->host_fiber);
   // Resumed: non-volatile regs and stack state already restored by the fiber that switched back.
 }

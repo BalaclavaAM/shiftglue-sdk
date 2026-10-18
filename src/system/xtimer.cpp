@@ -15,14 +15,27 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 
 namespace rex::system {
 
 XTimer::XTimer(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
-XTimer::~XTimer() = default;
+XTimer::~XTimer() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_event_) Cancel();
+#endif
+}
 
 void XTimer::Initialize(uint32_t timer_type) {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (cs_scheduler::Enabled()) {
+    assert_true(timer_type <= 1);
+    verification_event_ = timer_type ? rex::thread::Event::CreateAutoResetEvent(false) :
+                                      rex::thread::Event::CreateManualResetEvent(false);
+    return;
+  }
+#endif
   assert_false(timer_);
   switch (timer_type) {
     case 0:  // NotificationTimer
@@ -46,6 +59,35 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
   if (resume) {
     return X_STATUS_TIMER_RESUME_IGNORED;
   }
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_event_) {
+    Cancel(); verification_event_->Reset();
+    verification_stop_=false; verification_done_=false;
+    const auto caller=XThread::GetCurrentThread();
+    const uint64_t deadline=due_time<0 ? cs_scheduler::Now()+uint64_t(-due_time)*100 :
+        (uint64_t(due_time)>cs_scheduler::Epoch() ? (uint64_t(due_time)-cs_scheduler::Epoch())*100 : cs_scheduler::Now());
+    const uint64_t tag=UINT64_C(0x8000000100000000)|handle();
+    verification_timer_=std::thread([this,caller,deadline,tag,period_ms,routine,routine_arg] {
+      cs_scheduler::Actor scheduled(tag);
+      uint64_t next=deadline;
+      while (!verification_stop_) {
+        if (cs_scheduler::Now()<next) {
+          cs_scheduler::Point(0,cs_scheduler::PointKind::kWait,true,next-cs_scheduler::Now());
+          continue;
+        }
+        verification_event_->Set();
+        if (routine) {
+          const auto time=cs_scheduler::Epoch()+cs_scheduler::Now()/100;
+          caller->EnqueueApc(routine,routine_arg,uint32_t(time),uint32_t(time>>32));
+        }
+        if (!period_ms) break;
+        next+=uint64_t(period_ms)*1000000;
+      }
+      verification_done_=true;
+    });
+    return X_STATUS_SUCCESS;
+  }
+#endif
 
   period_ms = chrono::Clock::ScaleGuestDurationMillis(period_ms);
   WinSystemClock::time_point due_tp;
@@ -96,6 +138,18 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
 }
 
 X_STATUS XTimer::Cancel() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_event_) {
+    verification_stop_=true;
+    cs_scheduler::Wake(UINT64_C(0x8000000100000000)|handle());
+    while (!verification_done_) {
+      if (cs_scheduler::InActor()) cs_scheduler::Point(0,cs_scheduler::PointKind::kWait,true);
+      else std::this_thread::yield();
+    }
+    if (verification_timer_.joinable()) verification_timer_.join();
+    return X_STATUS_SUCCESS;
+  }
+#endif
   return timer_->Cancel() ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
 }
 

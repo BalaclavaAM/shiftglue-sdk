@@ -18,6 +18,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
@@ -111,6 +112,7 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 }
 
 void AudioSystem::WorkerThreadMain() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kAudio);
   if (session_probe::Enabled()) session_probe::SetHostRole(6);
   // Initialize driver and ringbuffer.
   Initialize();
@@ -125,10 +127,12 @@ void AudioSystem::WorkerThreadMain() {
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
     std::pair<rex::thread::WaitResult, size_t> result{};
-    if (!(session_probe::Enabled() && session_probe::Replaying()))
+    if (!(session_probe::ExternalEnabled() && session_probe::Replaying()))
       result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
                                      std::chrono::milliseconds(500));
-    if (session_probe::Enabled()) {
+    else cs_scheduler::ReplayExternalWait();
+    if (cs_scheduler::Enabled()) cs_scheduler::Point(0,cs_scheduler::PointKind::kExternalReturn,true);
+    if (session_probe::ExternalEnabled()) {
       const auto packed = session_probe::Scalar(session_probe::Kind::kAudioPump, 0,
           (uint64_t(result.first) << 32) | uint32_t(result.second), true);
       result = {rex::thread::WaitResult(packed >> 32), uint32_t(packed)};

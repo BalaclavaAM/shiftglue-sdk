@@ -20,6 +20,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/cert_monitor.h>
@@ -193,7 +194,11 @@ XboxkrnlModule::XboxkrnlModule(Runtime* emulator, KernelState* kernel_state)
   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16,
                                    chrono::Clock::QueryGuestUptimeMillis());
   memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 20, 0);
-  timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
+  if (cs_scheduler::Enabled()) {
+    cs_scheduler::SetTimestampWriter([lpKeTimeStampBundle](uint64_t ms) {
+      memory::store_and_swap<uint32_t>(lpKeTimeStampBundle + 16, uint32_t(ms));
+    });
+  } else timestamp_timer_ = rex::thread::HighResolutionTimer::CreateRepeating(
       std::chrono::milliseconds(1), [lpKeTimeStampBundle]() {
         if (session_probe::Enabled()) {
           session_probe::SetHostRole(1);

@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  * @file        system/function_dispatcher.cpp
  * @brief       Guest function dispatch coordinator for recompiled code
@@ -83,6 +84,7 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   ctx->lr = 0xBCBCBCBC;
 
   ctx->dispatch_address = address;
+  cs_scheduler::Callback callback_schedule;
   fn(*ctx, memory_->virtual_membase());
   ctx->dispatch_address = 0;
 
