@@ -51,11 +51,12 @@ class Fh1FrameDump {
                uint64_t frame, std::filesystem::path path);
   ~Fh1FrameDump();
 
-  // Frame requested by fh1_frame_dump_frame, 0 when none.
+  // Consumes the request: 0 when none, UINT64_MAX for the next complete frame.
   static uint64_t RequestedFrame();
   static std::filesystem::path RequestedPath();
 
   bool recording() const { return recording_; }
+  bool done() const { return done_; }
   // At every swap, `frame` being the swap's frame.
   void OnSwap(uint64_t frame, uint32_t frontbuffer_address);
   // A range a draw is about to read from the GPU mirror (already requested).

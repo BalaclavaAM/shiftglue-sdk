@@ -2566,15 +2566,9 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     untile_select_all_ = untile_tiling_ && !(REXCVAR_GET(fh1_debug_untile) & 1);
   }
 
-  // Frame dumps record and compare the 1x guest-memory mirror. One made
-  // earlier at 1x (it only reads guest memory and the shared memory) stays.
+  // Dumps use the 1x guest layout; abort if the resolution scale changes.
   if (draw_resolution_scale_x != 1 || draw_resolution_scale_y != 1) {
     frame_dump_.reset();
-  } else if (const uint64_t dump_frame = frame_dump_ ? 0 : Fh1FrameDump::RequestedFrame()) {
-    frame_dump_ = std::make_unique<Fh1FrameDump>(
-        *this, *register_file_, *memory_,
-        std::make_unique<VulkanFh1FrameDumpMirror>(*this, *shared_memory_), dump_frame,
-        Fh1FrameDump::RequestedPath());
   }
   return true;
 }
@@ -3733,6 +3727,20 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   if (d3d12::Fh1FrameCensus::OrderedEnabled())
     d3d12::Fh1FrameCensus::ObserveOrderedSwap(observation_frame_sequence_, presented_output_frames_);
 #endif
+  if (frame_dump_ && frame_dump_->done()) frame_dump_.reset();
+  if (!frame_dump_ && texture_cache_->draw_resolution_scale_x() == 1 &&
+      texture_cache_->draw_resolution_scale_y() == 1) {
+    if (const uint64_t requested = Fh1FrameDump::RequestedFrame()) {
+      if (record_split()) {
+        REXGPU_WARN("FH1 frame dumps require gpu_record_thread=false; request ignored");
+      } else {
+        frame_dump_ = std::make_unique<Fh1FrameDump>(
+            *this, *register_file_, *memory_,
+            std::make_unique<VulkanFh1FrameDumpMirror>(*this, *shared_memory_), requested,
+            Fh1FrameDump::RequestedPath());
+      }
+    }
+  }
   if (frame_dump_) {
     frame_dump_->OnSwap(observation_frame_sequence_, frontbuffer_ptr);
   }
