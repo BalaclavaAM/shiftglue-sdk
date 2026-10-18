@@ -100,6 +100,22 @@ endif()
 
 # Discover tests
 include(Catch)
+if(UNIX AND NOT APPLE)
+    # Compile the production backend into the executable so --wrap intercepts
+    # its mmap calls as well as the test's calls (not calls inside rexruntime).
+    add_executable(memory_posix_tests
+        core/memory_posix_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/memory_posix.cpp
+    )
+    target_link_libraries(memory_posix_tests PRIVATE rexruntime Catch2::Catch2WithMain)
+    target_link_options(memory_posix_tests PRIVATE -Wl,--wrap=mmap)
+    set_target_properties(memory_posix_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON
+    )
+    catch_discover_tests(memory_posix_tests TEST_PREFIX "unit." PROPERTIES LABELS "unit" TIMEOUT 60)
+endif()
 catch_discover_tests(unit_tests
     TEST_PREFIX "unit."
     PROPERTIES

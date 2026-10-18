@@ -239,7 +239,14 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
-    return result;
+    if (!base_address || result == base_address) {
+      return result;
+    }
+    // Kernels before 4.17 may ignore MAP_FIXED_NOREPLACE and relocate the mapping.
+    if (munmap(result, length) != 0) {
+      return nullptr;
+    }
+    errno = EEXIST;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
   // Handle EEXIST: address already has a mapping (e.g., from prior Reserve)
