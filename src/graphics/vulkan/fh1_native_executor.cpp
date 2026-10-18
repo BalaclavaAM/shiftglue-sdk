@@ -16,6 +16,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -24,6 +25,13 @@
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
 
+
+REXCVAR_DEFINE_STRING(vulkan_shader_discovery_dir, "", "GPU/Vulkan",
+                      "Local output directory for one frame's translated shaders and draws.jsonl")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_shader_discovery_frame, 0, "GPU/Vulkan",
+                     "Swap count to discover shaders on (0 disables discovery)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "Above 1x resolution scale, keep the guest's 2x and 4x MSAA surfaces as "
@@ -2310,6 +2318,58 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   }
   id &= ~(uint64_t(1) << 63);
   return id | 1;
+}
+
+void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                                          const VulkanShader::VulkanTranslation* pixel) {
+  const auto& dir = REXCVAR_GET(vulkan_shader_discovery_dir);
+  if (dir.empty() || REXCVAR_GET(vulkan_shader_discovery_frame) <= 0) return;
+  if (frame_ != uint64_t(REXCVAR_GET(vulkan_shader_discovery_frame))) {
+    if (shader_discovery_draws_.is_open()) shader_discovery_draws_.close();
+    return;
+  }
+  const auto root = rex::to_path(dir);
+  if (!shader_discovery_started_) {
+    shader_discovery_started_ = true;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (!error) shader_discovery_draws_.open(root / "draws.jsonl", std::ios::trunc);
+    if (!shader_discovery_draws_) REXGPU_WARN("Cannot write shader discovery to {}", dir);
+  }
+  if (!shader_discovery_draws_) return;
+  auto capture = [&](const VulkanShader::VulkanTranslation* translation) {
+    if (!translation || !translation->is_valid()) return std::string();
+    const auto& bytes = translation->replaced_binary().empty()
+                            ? translation->translated_binary() : translation->replaced_binary();
+    const auto name = VulkanShaderOverrideFilename(translation->shader().ucode_data_hash(),
+                                                    translation->modification(), bytes);
+    if (shader_discovery_written_.insert(name).second) {
+      std::ofstream out(root / name, std::ios::binary);
+      if (!out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size())) {
+        REXGPU_WARN("Cannot write discovered shader {}", name);
+        return std::string();
+      }
+    }
+    return name;
+  };
+  const auto vs = capture(vertex), ps = capture(pixel);
+  shader_discovery_draws_ << fmt::format(
+      "{{\"frame\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},\"surfaces\":[",
+      frame_, vs, ps, hud_draw_);
+  bool first = true;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(bound_bits_ & (1u << i))) continue;
+    const auto& key = pending_keys_[i];
+    const auto* surface = FindSurface(key.Pack());
+    if (!surface) continue;
+    shader_discovery_draws_ << fmt::format(
+        "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
+        "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
+        first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
+        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
+    first = false;
+  }
+  shader_discovery_draws_ << "]}\n";
 }
 
 void Fh1NativeExecutor::BeginDrawRendering() {

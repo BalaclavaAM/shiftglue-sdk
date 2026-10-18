@@ -6891,6 +6891,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   }
 
   DrawCostMark(kCostBeginRendering);
+  if (fh1_native_executor_) {
+    fh1_native_executor_->DiscoverShaderDraw(vertex_shader_translation, pixel_shader_translation);
+  }
   uint64_t draw_gpu_timing = UINT64_MAX;
   if (fh1_native_executor_ && REXCVAR_GET(fh1_native_gpu_profile_draws)) {
     draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(

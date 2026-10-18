@@ -71,6 +71,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
     vulkan/shader_overrides.cpp
+    vulkan/shader_override_files.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
 )
@@ -228,6 +229,7 @@ if(REXGLUE_USE_VULKAN)
         target_link_libraries(${rexgpu_fh1_target} PRIVATE
             Vulkan::Headers
             glslang::SPIRV
+            SPIRV-Tools-static
             GPUOpen::VulkanMemoryAllocator
             glslang
             MachineIndependent

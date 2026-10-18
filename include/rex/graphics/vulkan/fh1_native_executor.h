@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -23,6 +25,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
+#include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/thread.h>
 #include <rex/ui/vulkan/api.h>
@@ -104,6 +107,9 @@ class Fh1NativeExecutor {
   VkExtent2D draw_shading_rate() const { return draw_shading_rate_; }
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
+  // Local one-frame shader identities and the actual bound render surfaces.
+  void DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                          const VulkanShader::VulkanTranslation* pixel);
   // After BindTargets: the draw has no depth, stencil or color target to use.
   bool BoundNothing() const { return bound_bits_ == 0; }
   void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }
@@ -618,6 +624,9 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
+  std::ofstream shader_discovery_draws_;
+  bool shader_discovery_started_ = false;
+  std::set<std::string> shader_discovery_written_;
   // DrawRenderingId(bound_bits_), set by BindTargets for BeginDrawRendering.
   uint64_t bound_rendering_id_ = 0;
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.

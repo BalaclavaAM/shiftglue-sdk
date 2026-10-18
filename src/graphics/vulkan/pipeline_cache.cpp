@@ -49,6 +49,7 @@
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shader_overrides.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -124,6 +125,10 @@ REXCVAR_DEFINE_STRING(vulkan_shader_override_dir, "", "GPU/Vulkan",
                       "Directory of shader_<guest hash>_<modification>_<translated SPIR-V "
                       "hash>.spv replacements, checked before the built-in ones (for writing "
                       "new overrides)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_override_dirs, "", "GPU/Vulkan",
+                      "Semicolon-separated shader replacement directories, first valid exact "
+                      "identity wins, ahead of vulkan_shader_override_dir and built-in edits")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
@@ -2080,26 +2085,21 @@ void VulkanPipelineCache::ApplyShaderOverride(VulkanShader::VulkanTranslation& t
   const uint64_t translated_hash = XXH3_64bits(translated.data(), translated.size());
   std::vector<uint8_t> replacement;
   std::string source;
-  const std::string& dir = REXCVAR_GET(vulkan_shader_override_dir);
-  if (!dir.empty()) {
-    const std::filesystem::path path =
-        rex::to_path(dir) / fmt::format("shader_{:016X}_{:016X}_{:016X}.spv",
-                                        shader.ucode_data_hash(), translation.modification(),
-                                        translated_hash);
-    if (FILE* file = filesystem::OpenFile(path, "rb")) {
-      std::fseek(file, 0, SEEK_END);
-      const long size = std::ftell(file);
-      std::fseek(file, 0, SEEK_SET);
-      if (size > 0) {
-        replacement.resize(size_t(size));
-        if (std::fread(replacement.data(), 1, replacement.size(), file) != replacement.size()) {
-          replacement.clear();
-        }
-      }
-      std::fclose(file);
-      source = rex::path_to_utf8(path);
-    }
+  std::vector<std::filesystem::path> roots;
+  const auto& dirs = REXCVAR_GET(vulkan_shader_override_dirs);
+  for (size_t start = 0; start < dirs.size();) {
+    const auto end = dirs.find(';', start);
+    const auto dir = dirs.substr(start, end == std::string::npos ? end : end - start);
+    if (!dir.empty()) roots.push_back(rex::to_path(dir));
+    if (end == std::string::npos) break;
+    start = end + 1;
   }
+  if (const auto& dir = REXCVAR_GET(vulkan_shader_override_dir); !dir.empty()) {
+    roots.push_back(rex::to_path(dir));
+  }
+  replacement = LoadVulkanShaderOverride(
+      roots, shader.ucode_data_hash(), translation.modification(), translated, source,
+      [](const std::string& warning) { REXGPU_WARN("Vulkan shader override {}", warning); });
   if (replacement.empty()) {
     for (const VulkanShaderOverride& entry : GetBuiltInVulkanShaderOverrides()) {
       if (entry.type != shader.type() || entry.ucode_data_hash != shader.ucode_data_hash() ||

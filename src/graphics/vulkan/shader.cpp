@@ -40,11 +40,21 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
   shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   shader_module_create_info.pNext = nullptr;
   shader_module_create_info.flags = 0;
-  shader_module_create_info.codeSize = translated_binary().size();
-  shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(translated_binary().data());
-  if (vulkan_device->functions().vkCreateShaderModule(vulkan_device->device(),
-                                                      &shader_module_create_info, nullptr,
-                                                      &shader_module_) != VK_SUCCESS) {
+  auto create_module = [&] {
+    shader_module_create_info.codeSize = translated_binary().size();
+    shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(translated_binary().data());
+    return vulkan_device->functions().vkCreateShaderModule(
+        vulkan_device->device(), &shader_module_create_info, nullptr, &shader_module_);
+  };
+  VkResult result = create_module();
+  if (result != VK_SUCCESS && !replaced_binary_.empty()) {
+    REXGPU_WARN("Shader override rejected by the driver; restoring {:016X}/{:016X}",
+                shader().ucode_data_hash(), modification());
+    ReplaceTranslatedBinary(replaced_binary_);
+    replaced_binary_.clear();
+    result = create_module();
+  }
+  if (result != VK_SUCCESS) {
     REXGPU_ERROR(
         "VulkanShader::VulkanTranslation: Failed to create a Vulkan shader "
         "module for shader {:016X} modification {:016X}",

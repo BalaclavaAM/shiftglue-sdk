@@ -340,6 +340,19 @@ if(REXGLUE_USE_VULKAN)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spirv-tools/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
+    # Validate mod bytecode on every platform, including packaged runtimes
+    # without a Vulkan SDK installed. The validator is linked statically.
+    set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spirv-headers")
+    set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+    set(SPIRV_TOOLS_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+    set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+    # Consumers already select their host Python for glslang's older finder.
+    if(PYTHON_EXECUTABLE AND NOT Python3_EXECUTABLE)
+        set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}")
+    endif()
+    add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
+
     # glslang/SPIRV - SPIR-V code generation for shader translation
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
     set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
