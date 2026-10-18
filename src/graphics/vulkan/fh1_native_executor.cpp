@@ -93,6 +93,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
+                    "Read completed 32_FLOAT resolves of 4 KB or less back to guest RAM for "
+                    "the title's CPU auto exposure")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
@@ -3109,13 +3113,14 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
-    // pixel's first host pixel, and read back. So are small resolves, without
-    // the readback: the 32x32 scene luminance the auto exposure samples is
+    // pixel's first host pixel, and read back. Small resolves also need an
+    // unscaled copy: the 32x32 scene luminance the auto exposure samples is
     // also read at guest size, and stale there it pins the exposure at its
     // daytime limit, overexposing the screen until about noon (#444).
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
     const bool one_off =
         scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+    bool unscaled_copy_complete = scale_ == 1 && complete;
     if (scale_ > 1 && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
@@ -3136,6 +3141,15 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
             range, true);
       }
       if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
+      unscaled_copy_complete = complete && unscaled_complete;
+    }
+    // GPU validity tracking preserves this resolve, but CPU exposure reads
+    // still need its bytes in guest RAM (seen at lr 830A4880 on Apple silicon).
+    if (written_address && unscaled_copy_complete && extent_length &&
+        extent_length <= kUnscaledCopyMaxLength &&
+        plan.info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT &&
+        REXCVAR_GET(fh1_readback_small_float_resolves)) {
+      QueueResolveReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
