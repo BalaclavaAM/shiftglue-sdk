@@ -1041,6 +1041,7 @@ class Presenter {
   std::mutex presentation_pacing_mutex_;
   PresentationDeadlineScheduler presentation_deadline_scheduler_;
   uint64_t last_presented_refresh_sequence_ = UINT64_MAX;
+  bool last_presented_ui_ = false;
   int64_t last_present_time_ns_ = 0;
 
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;

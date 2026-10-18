@@ -104,7 +104,7 @@ ImGuiDrawer::~ImGuiDrawer() {
     window_->RemoveInputListener(this);
     if (internal_state_) {
       ImGui::SetCurrentContext(internal_state_);
-      if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
+      if (mouse_buttons_) {
         window_->ReleaseMouse();
       }
     }
@@ -429,7 +429,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   if (reset_mouse_position_after_next_frame_) {
     reset_mouse_position_after_next_frame_ = false;
-    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
   }
 
   // Detaching is deferred if the last dialog is removed during drawing, perform
@@ -524,11 +524,12 @@ void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
     }
   }
   if (button >= 0 && button < std::size(io.MouseDown)) {
-    if (!io.MouseDown[button]) {
-      if (!ImGui::IsAnyMouseDown()) {
+    if (!(mouse_buttons_ & (1u << button))) {
+      if (!mouse_buttons_) {
         window_->CaptureMouse();
       }
-      io.MouseDown[button] = true;
+      mouse_buttons_ |= 1u << button;
+      io.AddMouseButtonEvent(button, true);
     }
   }
 }
@@ -556,9 +557,10 @@ void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
     }
   }
   if (button >= 0 && button < std::size(io.MouseDown)) {
-    if (io.MouseDown[button]) {
-      io.MouseDown[button] = false;
-      if (!ImGui::IsAnyMouseDown()) {
+    if (mouse_buttons_ & (1u << button)) {
+      mouse_buttons_ &= ~(1u << button);
+      io.AddMouseButtonEvent(button, false);
+      if (!mouse_buttons_) {
         window_->ReleaseMouse();
       }
     }
@@ -568,7 +570,7 @@ void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
 void ImGuiDrawer::OnMouseWheel(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
-  io.MouseWheel += float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent);
+  io.AddMouseWheelEvent(0, float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent));
 }
 
 void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
@@ -579,8 +581,10 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
     // The latest pointer needs to be controlling the ImGui mouse.
     if (touch_pointer_id_ == TouchEvent::kPointerIDNone) {
       // Switching from the mouse to touch input.
-      if (ImGui::IsAnyMouseDown()) {
-        std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+      if (mouse_buttons_) {
+        for (int button = 0; button < IM_ARRAYSIZE(io.MouseDown); ++button)
+          if (mouse_buttons_ & (1u << button)) io.AddMouseButtonEvent(button, false);
+        mouse_buttons_ = 0;
         window_->ReleaseMouse();
       }
     }
@@ -592,24 +596,25 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
   }
   UpdateMousePosition(e.x(), e.y());
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
-    io.MouseDown[0] = false;
+    io.AddMouseButtonEvent(0, false);
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     // Make sure that after a touch, the ImGui mouse isn't hovering over
     // anything.
     reset_mouse_position_after_next_frame_ = true;
   } else {
-    io.MouseDown[0] = true;
+    io.AddMouseButtonEvent(0, true);
     reset_mouse_position_after_next_frame_ = false;
   }
 }
 
 void ImGuiDrawer::ClearInput() {
   auto& io = GetIO();
-  if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
+  if (mouse_buttons_) {
     window_->ReleaseMouse();
   }
-  io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
-  std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+  mouse_buttons_ = 0;
+  io.ClearEventsQueue();
+  io.ClearInputMouse();
   io.ClearInputKeys();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
@@ -623,17 +628,17 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   }
   switch (virtual_key) {
     case VirtualKey::kShift:
-      io.KeyShift = is_down;
+      io.AddKeyEvent(ImGuiMod_Shift, is_down);
       break;
     case VirtualKey::kControl:
-      io.KeyCtrl = is_down;
+      io.AddKeyEvent(ImGuiMod_Ctrl, is_down);
       break;
     case VirtualKey::kMenu:
       // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
-      io.KeyAlt = is_down;
+      io.AddKeyEvent(ImGuiMod_Alt, is_down);
       break;
     case VirtualKey::kLWin:
-      io.KeySuper = is_down;
+      io.AddKeyEvent(ImGuiMod_Super, is_down);
       break;
     default:
       break;
@@ -643,15 +648,14 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
 void ImGuiDrawer::UpdateMousePosition(float x, float y) {
   auto& io = GetIO();
   float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.MousePos.x = x * physical_to_logical;
-  io.MousePos.y = y * physical_to_logical;
+  io.AddMousePosEvent(x * physical_to_logical, y * physical_to_logical);
 }
 
 void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e) {
   if (touch_pointer_id_ != TouchEvent::kPointerIDNone) {
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     auto& io = GetIO();
-    std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
+    io.AddMouseButtonEvent(0, false);
     // Nothing needs to be done regarding CaptureMouse and ReleaseMouse - all
     // buttons as well as mouse capture have been released when switching to
     // touch input, the mouse is never captured during touch input, and now

@@ -1497,7 +1497,10 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
   const uint64_t refresh_sequence =
       guest_output_refresh_sequence_.load(std::memory_order_acquire);
-  if (REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
+  // A suspended title still needs UI repaints, and one final paint without
+  // drawers to erase a closed overlay from the last presented image.
+  if (!execute_ui_drawers && !last_presented_ui_ &&
+      REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
       refresh_sequence == last_presented_refresh_sequence_) {
     return PaintResult::kNotPresented;
   }
@@ -1543,6 +1546,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
       PROFILE_DUPLICATE_PRESENT();
     }
     last_presented_refresh_sequence_ = refresh_sequence;
+    last_presented_ui_ = execute_ui_drawers;
   }
   switch (result) {
     case PaintResult::kPresented:
