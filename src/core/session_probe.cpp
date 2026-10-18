@@ -25,6 +25,10 @@
 REXCVAR_DEFINE_INT32(cs_session_mode, 0, "Diagnostics",
                      "CS-0.1 per-thread session probe: 0 off, 1 record, 2 replay")
     .range(0, 2).lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// The runtime creates a UI device before GPU plugin settings are registered.
+REXCVAR_DEFINE_BOOL(gpu_async_fence_probe, false, "GPU",
+                    "CS-0.4: create the Vulkan timeline completion worker")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(cs_session_path, "", "Diagnostics",
                       "CS-0.1 per-thread trace directory (record refuses an existing path)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

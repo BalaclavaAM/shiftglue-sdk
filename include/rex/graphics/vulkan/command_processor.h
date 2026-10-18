@@ -382,6 +382,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
+  void PublishGuestCompletion(std::function<void()> completion) override;
   bool AwaitGuestGpuCompletion() override {
     const bool completed = AwaitAllQueueOperationsCompletion();
     return completed && !device_lost_;
@@ -439,6 +440,21 @@ class VulkanCommandProcessor : public CommandProcessor {
     // With a tape: the submission's number.
     uint64_t submission = 0;
   };
+  bool StartCompletionWorker();
+  void StopCompletionWorker();
+  void CompletionWorkerMain();
+  struct CompletionJob { uint64_t value; std::function<void()> callback; };
+  VkSemaphore completion_timeline_ = VK_NULL_HANDLE;
+  PFN_vkWaitSemaphores completion_wait_ = nullptr;
+  uint64_t completion_issued_ = 0;
+  std::atomic<uint64_t> completion_retired_{0};
+  std::atomic<uint64_t> completion_pending_{0};
+  system::object_ref<system::XHostThread> completion_worker_;
+  std::mutex completion_mutex_;
+  std::condition_variable completion_wake_;
+  std::deque<CompletionJob> completion_jobs_;
+  bool completion_stop_ = false;
+  bool completion_last_mode_ = false;
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
   // device is lost, so waits for it end.

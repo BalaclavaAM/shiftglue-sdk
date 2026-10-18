@@ -954,6 +954,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+      if (rex::cvar::Query<bool>("gpu_async_fence_probe")) {
+        XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
+      }
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);

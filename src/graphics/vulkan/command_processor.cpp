@@ -34,6 +34,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/thread.h>
+#include <rex/system/xthread.h>
 #include <rex/graphics/fh1_frame_replay.h>
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
@@ -70,6 +71,8 @@ REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DECLARE(bool, gpu_async_fence_probe);
+REXCVAR_DECLARE(bool, gpu_async_fence_completion);
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
 // On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
 REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
@@ -2496,6 +2499,7 @@ bool VulkanCommandProcessor::SetupContext() {
   system_constants_memo_valid_ = false;
 
   StartSubmissionWorker();
+  if (REXCVAR_GET(gpu_async_fence_probe) && !StartCompletionWorker()) return false;
 
   return true;
 }
@@ -2843,6 +2847,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   StopSubmissionWorker();
+  StopCompletionWorker();
   if (present_deferred_presenter_) {
     present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
     present_deferred_presenter_ = nullptr;
@@ -8451,6 +8456,111 @@ void VulkanCommandProcessor::LogCheckpoints() {
       }
     }
   }
+}
+
+bool VulkanCommandProcessor::StartCompletionWorker() {
+  const auto* vd = GetVulkanDevice();
+  if (!vd->properties().timelineSemaphore) {
+    REXGPU_ERROR("CS_ASYNC timeline semaphore feature unavailable");
+    return false;
+  }
+  const auto& fn = vd->functions();
+  completion_wait_ = reinterpret_cast<PFN_vkWaitSemaphores>(
+      vd->vulkan_instance()->functions().vkGetDeviceProcAddr(vd->device(), "vkWaitSemaphores"));
+  if (!completion_wait_) return false;
+  VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+  type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  VkSemaphoreCreateInfo create{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  create.pNext = &type;
+  if (fn.vkCreateSemaphore(vd->device(), &create, nullptr, &completion_timeline_) != VK_SUCCESS)
+    return false;
+  completion_worker_ = system::object_ref<system::XHostThread>(
+      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        CompletionWorkerMain(); return 0;
+      }));
+  completion_worker_->set_name("CS GPU Completion");
+  if (XFAILED(completion_worker_->Create())) return false;
+  REXGPU_INFO("CS_ASYNC timeline completion worker armed; producer never waits on its semaphore");
+  return true;
+}
+
+void VulkanCommandProcessor::StopCompletionWorker() {
+  if (completion_worker_) {
+    { std::lock_guard lock(completion_mutex_); completion_stop_ = true; }
+    completion_wake_.notify_all();
+    completion_worker_->Wait(0, 0, 0, nullptr);
+    completion_worker_.reset();
+  }
+  if (completion_timeline_ != VK_NULL_HANDLE) {
+    REXGPU_INFO("CS_ASYNC issued={} retired={} pending={}", completion_issued_,
+                completion_retired_.load(), completion_pending_.load());
+    GetVulkanDevice()->functions().vkDestroySemaphore(
+        GetVulkanDevice()->device(), completion_timeline_, nullptr);
+    completion_timeline_ = VK_NULL_HANDLE;
+  }
+}
+
+void VulkanCommandProcessor::CompletionWorkerMain() {
+  while (true) {
+    CompletionJob job;
+    {
+      std::unique_lock lock(completion_mutex_);
+      completion_wake_.wait(lock, [this]() { return completion_stop_ || !completion_jobs_.empty(); });
+      if (completion_jobs_.empty()) return;
+      job = std::move(completion_jobs_.front()); completion_jobs_.pop_front();
+    }
+    if (job.value) {
+      VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+      wait.semaphoreCount = 1; wait.pSemaphores = &completion_timeline_; wait.pValues = &job.value;
+      const auto result = completion_wait_(GetVulkanDevice()->device(), &wait, UINT64_MAX);
+      if (result != VK_SUCCESS) {
+        rex::FatalError("CS-0.4 timeline wait failed; refusing an early guest completion");
+      }
+      completion_retired_.store(job.value);
+    }
+    job.callback();
+    completion_pending_.fetch_sub(1);
+  }
+}
+
+void VulkanCommandProcessor::PublishGuestCompletion(std::function<void()> completion) {
+  const bool enabled = REXCVAR_GET(gpu_async_fence_completion);
+  if (!completion_worker_) {
+    if (enabled) rex::FatalError("CS-0.4 async completion requires gpu_async_fence_probe and Vulkan");
+    completion(); return;
+  }
+  if (enabled != completion_last_mode_) {
+    REXGPU_INFO("CS_ASYNC mode={} issued={} retired={} pending={}", enabled,
+                completion_issued_, completion_retired_.load(), completion_pending_.load());
+    completion_last_mode_ = enabled;
+  }
+  if (!enabled && !completion_pending_.load()) { completion(); return; }
+  uint64_t value = 0;
+  if (enabled) {
+    // The submission worker's FIFO puts this signal after the just-ended work.
+    // No producer waits for submission or for GPU retirement.
+    if (!EndSubmission(false)) rex::FatalError("CS-0.4 could not end the guest fence submission");
+    value = ++completion_issued_;
+    auto signal = [this, value]() {
+      const auto* vd = GetVulkanDevice();
+      VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+      timeline.signalSemaphoreValueCount = 1; timeline.pSignalSemaphoreValues = &value;
+      VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.pNext = &timeline;
+      submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &completion_timeline_;
+      auto queue = vd->AcquireQueue(vd->queue_family_graphics_compute(), 0);
+      if (vd->functions().vkQueueSubmit(queue.queue(), 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS)
+        rex::FatalError("CS-0.4 timeline submission failed");
+    };
+    if (async_submission_) {
+      SubmissionJob submit; submit.callback = std::move(signal);
+      { std::lock_guard lock(submission_worker_mutex_); submission_jobs_.push_back(std::move(submit)); }
+      submission_worker_wake_.notify_one();
+    } else signal();
+  }
+  // Off transitions keep the FIFO until older delayed guest writes retire.
+  completion_pending_.fetch_add(1);
+  { std::lock_guard lock(completion_mutex_); completion_jobs_.push_back({value, std::move(completion)}); }
+  completion_wake_.notify_one();
 }
 
 void VulkanCommandProcessor::StartSubmissionWorker() {

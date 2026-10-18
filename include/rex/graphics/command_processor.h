@@ -319,6 +319,8 @@ class CommandProcessor {
   // CS-0.4: run on the recorder, before publishing a guest completion.
   virtual bool AwaitGuestGpuCompletion() { return false; }
   void AwaitGuestGpuCompletionIfRequested();
+  // The default backend publishes immediately. Vulkan can retire on a worker.
+  virtual void PublishGuestCompletion(std::function<void()> completion);
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);

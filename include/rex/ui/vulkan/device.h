@@ -99,6 +99,7 @@ class VulkanDevice {
     VkDeviceSize nonCoherentAtomSize = 256;
 
     bool robustBufferAccess = false;
+    bool timelineSemaphore = false;
     bool fullDrawIndexUint32 = false;
     bool independentBlend = false;
     bool geometryShader = false;
