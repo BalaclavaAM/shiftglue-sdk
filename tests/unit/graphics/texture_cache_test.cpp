@@ -1,0 +1,112 @@
+#include <cstring>
+#include <memory>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/register_file.h>
+#include <rex/graphics/shared_memory.h>
+
+#include "test_memory.h"
+
+namespace {
+
+using namespace rex::graphics;
+
+// Exercise the shared cache's real watches and binding memo without a GPU.
+class TestSharedMemory final : public SharedMemory {
+ public:
+  TestSharedMemory() : SharedMemory(rex::testing::GetTestMemory()) { InitializeCommon(); }
+
+ private:
+  bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) override {
+    for (const auto& [first, count] : ranges) {
+      MakeRangeValid(first << page_size_log2(), count << page_size_log2(), false);
+    }
+    return true;
+  }
+};
+
+class TestTextureCache final : public TextureCache {
+ public:
+  TestTextureCache(const RegisterFile& regs, SharedMemory& memory)
+      : TextureCache(regs, memory, 2, 2) {}
+
+  const Texture* bound(uint32_t index = 0) const {
+    const auto* binding = GetValidTextureBinding(index);
+    return binding ? binding->texture : nullptr;
+  }
+
+  bool EnsureScaledResolveMemoryCommitted(uint32_t, uint32_t, uint32_t) override {
+    return true;
+  }
+
+ private:
+  class TestTexture final : public Texture {
+   public:
+    TestTexture(TextureCache& cache, TextureKey key) : Texture(cache, key, false) {}
+  };
+
+  uint32_t GetHostFormatSwizzle(TextureKey) const override {
+    return xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
+  }
+  uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension) const override { return 16384; }
+  uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension) const override { return 2048; }
+  bool IsScaledResolveSupportedForFormat(TextureKey) const override { return true; }
+  std::unique_ptr<Texture> CreateTexture(TextureKey key) override {
+    return std::make_unique<TestTexture>(*this, key);
+  }
+  bool LoadTextureDataFromResidentMemoryImpl(Texture&, bool, bool) override { return true; }
+};
+
+void SetFetch(RegisterFile& regs, uint32_t index, uint32_t address) {
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.format = xenos::TextureFormat::k_8_8_8_8;
+  fetch.tiled = 1;
+  fetch.pitch = 2;
+  fetch.size_2d.width = 63;
+  fetch.size_2d.height = 63;
+  fetch.base_address = address >> 12;
+  std::memcpy(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + index * 6], &fetch,
+              sizeof(fetch));
+}
+
+}  // namespace
+
+TEST_CASE("texture binding memo follows resolve ownership with unchanged fetch words",
+          "[graphics][texture_cache]") {
+  RegisterFile regs;
+  TestSharedMemory memory;
+  TestTextureCache cache(regs, memory);
+  constexpr uint32_t kBase = 0x100000;
+  constexpr uint32_t kOther = 0x200000;
+  SetFetch(regs, 0, kBase);
+  SetFetch(regs, 1, kOther);
+  cache.RequestTextures(3);
+  const auto* cpu_texture = cache.bound();
+  const auto* unrelated = cache.bound(1);
+  REQUIRE(cpu_texture);
+  REQUIRE(unrelated);
+  CHECK_FALSE(cpu_texture->key().scaled_resolve);
+
+  cache.MarkRangeAsResolved(kBase, cpu_texture->GetGuestBaseSize());
+  cache.RequestTextures(3);
+  const auto* resolved = cache.bound();
+  REQUIRE(resolved);
+  CHECK(resolved->key().scaled_resolve);
+  CHECK(resolved != cpu_texture);
+  CHECK(cache.bound(1) == unrelated);
+  CHECK(unrelated->payload_generation() == 1);
+
+  // Reuse the livery allocation for a CPU texture, retaining the fetch words.
+  memory.MemoryInvalidationCallback(kBase, resolved->GetGuestBaseSize(), true);
+  cache.RequestTextures(2);  // Consume invalidation while only the other texture is used.
+  cache.RequestTextures(3);
+  REQUIRE(cache.bound());
+  CHECK_FALSE(cache.bound()->key().scaled_resolve);
+  CHECK(cache.bound() == cpu_texture);
+  CHECK(cache.bound(1) == unrelated);
+  CHECK(unrelated->payload_generation() == 1);
+}

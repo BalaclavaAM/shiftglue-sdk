@@ -706,7 +706,11 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     const BindingMemo* memo = nullptr;
     const BindingMemo& memo_slot = binding_memos_[BindingMemoSlot(fetch_words)];
     if (memo_slot.epoch == binding_memo_epoch_ &&
-        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words))) {
+        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words)) &&
+        (!IsDrawResolutionScaled() ||
+         ((!memo_slot.texture || !memo_slot.texture->outdated_mask()) &&
+          (!memo_slot.texture_signed || !memo_slot.texture_signed->outdated_mask())))) {
+      // Scaled resolve ownership can change without changing the fetch words.
       memo = &memo_slot;
     }
     if (memo) {
@@ -1353,10 +1357,9 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 }
 
 void TextureCache::ResetOutdatedTextureBindings() {
-  // Only a binding whose texture is outdated needs its load rechecked: the
-  // others, and the memo's derivations (fetch words to key to texture, which
-  // an outdated texture keeps), stay valid. A texture outdated after the flag
-  // was taken sets it again, so the next draw rechecks it.
+  // Only a binding whose texture is outdated needs its load rechecked. The
+  // memo re-derives outdated entries at scale, where ownership may have changed.
+  // A texture outdated after the flag was taken sets it again for the next draw.
   auto outdated = [](const Texture* texture) {
     return texture != nullptr && texture->outdated_mask() != 0;
   };

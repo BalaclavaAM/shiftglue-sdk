@@ -35,6 +35,7 @@ add_executable(unit_tests
     graphics/native_guest_output_test.cpp
     graphics/vulkan_shader_overrides_test.cpp
     graphics/cube_lut_test.cpp
+    graphics/texture_cache_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -43,11 +44,16 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/thirdparty/renderdoc
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
