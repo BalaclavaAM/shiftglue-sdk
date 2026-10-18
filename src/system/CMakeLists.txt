@@ -62,6 +62,9 @@ set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 # the targets linking rexruntime; rexruntime and the object libraries built
 # into it do not get this definition.
 target_compile_definitions(rexruntime INTERFACE REX_RUNTIME_IMPORTS=1)
+if(REXGLUE_ENABLE_CS_PROBES)
+    target_compile_definitions(rexruntime PUBLIC REXGLUE_ENABLE_CS_PROBES=1)
+endif()
 
 rex_target_pch(rexruntime
     <mutex>

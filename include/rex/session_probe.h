@@ -23,6 +23,7 @@ enum class Kind : uint32_t {
   kHostHook,
   kAudioPump, kAudioCallback,
 };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 bool Enabled();
 bool Active();
 uint64_t ObjectKey(const system::XObject* object);
@@ -48,6 +49,28 @@ struct LockGrant {
   explicit LockGrant(uint64_t key);
   void Acquired();
 };
+#else
+inline constexpr bool Enabled() { return false; }
+inline constexpr bool Active() { return false; }
+inline constexpr bool Replaying() { return false; }
+inline uint64_t ObjectKey(const system::XObject*) { return 0; }
+inline void SetThreadTag(uint64_t, uint32_t = 0) {}
+inline void SetHostRole(uint64_t) {}
+inline uint64_t CurrentTag() { return 0; }
+inline uint64_t Site(const void*) { return 0; }
+inline void Delivery(Kind, uint64_t, uint64_t) {}
+inline std::optional<uint32_t> PeekWaitResult(uint64_t) { return {}; }
+inline uint64_t Scalar(Kind, uint64_t, uint64_t value, bool = false) { return value; }
+inline void Blob(Kind, uint64_t, void*, uint32_t) {}
+inline void Bytes(Kind, uint64_t, void*, uint32_t) {}
+inline void Flush() {}
+inline void Require(bool, const char*) {}
+struct Suppress {};
+struct LockGrant {
+  explicit LockGrant(uint64_t) {}
+  void Acquired() {}
+};
+#endif
 struct SyncBoundary {
   uint64_t key;
   bool enabled;

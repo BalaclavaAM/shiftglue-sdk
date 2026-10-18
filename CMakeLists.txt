@@ -19,6 +19,10 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+option(REXGLUE_ENABLE_CS_PROBES "Compile clean-slate session and fence experiments" OFF)
+if(REXGLUE_ENABLE_CS_PROBES)
+    add_compile_definitions(REXGLUE_ENABLE_CS_PROBES=1)
+endif()
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)

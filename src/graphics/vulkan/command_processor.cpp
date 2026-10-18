@@ -71,8 +71,10 @@ REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
 REXCVAR_DECLARE(bool, gpu_async_fence_completion);
+#endif
 REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
 // On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
 REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
@@ -2499,7 +2501,9 @@ bool VulkanCommandProcessor::SetupContext() {
   system_constants_memo_valid_ = false;
 
   StartSubmissionWorker();
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   if (REXCVAR_GET(gpu_async_fence_probe) && !StartCompletionWorker()) return false;
+#endif
 
   return true;
 }
@@ -2847,7 +2851,9 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   StopSubmissionWorker();
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   StopCompletionWorker();
+#endif
   if (present_deferred_presenter_) {
     present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
     present_deferred_presenter_ = nullptr;
@@ -8458,6 +8464,7 @@ void VulkanCommandProcessor::LogCheckpoints() {
   }
 }
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 bool VulkanCommandProcessor::StartCompletionWorker() {
   const auto* vd = GetVulkanDevice();
   if (!vd->properties().timelineSemaphore) {
@@ -8563,6 +8570,7 @@ void VulkanCommandProcessor::PublishGuestCompletion(std::function<void()> comple
   completion_wake_.notify_one();
 }
 
+#endif
 void VulkanCommandProcessor::StartSubmissionWorker() {
   checkpoints_enabled_ = GetVulkanDevice()->extensions().ext_NV_device_diagnostic_checkpoints;
   if (checkpoints_enabled_) {

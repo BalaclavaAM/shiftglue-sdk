@@ -316,11 +316,13 @@ class CommandProcessor {
   // (writes guest memory, raises an interrupt, swaps, advances the ring read
   // pointer): results the CPU may read from then on must be in guest memory.
   virtual void FlushCpuVisibleResults() {}
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   // CS-0.4: run on the recorder, before publishing a guest completion.
   virtual bool AwaitGuestGpuCompletion() { return false; }
   void AwaitGuestGpuCompletionIfRequested();
   // The default backend publishes immediately. Vulkan can retire on a worker.
   virtual void PublishGuestCompletion(std::function<void()> completion);
+#endif
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -756,9 +758,11 @@ class CommandProcessor {
   uint32_t gamma_ramp_rw_component_ = 0;
   // CS-0.1, decoder-owned: headers (including IB links), payloads and nested
   // packets in decode order; reset on each XE_SWAP.
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   uint64_t session_pm4_hash_ = UINT64_C(14695981039346656037);
   uint64_t session_pm4_words_ = 0;
   uint64_t session_pm4_frame_ = 0;
+#endif
 };
 
 }  // namespace rex::graphics

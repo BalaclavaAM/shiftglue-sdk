@@ -253,7 +253,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   void FlushCpuVisibleResults() override;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   bool AwaitGuestGpuCompletion() override { return AwaitAllQueueOperationsCompletion(); }
+#endif
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;

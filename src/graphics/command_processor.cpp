@@ -65,6 +65,7 @@ REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "resolves (-1: off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
 REXCVAR_DEFINE_BOOL(gpu_async_fence_completion, false, "GPU",
                     "CS-0.4: publish guest fences and interrupts after GPU completion without a CPU wait")
@@ -73,6 +74,7 @@ REXCVAR_DEFINE_BOOL(gpu_true_fence_completion, false, "GPU",
                     "CS-0.4 probe: submit and await host GPU work before guest fence writes, "
                     "scratch writebacks, command-stream interrupts and WAIT_FOR_IDLE")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
 // FH1's race polls through WAIT_REG_MEM about 1.5 ms per frame on the GPU
 // commands thread, its bottleneck; yielding first ends those waits sooner
 // (NP-9.3: race frames 16.76-16.92 against 17.05-17.23 ms mean over three
@@ -1390,11 +1392,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
       AwaitGuestGpuCompletionIfRequested();
-      PublishGuestCompletion([this, mem_addr, value]() {
+#endif
+      auto complete = [this, mem_addr, value]() {
         memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
         if (REXCVAR_GET(gpu_async_fence_probe)) system::SignalGpuWrite();
-      });
+#endif
+      };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      PublishGuestCompletion(std::move(complete));
+#else
+      complete();
+#endif
     }
   } else {
     switch (index) {
@@ -1719,6 +1730,7 @@ void CommandProcessor::MakeCoherent() {
 
 void CommandProcessor::PrepareForWait() {}
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 void CommandProcessor::AwaitGuestGpuCompletionIfRequested() {
   if (REXCVAR_GET(gpu_true_fence_completion) && !AwaitGuestGpuCompletion()) {
     rex::FatalError("CS-0.4 could not await host GPU completion; refusing an early guest signal");
@@ -1731,6 +1743,7 @@ void CommandProcessor::PublishGuestCompletion(std::function<void()> completion) 
   completion();
 }
 
+#endif
 void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
@@ -2165,6 +2178,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   if (session_probe::Enabled()) {
     uint32_t words = 1;
     if (packet && (packet_type == 0 || packet_type == 3)) words += ((packet >> 16) & 0x3FFF) + 1;
@@ -2185,6 +2199,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
       session_pm4_words_ = 0;
     }
   }
+#endif
   if (packet == 0) {
     return true;
   }
@@ -2515,10 +2530,12 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       assert_true(count == 1);
       uint32_t value = reader->ReadAndSwap<uint32_t>();
       REXGPU_INFO("GPU wait for idle = {:08X}", value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
       if (REXCVAR_GET(gpu_true_fence_completion)) {
         RecordCall([this]() { AwaitGuestGpuCompletionIfRequested(); });
         PublishRecordBatch();
       }
+#endif
       result = true;
       break;
     }
@@ -2593,19 +2610,26 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   RecordCall([this, cpu_mask, frame = counter_]() {
     if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuInterrupt, 0, cpu_mask);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
     AwaitGuestGpuCompletionIfRequested();
+#endif
     if (record_split_) {
       FlushCpuVisibleResults();
     }
-    PublishGuestCompletion([this, cpu_mask]() {
-    for (int n = 0; n < 6; n++) {
-      if (cpu_mask & (1 << n)) {
-        if (graphics_system_) {
-          graphics_system_->DispatchInterruptCallback(1, n);
+    auto complete = [this, cpu_mask]() {
+      for (int n = 0; n < 6; n++) {
+        if (cpu_mask & (1 << n)) {
+          if (graphics_system_) {
+            graphics_system_->DispatchInterruptCallback(1, n);
+          }
         }
       }
-    }
-    });
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
   });
   PublishRecordBatch();
   return true;
@@ -3012,22 +3036,38 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   if (!record_split_) {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
     AwaitGuestGpuCompletionIfRequested();
+#endif
     if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
-    PublishGuestCompletion([this, address, data_value]() {
+    auto complete = [this, address, data_value]() {
       memory::store(memory_->TranslatePhysical(address), data_value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
       if (REXCVAR_GET(gpu_async_fence_probe)) system::SignalGpuWrite();
-    });
+#endif
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
     return true;
   }
   RecordCall([this, address, data_value]() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
     AwaitGuestGpuCompletionIfRequested();
+#endif
     if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
     FlushCpuVisibleResults();
-    PublishGuestCompletion([this, address, data_value]() {
+    auto complete = [this, address, data_value]() {
       memory::store(memory_->TranslatePhysical(address), data_value);
       system::SignalGpuWrite();
-    });
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
   });
   PublishRecordBatch();
   return true;

@@ -382,11 +382,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   void PublishGuestCompletion(std::function<void()> completion) override;
   bool AwaitGuestGpuCompletion() override {
     const bool completed = AwaitAllQueueOperationsCompletion();
     return completed && !device_lost_;
   }
+#endif
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -440,6 +442,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     // With a tape: the submission's number.
     uint64_t submission = 0;
   };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
   bool StartCompletionWorker();
   void StopCompletionWorker();
   void CompletionWorkerMain();
@@ -455,6 +458,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::deque<CompletionJob> completion_jobs_;
   bool completion_stop_ = false;
   bool completion_last_mode_ = false;
+#endif
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
   // device is lost, so waits for it end.

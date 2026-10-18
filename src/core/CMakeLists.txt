@@ -16,7 +16,6 @@ add_library(rexcore OBJECT
     memory.cpp
     mutex.cpp
     ring_buffer.cpp
-    session_probe.cpp
     string_buffer.cpp
     sync_census.cpp
     threading.cpp
@@ -25,6 +24,11 @@ add_library(rexcore OBJECT
     vec128.cpp
 )
 add_library(rex::core ALIAS rexcore)
+
+if(REXGLUE_ENABLE_CS_PROBES)
+    target_sources(rexcore PRIVATE session_probe.cpp)
+    target_compile_definitions(rexcore PUBLIC REXGLUE_ENABLE_CS_PROBES=1)
+endif()
 
 if(APPLE)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the

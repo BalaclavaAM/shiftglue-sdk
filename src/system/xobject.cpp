@@ -496,9 +496,11 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
 
 }  // namespace rex::system
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
 namespace rex::session_probe {
 uint64_t ObjectKey(const system::XObject* object) {
   const auto address = Enabled() ? object->guest_object() : 0;
   return address ? (UINT64_C(1) << 63) | address : object->handle();
 }
 }  // namespace rex::session_probe
+#endif
