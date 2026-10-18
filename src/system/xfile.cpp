@@ -113,6 +113,12 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {
+  const bool tracing = session_probe::Enabled();
+  const uint64_t trace_key = (uint64_t(handle()) << 32) | buffer_guest_address;
+  if (tracing) {
+    session_probe::Scalar(session_probe::Kind::kIoReadRequest, trace_key, buffer_length);
+    session_probe::Scalar(session_probe::Kind::kIoReadRequest, trace_key ^ 1, byte_offset);
+  }
   if (byte_offset == uint64_t(-1)) {
     // Read from current position.
     byte_offset = position_;
@@ -120,6 +126,18 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
 
   size_t bytes_read = 0;
   X_STATUS result = X_STATUS_SUCCESS;
+  bool result_captured = false;
+  auto capture_result = [&](uint8_t* data) {
+    if (!tracing) return;
+    const auto packed = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key,
+        (uint64_t(result) << 32) | uint32_t(bytes_read), true);
+    result = X_STATUS(packed >> 32); bytes_read = uint32_t(packed);
+    session_probe::Require(bytes_read <= buffer_length && (!bytes_read || data),
+        "capture incomplete: replay read range");
+    byte_offset = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key ^ 1, byte_offset, true);
+    if (bytes_read) session_probe::Bytes(session_probe::Kind::kIoReadData, trace_key, data, uint32_t(bytes_read));
+    result_captured = true;
+  };
   // Zero length means success for a valid file object according to Windows
   // tests.
   if (buffer_length) {
@@ -159,12 +177,10 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
           auto* read_buffer = buffer_physical_heap
               ? memory()->TranslatePhysical(buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
               : memory()->TranslateVirtual(buffer_guest_address);
-          result = file_->ReadSync(std::span<uint8_t>(read_buffer, buffer_length),
-              size_t(byte_offset), &bytes_read);
-          if (session_probe::Enabled()) {
-            session_probe::Scalar(session_probe::Kind::kIoData, (uint64_t(handle()) << 32) | buffer_guest_address,
-                                  session_probe::Digest(read_buffer, bytes_read));
-          }
+          if (!session_probe::Replaying())
+            result = file_->ReadSync(std::span<uint8_t>(read_buffer, buffer_length),
+                size_t(byte_offset), &bytes_read);
+          capture_result(read_buffer);
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
@@ -182,10 +198,8 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     }
   }
 
-  if (session_probe::Enabled()) {
-    session_probe::Scalar(session_probe::Kind::kIoRead, (uint64_t(handle()) << 32) | uint32_t(result), bytes_read);
-    session_probe::Scalar(session_probe::Kind::kIoRead, buffer_guest_address, byte_offset);
-  }
+  if (!result_captured) capture_result(nullptr);
+  if (tracing) position_ = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key ^ 2, position_, true);
   if (out_bytes_read) {
     *out_bytes_read = uint32_t(bytes_read);
   }

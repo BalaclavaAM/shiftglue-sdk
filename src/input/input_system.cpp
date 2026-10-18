@@ -221,7 +221,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
   return nullptr;
 }
 
-X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+X_RESULT InputSystem::GetCapabilitiesImpl(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
   if (!out_caps || !assignment_) {
@@ -250,14 +250,37 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
-X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  const auto result = GetMergedState(user_index, false, out_state);
-  if (session_probe::Enabled()) {
-    session_probe::Scalar(session_probe::Kind::kInputResult, user_index, result);
-    if (result == X_ERROR_SUCCESS)
-      session_probe::Blob(session_probe::Kind::kInputState, user_index, out_state, sizeof(*out_state));
+namespace {
+template <typename T, typename Read>
+X_RESULT SessionInput(session_probe::Kind result_kind, session_probe::Kind data_kind,
+                       uint64_t key, T* output, Read read) {
+  if (!session_probe::Enabled()) return read();
+  X_RESULT result = X_ERROR_SUCCESS;
+  if (!session_probe::Replaying()) {
+    session_probe::Suppress native_input_clock;
+    result = read();
   }
+  result = X_RESULT(session_probe::Scalar(result_kind, key, result, true));
+  if (result == X_ERROR_SUCCESS)
+    session_probe::Blob(data_kind, key, output, sizeof(*output));
   return result;
+}
+}
+X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+  return SessionInput(session_probe::Kind::kInputCapsResult, session_probe::Kind::kInputCapsData,
+                      (uint64_t(user_index) << 32) | flags, out_caps,
+                      [&] { return GetCapabilitiesImpl(user_index, flags, out_caps); });
+}
+X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                   X_INPUT_KEYSTROKE* out_keystroke) {
+  return SessionInput(session_probe::Kind::kInputKeyResult, session_probe::Kind::kInputKeyData,
+                      (uint64_t(user_index) << 32) | flags, out_keystroke,
+                      [&] { return GetKeystrokeImpl(user_index, flags, out_keystroke); });
+}
+X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  return SessionInput(session_probe::Kind::kInputResult, session_probe::Kind::kInputState,
+                      user_index, out_state, [&] { return GetMergedState(user_index, false, out_state); });
 }
 
 X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state) {
@@ -564,7 +587,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
-X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+X_RESULT InputSystem::GetKeystrokeImpl(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {

@@ -215,6 +215,14 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  if (trace.expected) {
+    if (*trace.expected == X_STATUS_TIMEOUT) {
+      rex::thread::MaybeYield();
+      return trace.Finish(X_STATUS_TIMEOUT);
+    }
+    timeout_ms = std::chrono::milliseconds::max();
+    alertable = *trace.expected == X_STATUS_USER_APC;
+  }
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
   XThread::CheckTitleTermination();
   switch (result) {
@@ -242,6 +250,11 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
+
+  if (trace.expected && *trace.expected != X_STATUS_TIMEOUT) {
+    timeout_ms = std::chrono::milliseconds::max();
+    alertable = *trace.expected == X_STATUS_USER_APC;
+  }
 
   auto result =
       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
@@ -282,6 +295,23 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  if (trace.expected) {
+    if (*trace.expected == X_STATUS_TIMEOUT) {
+      rex::thread::MaybeYield();
+      return trace.Finish(X_STATUS_TIMEOUT);
+    }
+    timeout_ms = std::chrono::milliseconds::max();
+    alertable = *trace.expected == X_STATUS_USER_APC;
+    if (wait_type && *trace.expected < count) {
+      auto result = rex::thread::Wait(wait_handles[*trace.expected], false, timeout_ms);
+      XThread::CheckTitleTermination();
+      if (result == rex::thread::WaitResult::kSuccess) {
+        objects[*trace.expected]->WaitCallback();
+        return trace.Finish(X_STATUS(*trace.expected));
+      }
+      return trace.Finish(X_STATUS_UNSUCCESSFUL);
+    }
+  }
   if (wait_type) {
     auto result =
         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);

@@ -1,120 +1,225 @@
 #include <rex/session_probe.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 #include <array>
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <thread>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 REXCVAR_DEFINE_INT32(cs_session_mode, 0, "Diagnostics",
-                     "CS-0.1 ordered session boundary pilot: 0 off, 1 record, 2 strict replay")
+                     "CS-0.1 per-thread session probe: 0 off, 1 record, 2 replay")
     .range(0, 2).lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(cs_session_path, "", "Diagnostics",
-                      "CS-0.1 boundary log path (record refuses an existing file)")
+                      "CS-0.1 per-thread trace directory (record refuses an existing path)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::session_probe {
 namespace {
 static_assert(std::endian::native == std::endian::little);
-constexpr char kMagic[8] = {'C','S','0','L','O','G','1',0};
+constexpr char kMagic[8] = {'C','S','0','L','O','G','2',0};
 struct Record {
-  uint32_t kind, thread;
-  uint64_t key, value;
-  uint32_t size, reserved;
-  uint64_t host_ns;
+  uint32_t kind, size;
+  uint64_t thread, sequence, key, value, host_ns;
 };
-static_assert(sizeof(Record) == 40);
-thread_local uint32_t thread_tag = 0;
-std::mutex mutex;
-FILE* file = nullptr;
-uint64_t index = 0;
-std::array<char, 1 << 20> io_buffer;
+static_assert(sizeof(Record) == 48);
+struct Stream {
+  FILE* file = nullptr;
+  uint64_t sequence = 0;
+  std::array<char, 64 * 1024> buffer;
+  std::recursive_mutex mutex;
+  bool started = false;
+  ~Stream() { if (file) std::fclose(file); }
+};
+thread_local uint64_t thread_tag = 0;
+thread_local Stream* current_stream = nullptr;
+thread_local uint32_t suppression_depth = 0;
+std::mutex streams_mutex;
+std::map<uint64_t, std::unique_ptr<Stream>> streams;
+std::once_flag root_once;
+std::filesystem::path root;
+std::chrono::steady_clock::time_point epoch;
+uint32_t main_native_tid = 0;
+std::atomic<uint64_t> matched_frames{0};
 
 [[noreturn]] void Fail(const char* reason, const Record& expected = {},
                        const Record& actual = {}) {
-  // Fail closed; continuing with unrelated reference values could corrupt
-  // the private replay state and conceal the first source of divergence.
-  std::fprintf(stderr,
-      "CS_SESSION_DIVERGENCE index=%llu reason=%s expected=(%u,%08X,%llX,%llX,%u) "
-      "actual=(%u,%08X,%llX,%llX,%u)\n",
-      static_cast<unsigned long long>(index), reason, expected.kind, expected.thread,
-      static_cast<unsigned long long>(expected.key), static_cast<unsigned long long>(expected.value), expected.size,
-      actual.kind, actual.thread, static_cast<unsigned long long>(actual.key),
-      static_cast<unsigned long long>(actual.value), actual.size);
-  std::fflush(stderr);
-  REXLOG_ERROR("CS-0.1 replay stopped: {} at boundary {}; "
-               "expected=({},{:08X},{:X},{:X},{}) actual=({},{:08X},{:X},{:X},{})",
-               reason, index, expected.kind, expected.thread, expected.key,
+  REXLOG_ERROR("CS_SESSION_DIVERGENCE {} tag={:016X} seq={} matched_frames={} "
+               "expected=({},{:016X},{},{:X},{:X},{}) actual=({},{:016X},{},{:X},{:X},{})",
+               reason, thread_tag, current_stream ? current_stream->sequence : 0, matched_frames.load(),
+               expected.kind, expected.thread, expected.sequence, expected.key,
                expected.value, expected.size, actual.kind, actual.thread,
-               actual.key, actual.value, actual.size);
+               actual.sequence, actual.key, actual.value, actual.size);
   rex::FlushLogging();
   std::_Exit(86);
 }
 
-void Open(int mode) {
-  if (file) return;
-  const auto path = REXCVAR_GET(cs_session_path);
-  if (path.empty()) Fail("empty trace path");
-  file = std::fopen(path.c_str(), mode == 1 ? "wbx" : "rb");
-  if (!file) Fail(mode == 1 ? "cannot exclusively create trace" : "cannot open reference trace");
-  std::setvbuf(file, io_buffer.data(), _IOFBF, io_buffer.size());
-  if (mode == 1) {
-    if (std::fwrite(kMagic, 1, sizeof(kMagic), file) != sizeof(kMagic)) Fail("write header");
-  } else {
-    char magic[8];
-    if (std::fread(magic, 1, sizeof(magic), file) != sizeof(magic) ||
-        std::memcmp(magic, kMagic, sizeof(magic))) Fail("invalid trace header");
+Stream& Open(int mode) {
+  if (current_stream) return *current_stream;
+  std::call_once(root_once, [mode]() {
+    root = REXCVAR_GET(cs_session_path);
+    epoch = std::chrono::steady_clock::now();
+    std::error_code ec;
+    if (root.empty()) Fail("empty trace directory");
+    if (mode == 1) {
+      if (!std::filesystem::create_directory(root, ec)) Fail("cannot exclusively create trace directory");
+    } else if (!std::filesystem::is_directory(root, ec)) Fail("missing trace directory");
+  });
+  std::lock_guard lock(streams_mutex);
+  if (!thread_tag) {
+    const auto tid = rex::thread::current_thread_system_id();
+    if (!main_native_tid) main_native_tid = tid;
+    if (main_native_tid != tid) Fail("capture incomplete: untagged host thread");
   }
+  auto& stream = streams[thread_tag];
+  if (!stream) {
+    stream = std::make_unique<Stream>();
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llX.bin", static_cast<unsigned long long>(thread_tag));
+    auto path = (root / name).string();
+    stream->file = std::fopen(path.c_str(), mode == 1 ? "wbx" : "rb");
+    if (!stream->file) Fail("cannot open per-thread stream");
+    std::setvbuf(stream->file, stream->buffer.data(), _IOFBF, stream->buffer.size());
+    if (mode == 1) {
+      if (std::fwrite(kMagic, 1, 8, stream->file) != 8 ||
+          std::fwrite(&thread_tag, 8, 1, stream->file) != 1) Fail("write stream header");
+    } else {
+      char magic[8]; uint64_t tag = 0;
+      if (std::fread(magic, 1, 8, stream->file) != 8 || std::memcmp(magic,kMagic,8) ||
+          std::fread(&tag,8,1,stream->file) != 1 || tag != thread_tag) Fail("invalid stream header");
+    }
+  }
+  current_stream = stream.get();
+  return *current_stream;
 }
 
 Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
-                  uint32_t size, bool replay_value) {
+                uint32_t size, bool replay_value) {
   const int mode = REXCVAR_GET(cs_session_mode);
-  if (!mode) return {uint32_t(kind), thread_tag, key, value, size, 0, 0};
-  std::lock_guard lock(mutex);
-  Open(mode);
-  Record actual{uint32_t(kind), thread_tag, key, value, size, 0,
+  if (!mode) return {uint32_t(kind), size, thread_tag, 0, key, value, 0};
+  if (!thread_tag && main_native_tid && main_native_tid != rex::thread::current_thread_system_id())
+    REXLOG_ERROR("CS_SESSION_UNTAGGED kind={} key={:016X}", uint32_t(kind), key);
+  auto& stream = Open(mode);
+  std::lock_guard stream_lock(stream.mutex);
+  Record actual{uint32_t(kind),size,thread_tag,stream.sequence,key,value,
       uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch()).count())};
-  if (size > 4096 || (size && !data)) Fail("invalid payload size", {}, actual);
+          std::chrono::steady_clock::now()-epoch).count())};
+  if (size > 4096 || (size && !data)) Fail("invalid payload size",{},actual);
   if (mode == 1) {
-    if (std::fwrite(&actual, sizeof(actual), 1, file) != 1 ||
-        (size && std::fwrite(data, 1, size, file) != size)) Fail("write boundary", {}, actual);
-    ++index;
+    if (std::fwrite(&actual,sizeof(actual),1,stream.file)!=1 ||
+        (size && std::fwrite(data,1,size,stream.file)!=size)) Fail("write boundary",{},actual);
+    ++stream.sequence;
     return actual;
   }
   Record expected{};
-  if (std::fread(&expected, sizeof(expected), 1, file) != 1) Fail("reference EOF", expected, actual);
-  if (expected.kind != actual.kind || expected.thread != actual.thread ||
-      expected.key != actual.key || expected.size != size || expected.reserved || size > 4096)
-    Fail("boundary order or identity", expected, actual);
-  if (!replay_value && expected.value != value) Fail("observed value", expected, actual);
-  if (size && std::fread(data, 1, size, file) != size) Fail("truncated payload", expected, actual);
-  if (size && Digest(data, size) != expected.value) Fail("payload digest", expected, actual);
-  ++index;
+  if (std::fread(&expected,sizeof(expected),1,stream.file)!=1) Fail("reference EOF",expected,actual);
+  if (expected.kind!=actual.kind || expected.thread!=thread_tag ||
+      expected.sequence!=stream.sequence || expected.key!=key || expected.size!=size)
+    Fail("per-thread boundary identity",expected,actual);
+  if (!replay_value && expected.value!=value) Fail("observed value",expected,actual);
+  if (size && std::fread(data,1,size,stream.file)!=size) Fail("truncated payload",expected,actual);
+  if (size && Digest(data,size)!=expected.value) Fail("payload digest",expected,actual);
+  ++stream.sequence;
+  if (replay_value || kind==Kind::kSyncResult || kind==Kind::kGpuFence || kind==Kind::kGpuInterrupt)
+    std::this_thread::sleep_until(epoch+std::chrono::nanoseconds(expected.host_ns));
+  if (kind==Kind::kPm4Words) matched_frames.fetch_add(1);
   return expected;
 }
 }  // namespace
 
-bool Enabled() { return REXCVAR_GET(cs_session_mode) != 0; }
-void SetThreadTag(uint32_t tag) {
-  thread_tag = tag;
-  if (Enabled()) Scalar(Kind::kThreadStart, tag, 0);
+bool Enabled() { return REXCVAR_GET(cs_session_mode)!=0 && !suppression_depth; }
+bool Replaying() { return REXCVAR_GET(cs_session_mode)==2; }
+void Require(bool condition, const char* reason) { if (!condition) Fail(reason); }
+Suppress::Suppress() { ++suppression_depth; }
+Suppress::~Suppress() { --suppression_depth; }
+uint64_t CurrentTag() { return thread_tag; }
+void SetThreadTag(uint64_t tag, uint32_t entry) {
+  if (thread_tag==tag) return;
+  thread_tag=tag;current_stream=nullptr;
+  if (Enabled()) {
+    auto& stream=Open(REXCVAR_GET(cs_session_mode));
+    std::lock_guard lock(stream.mutex);
+    if (!stream.started) {
+      stream.started=true;
+      Scalar(Kind::kThreadStart,entry,tag);
+    }
+  }
 }
+void SetHostRole(uint64_t role) { SetThreadTag(UINT64_C(0x8000000000000000)|role); }
 uint64_t Scalar(Kind kind, uint64_t key, uint64_t value, bool replay_value) {
-  return Exchange(kind, key, value, nullptr, 0, replay_value).value;
+  return Exchange(kind,key,value,nullptr,0,replay_value).value;
 }
 void Blob(Kind kind, uint64_t key, void* data, uint32_t size) {
   if (!Enabled()) return;
-  if (size > 4096 || (size && !data)) Fail("invalid blob argument");
-  Exchange(kind, key, Digest(data, size), data, size, true);
+  if (size>4096 || (size && !data)) Fail("invalid blob argument");
+  Exchange(kind,key,Digest(data,size),data,size,true);
+}
+void Bytes(Kind kind, uint64_t key, void* data, uint32_t size) {
+  auto* bytes=static_cast<uint8_t*>(data);
+  for (uint32_t offset=0;offset<size;) {
+    const auto n=std::min(uint32_t(4096),size-offset);
+    Blob(kind,key^offset,bytes+offset,n);offset+=n;
+  }
+}
+void Delivery(Kind kind, uint64_t key, uint64_t value) {
+  if (!Enabled()) return;
+  auto event=Exchange(kind,key,value,nullptr,0,false);
+  if (Replaying()) std::this_thread::sleep_until(epoch+std::chrono::nanoseconds(event.host_ns));
+}
+std::optional<uint32_t> PeekWaitResult(uint64_t key) {
+  if (!Replaying()) return std::nullopt;
+  auto& stream=Open(2);fpos_t position;
+  std::lock_guard stream_lock(stream.mutex);
+  if (std::fgetpos(stream.file,&position)) Fail("save wait lookahead position");
+  Record record{};uint32_t depth=0;bool found=false;
+  while (std::fread(&record,sizeof(record),1,stream.file)==1) {
+    if (record.size>4096 || record.thread!=thread_tag) Fail("invalid wait lookahead");
+    if (record.kind==uint32_t(Kind::kSyncRequest)) ++depth;
+    if (record.kind==uint32_t(Kind::kSyncResult)) {
+      if (!depth) { found=record.key==key;break; }
+      --depth;
+    }
+    if (record.size && std::fseek(stream.file,record.size,SEEK_CUR)) Fail("skip wait payload");
+  }
+  if (std::fsetpos(stream.file,&position)) Fail("restore wait lookahead position");
+  if (!found) Fail("missing wait result");
+  return uint32_t(record.value);
+}
+uint64_t Site(const void* return_address) {
+  if (!Enabled()) return 0;
+  uintptr_t base=0; const char* name="unknown";
+#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION info{};
+  if (VirtualQuery(return_address,&info,sizeof(info))) base=reinterpret_cast<uintptr_t>(info.AllocationBase);
+  char path[MAX_PATH];
+  if (base && GetModuleFileNameA(reinterpret_cast<HMODULE>(base),path,MAX_PATH)) name=path;
+#else
+  Dl_info info{};
+  if (dladdr(return_address,&info)) { base=reinterpret_cast<uintptr_t>(info.dli_fbase); name=info.dli_fname; }
+#endif
+  for (const char* c=name;*c;++c) if (*c=='/' || *c=='\\') name=c+1;
+  return (uint64_t(uint32_t(Digest(name,std::strlen(name))))<<32)|uint32_t(reinterpret_cast<uintptr_t>(return_address)-base);
 }
 void Flush() {
-  if (!Enabled()) return;
-  std::lock_guard lock(mutex);
-  if (file && std::fflush(file)) Fail("flush trace");
+  if (!Enabled() || Replaying()) return;
+  std::lock_guard lock(streams_mutex);
+  for (const auto& [tag,stream]:streams) {
+    std::lock_guard stream_lock(stream->mutex);
+    if (stream->file && std::fflush(stream->file)) Fail("flush stream");
+  }
 }
 }  // namespace rex::session_probe

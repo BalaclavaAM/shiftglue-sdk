@@ -421,6 +421,7 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  if (session_probe::Enabled()) session_probe::SetHostRole(3);
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
@@ -552,6 +553,7 @@ void CommandProcessor::StopRecordThread() {
 }
 
 void CommandProcessor::RecordThreadMain() {
+  if (session_probe::Enabled()) session_probe::SetHostRole(4);
   // The thread's CPU time is a system call (GetThreadTimes cost 2 % of the
   // recorder when read around every batch), and it does not advance while the
   // thread waits, so read it before waiting and at most once a millisecond.
@@ -2163,8 +2165,8 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     session_pm4_hash_ = session_probe::Digest(range.second, range.second_length, session_pm4_hash_);
     session_pm4_words_ += words;
     if (packet_type == 3 && ((packet >> 8) & 0x7F) == PM4_XE_SWAP) {
-      session_probe::Scalar(session_probe::Kind::kPm4Frame, counter_, session_pm4_hash_);
-      session_probe::Scalar(session_probe::Kind::kPm4Words, counter_, session_pm4_words_);
+      session_probe::Scalar(session_probe::Kind::kPm4Frame, session_pm4_frame_, session_pm4_hash_);
+      session_probe::Scalar(session_probe::Kind::kPm4Words, session_pm4_frame_++, session_pm4_words_);
       session_probe::Flush();
       session_pm4_hash_ = UINT64_C(14695981039346656037);
       session_pm4_words_ = 0;
@@ -2577,7 +2579,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   RecordCall([this, cpu_mask, frame = counter_]() {
-    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuInterrupt, frame, cpu_mask);
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuInterrupt, 0, cpu_mask);
     AwaitGuestGpuCompletionIfRequested();
     if (record_split_) {
       FlushCpuVisibleResults();

@@ -756,6 +756,7 @@ class CommandProcessor {
   // packets in decode order; reset on each XE_SWAP.
   uint64_t session_pm4_hash_ = UINT64_C(14695981039346656037);
   uint64_t session_pm4_words_ = 0;
+  uint64_t session_pm4_frame_ = 0;
 };
 
 }  // namespace rex::graphics

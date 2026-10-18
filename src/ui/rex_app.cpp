@@ -10,6 +10,7 @@
  */
 
 #include <rex/rex_app.h>
+#include <rex/session_probe.h>
 
 #include <cstdlib>
 
@@ -557,6 +558,8 @@ void ReXApp::LaunchModule() {
     main_thread->Resume();
 
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+      // This is the host launcher join, not a guest kernel wait.
+      session_probe::Suppress host_join;
       main_thread->Wait(0, 0, 0, nullptr);
       OnGuestThreadExit(main_thread.get());
       REXLOG_INFO("Execution complete");

@@ -78,6 +78,8 @@ class InputSystem : public system::IInputSystem {
   static InputSystem* Live();
 
  private:
+  X_RESULT GetCapabilitiesImpl(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
+  X_RESULT GetKeystrokeImpl(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();

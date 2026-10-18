@@ -67,8 +67,11 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
   std::function<void()> callback = nullptr;
   if (callback_routine_) {
     callback = [this]() {
-      if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kTimerFire, handle(),
-          (uint64_t(callback_routine_) << 32) | callback_routine_arg_);
+      if (session_probe::Enabled()) {
+        session_probe::SetHostRole(UINT64_C(0x100000000) | handle());
+        session_probe::Delivery(session_probe::Kind::kTimerFire, handle(),
+            (uint64_t(callback_routine_) << 32) | callback_routine_arg_);
+      }
       // Queue APC to call back routine with (arg, low, high).
       // It'll be executed on the thread that requested the timer.
       uint64_t time = rex::chrono::Clock::QueryGuestSystemTime();

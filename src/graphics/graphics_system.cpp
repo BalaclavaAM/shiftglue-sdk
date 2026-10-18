@@ -1,3 +1,4 @@
+#include <rex/session_probe.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -215,6 +216,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        if (session_probe::Enabled()) session_probe::SetHostRole(2);
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
@@ -445,6 +447,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 }
 
 void GraphicsSystem::MarkVblank() {
+  if (session_probe::Enabled()) session_probe::Delivery(session_probe::Kind::kVblankDelivery, 0, 0);
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 

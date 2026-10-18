@@ -617,7 +617,7 @@ X_STATUS XThread::Create() {
                   rex::thread::current_thread_system_id(), creation_params_.start_address,
                   reinterpret_cast<uintptr_t>(thread_state_->context()), sizeof(PPCContext));
     }
-    session_probe::SetThreadTag(thread_id_);
+    session_probe::SetThreadTag(thread_id_, creation_params_.start_address);
     current_xthread_tls_ = this;
     running_ = true;
     Execute();
@@ -980,6 +980,12 @@ void XThread::DeliverAPCs() {
     uint32_t apc_ptr = mem->HostToGuestVirtual(apc);
     bool needs_freeing = apc->kernel_routine != XAPC::kDummyKernelRoutine;
 
+    if (session_probe::Enabled()) {
+      session_probe::Scalar(session_probe::Kind::kApcDelivery, apc->kernel_routine,
+          (uint64_t(apc->normal_routine) << 32) | apc->normal_context);
+      session_probe::Scalar(session_probe::Kind::kApcDelivery, apc_ptr,
+          (uint64_t(apc->arg1) << 32) | apc->arg2);
+    }
     util::XeRemoveEntryList(&apc->list_entry, mem);
     apc->enqueued = 0;
 

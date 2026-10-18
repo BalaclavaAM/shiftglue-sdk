@@ -196,7 +196,7 @@ std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
 }
 
 uint64_t Clock::guest_tick_frequency() {
-  return guest_tick_frequency_;
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kPerformanceFrequency, session_probe::Site(__builtin_return_address(0)), guest_tick_frequency_, true) : guest_tick_frequency_;
 }
 
 void Clock::set_guest_tick_frequency(uint64_t frequency) {
@@ -205,7 +205,7 @@ void Clock::set_guest_tick_frequency(uint64_t frequency) {
 }
 
 uint64_t Clock::guest_system_time_base() {
-  return guest_system_time_base_;
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kHostEpoch, 0, guest_system_time_base_, true) : guest_system_time_base_;
 }
 
 void Clock::set_guest_system_time_base(uint64_t time_base) {
@@ -215,25 +215,25 @@ void Clock::set_guest_system_time_base(uint64_t time_base) {
 uint64_t Clock::QueryGuestTickCount() {
   auto guest_tick_count = UpdateGuestClock();
   if (session_probe::Enabled())
-    return session_probe::Scalar(session_probe::Kind::kTimebase, 0, guest_tick_count, true);
+    return session_probe::Scalar(session_probe::Kind::kTimebase, session_probe::Site(__builtin_return_address(0)), guest_tick_count, true);
   return guest_tick_count;
 }
 
 uint64_t Clock::QueryGuestSystemTime() {
   if (REXCVAR_GET(clock_no_scaling)) {
     const auto now = Clock::QueryHostSystemTime();
-    return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, 0, now, true) : now;
+    return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, session_probe::Site(__builtin_return_address(0)), now, true) : now;
   }
 
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
   const auto now = guest_system_time_base_ + guest_system_time_offset;
-  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, 0, now, true) : now;
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, session_probe::Site(__builtin_return_address(0)), now, true) : now;
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {
   const auto value = static_cast<uint32_t>(std::min<uint64_t>(QueryGuestSystemTimeOffset() / 10000,
                                                   std::numeric_limits<uint32_t>::max()));
-  return session_probe::Enabled() ? uint32_t(session_probe::Scalar(session_probe::Kind::kUptime, 0, value, true)) : value;
+  return session_probe::Enabled() ? uint32_t(session_probe::Scalar(session_probe::Kind::kUptime, session_probe::Site(__builtin_return_address(0)), value, true)) : value;
 }
 
 void Clock::SetGuestSystemTime(uint64_t system_time) {
