@@ -8375,7 +8375,7 @@ bool VulkanCommandProcessor::ExecuteSubmission(
     submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
   }
   if (submit_result != VK_SUCCESS) {
-    REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+    REXGPU_ERROR("Failed to submit a Vulkan command buffer: {}", int32_t(submit_result));
     if (submit_result == VK_ERROR_DEVICE_LOST) {
       LogCheckpoints();
       if (!async_submission_) {

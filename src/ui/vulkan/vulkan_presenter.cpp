@@ -261,15 +261,7 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
-  // Destroy the swapchain after its images are not used for drawing anymore.
-  // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
-  // fence clearly indicating when it's safe to destroy a swapchain, so we
-  // assume that its lifetime is tracked internally in the WSI. This is also
-  // done before destroying the semaphore awaited by vkQueuePresentKHR, hoping
-  // that it will prevent the destruction during the semaphore wait in
-  // vkQueuePresentKHR execution (or between the vkQueueSubmit semaphore signal
-  // and the vkQueuePresentKHR semaphore wait).
-  // This will await completion of all paint submissions also.
+  // Retirement drains drawing and presentation before releasing their objects.
   paint_context_.DestroySwapchainAndVulkanSurface();
 
   // Await completion of the usage of everything before destroying anything
@@ -1988,7 +1980,23 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   if (swapchain != VK_NULL_HANDLE) {
-    submission_tracker.AwaitAllSubmissionsCompletion();
+    REXLOG_INFO("VulkanPresenter: Retiring swapchain: waiting for drawing");
+    const bool drawing_complete = submission_tracker.AwaitAllSubmissionsCompletion();
+    REXLOG_INFO("VulkanPresenter: Retirement drawing complete={}; waiting for presentation queue",
+                drawing_complete);
+    // Draw fences don't cover vkQueuePresentKHR's semaphore waits.
+    // shortcut: queue idle is the unextended WSI fallback; use maintenance
+    // present fences when that extension is enabled.
+    assert_true(present_queue_family != UINT32_MAX);
+    const VulkanDevice::Queue::Acquisition queue =
+        vulkan_device->AcquireQueue(present_queue_family, 0);
+    const VkResult result = vulkan_device->functions().vkQueueWaitIdle(queue.queue());
+    if (result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Present queue drain failed during retirement: {}",
+                   int32_t(result));
+    } else {
+      REXLOG_INFO("VulkanPresenter: Retirement presentation queue drained");
+    }
   }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2201,10 +2209,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
+  // Keep pumping window events even if an occluded surface stops making
+  // progress; this may run on the UI thread or the submission worker.
   VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(50000000),
+                                acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
   switch (acquire_result) {
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+      return PaintResult::kNotPresented;
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
@@ -3184,7 +3197,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       }
     }
     if (submit_result != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers: {}", int32_t(submit_result));
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
       if (ui_setup_command_buffer_index != SIZE_MAX) {
@@ -3195,6 +3208,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // buffers.
         paint_context_.ui_setup_command_buffers[ui_setup_command_buffer_index]
             .last_usage_submission_index = 0;
+      }
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        return PaintResult::kGpuLostResponsible;
       }
       // The image is in an acquired state - but now, it will be in it forever.
       // To avoid that, recreate the swapchain - don't return just
