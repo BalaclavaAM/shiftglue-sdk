@@ -13,7 +13,8 @@ enum class Kind : uint32_t {
   kPerformanceFrequency, kVblankDelivery, kTimestampDelivery, kApcDelivery,
   kHostEpoch,
   kInputCapsResult, kInputCapsData, kInputKeyResult, kInputKeyData,
-  kIoReadRequest, kIoReadData, kSemaphoreRelease,
+  kIoReadRequest, kIoReadData, kSemaphoreRelease, kObjectSlot, kThreadId,
+  kKernelOrder, kGuestTickCount, kIoResult, kIoMetadata, kLockGrant, kTryLock,
 };
 bool Enabled();
 bool Replaying();
@@ -31,6 +32,20 @@ void Require(bool condition, const char* reason);
 struct Suppress {
   Suppress();
   ~Suppress();
+};
+// Replay only the kernel table's existing critical sections, not guest code.
+struct KernelOrder {
+  uint64_t key;
+  bool outer;
+  explicit KernelOrder(uint64_t key);
+  void Acquired();
+  ~KernelOrder();
+};
+struct LockGrant {
+  uint64_t key;
+  bool active;
+  explicit LockGrant(uint64_t key);
+  void Acquired();
 };
 struct SyncBoundary {
   uint64_t key;

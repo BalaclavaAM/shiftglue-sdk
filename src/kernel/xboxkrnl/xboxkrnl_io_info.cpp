@@ -15,6 +15,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -106,6 +107,9 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
 
 u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
+  const bool trace = session_probe::Enabled();
+  if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 1, (uint64_t(file_handle) << 32) | info_class); session_probe::Scalar(session_probe::Kind::kIoReadRequest, info_ptr.guest_address(), info_length); }
+  auto live = [&]() -> u32 {
   uint32_t minimum_length = GetQueryFileInfoMinimumLength(info_class);
   if (!minimum_length) {
     return X_STATUS_INVALID_INFO_CLASS;
@@ -197,6 +201,17 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
     io_status_block_ptr->information = out_length;
   }
 
+  return status;
+
+  };
+  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  if (trace) {
+    status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 1, status, true));
+    if (io_status_block_ptr) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
+        io_status_block_ptr.host_address(), sizeof(X_IO_STATUS_BLOCK));
+    if (XSUCCEEDED(status) && info_ptr) session_probe::Bytes(session_probe::Kind::kIoMetadata, 1,
+        info_ptr.host_address(), info_length);
+  }
   return status;
 }
 
@@ -372,6 +387,9 @@ uint32_t GetQueryVolumeInfoMinimumLength(uint32_t info_class) {
 u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
                                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
                                        mapped_void info_ptr, u32 info_length, u32 info_class) {
+  const bool trace = session_probe::Enabled();
+  if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 2, (uint64_t(file_handle) << 32) | info_class); session_probe::Scalar(session_probe::Kind::kIoReadRequest, info_ptr.guest_address(), info_length); }
+  auto live = [&]() -> u32 {
   uint32_t minimum_length = GetQueryVolumeInfoMinimumLength(info_class);
   if (!minimum_length) {
     return X_STATUS_INVALID_INFO_CLASS;
@@ -450,6 +468,17 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
     io_status_block_ptr->information = out_length;
   }
 
+  return status;
+
+  };
+  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  if (trace) {
+    status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 2, status, true));
+    if (io_status_block_ptr) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
+        io_status_block_ptr.host_address(), sizeof(X_IO_STATUS_BLOCK));
+    if (XSUCCEEDED(status) && info_ptr) session_probe::Bytes(session_probe::Kind::kIoMetadata, 1,
+        info_ptr.host_address(), info_length);
+  }
   return status;
 }
 

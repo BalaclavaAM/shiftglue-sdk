@@ -23,6 +23,7 @@
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
@@ -985,6 +986,8 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
+  session_probe::LockGrant grant(uint32_t(reinterpret_cast<uint8_t*>(lock) -
+      rex::system::kernel_state()->memory()->virtual_membase()));
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
@@ -992,6 +995,7 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
     rex::thread::MaybeYield();
   }
+  grant.Acquired();
   return old_irql;
 }
 
@@ -1085,8 +1089,20 @@ u32 KeTryToAcquireSpinLockAtRaisedIrql_entry(mapped_u32 lock_ptr) {
   auto lock = reinterpret_cast<X_KSPINLOCK*>(lock_ptr.host_address());
   auto* ctx = current_ppc_context();
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
+  if (session_probe::Replaying() && session_probe::Enabled()) {
+    const bool acquired = session_probe::Scalar(session_probe::Kind::kTryLock,
+        lock_ptr.guest_address(), 0, true);
+    if (acquired) xeKeKfAcquireSpinLock(ctx, lock, false);
+    return acquired;
+  }
   if (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kTryLock,
+        lock_ptr.guest_address(), 0);
     return 0;
+  }
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kTryLock, lock_ptr.guest_address(), 1);
+    session_probe::LockGrant grant(lock_ptr.guest_address()); grant.Acquired();
   }
   return 1;
 }

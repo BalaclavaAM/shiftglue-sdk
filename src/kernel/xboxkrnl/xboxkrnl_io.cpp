@@ -18,6 +18,7 @@
 #include <rex/kernel/xboxkrnl/io.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -610,6 +611,9 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
+  const bool trace = session_probe::Enabled();
+  if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 3, obj_attribs.guest_address()); auto n = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr); auto path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), n); session_probe::Scalar(session_probe::Kind::kIoReadRequest, 0, session_probe::Digest(path.data(), path.size())); }
+  auto live = [&]() -> u32 {
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
@@ -648,6 +652,15 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
 
   REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "X_STATUS_NO_SUCH_FILE");
   return X_STATUS_NO_SUCH_FILE;
+
+  };
+  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  if (trace) {
+    status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 3, status, true));
+    if (XSUCCEEDED(status) && file_info) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
+        file_info.host_address(), sizeof(X_FILE_NETWORK_OPEN_INFORMATION));
+  }
+  return status;
 }
 
 u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine,
@@ -655,6 +668,9 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
+  const bool trace = session_probe::Enabled();
+  if (trace) { session_probe::Scalar(session_probe::Kind::kIoReadRequest, 4, (uint64_t(file_handle) << 32) | length); session_probe::Scalar(session_probe::Kind::kIoReadRequest, restart_scan, file_info_ptr.guest_address()); auto name = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), file_name); session_probe::Scalar(session_probe::Kind::kIoReadRequest, 0, session_probe::Digest(name.data(), name.size())); }
+  auto live = [&]() -> u32 {
   if (length < 72) {
     return X_STATUS_INFO_LENGTH_MISMATCH;
   }
@@ -690,6 +706,17 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
   }
 
   return result;
+
+  };
+  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  if (trace) {
+    status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 4, status, true));
+    if (io_status_block) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
+        io_status_block.host_address(), sizeof(X_IO_STATUS_BLOCK));
+    if (XSUCCEEDED(status) && file_info_ptr) session_probe::Bytes(session_probe::Kind::kIoMetadata, 1,
+        file_info_ptr.host_address(), length);
+  }
+  return status;
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {

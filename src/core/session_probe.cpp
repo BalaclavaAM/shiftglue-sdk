@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,15 @@ std::filesystem::path root;
 std::chrono::steady_clock::time_point epoch;
 uint32_t main_native_tid = 0;
 std::atomic<uint64_t> matched_frames{0};
+std::atomic<uint64_t> kernel_ticket{0};
+uint64_t kernel_turn = 0;
+std::mutex kernel_mutex;
+std::condition_variable kernel_wake;
+thread_local uint32_t kernel_depth = 0;
+std::atomic<uint64_t> lock_ticket{0};
+uint64_t lock_turn = 0;
+std::mutex grant_mutex;
+std::condition_variable grant_wake;
 
 [[noreturn]] void Fail(const char* reason, const Record& expected = {},
                        const Record& actual = {}) {
@@ -64,6 +74,12 @@ std::atomic<uint64_t> matched_frames{0};
                expected.kind, expected.thread, expected.sequence, expected.key,
                expected.value, expected.size, actual.kind, actual.thread,
                actual.sequence, actual.key, actual.value, actual.size);
+#if defined(_WIN32)
+  void* frames[24];
+  const auto count = CaptureStackBackTrace(0, 24, frames, nullptr);
+  for (unsigned i = 0; i < count; ++i)
+    REXLOG_ERROR("CS_SESSION_STACK {} {:016X}", i, Site(frames[i]));
+#endif
   rex::FlushLogging();
   std::_Exit(86);
 }
@@ -146,6 +162,40 @@ bool Replaying() { return REXCVAR_GET(cs_session_mode)==2; }
 void Require(bool condition, const char* reason) { if (!condition) Fail(reason); }
 Suppress::Suppress() { ++suppression_depth; }
 Suppress::~Suppress() { --suppression_depth; }
+KernelOrder::KernelOrder(uint64_t value) : key(value), outer(Enabled() && !kernel_depth++) {
+  if (!Enabled()) return;
+  if (outer && Replaying()) {
+    auto ticket = Scalar(Kind::kKernelOrder, key, 0, true);
+    std::unique_lock lock(kernel_mutex);
+    kernel_wake.wait(lock, [ticket]() { return kernel_turn == ticket; });
+  }
+}
+void KernelOrder::Acquired() {
+  if (outer && !Replaying()) Scalar(Kind::kKernelOrder, key, kernel_ticket.fetch_add(1));
+}
+LockGrant::LockGrant(uint64_t value) : key(value), active(Enabled()) {
+  if (active && Replaying()) {
+    auto ticket = Scalar(Kind::kLockGrant, key, 0, true);
+    std::unique_lock lock(grant_mutex);
+    grant_wake.wait(lock, [ticket]() { return lock_turn == ticket; });
+  }
+}
+void LockGrant::Acquired() {
+  if (!active) return;
+  if (!Replaying()) Scalar(Kind::kLockGrant, key, lock_ticket.fetch_add(1));
+  else {
+    { std::lock_guard lock(grant_mutex); ++lock_turn; }
+    grant_wake.notify_all();
+  }
+}
+KernelOrder::~KernelOrder() {
+  if (!Enabled()) return;
+  --kernel_depth;
+  if (outer && Replaying()) {
+    { std::lock_guard lock(kernel_mutex); ++kernel_turn; }
+    kernel_wake.notify_all();
+  }
+}
 uint64_t CurrentTag() { return thread_tag; }
 void SetThreadTag(uint64_t tag, uint32_t entry) {
   if (thread_tag==tag) return;

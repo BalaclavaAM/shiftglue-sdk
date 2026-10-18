@@ -230,6 +230,9 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
       guest_thread_(guest_thread),
       main_thread_(main_thread),
       apc_lock_old_irql_(0) {
+  if (session_probe::Enabled()) thread_id_ = uint32_t(session_probe::Scalar(
+      session_probe::Kind::kThreadId, (uint64_t(start_address) << 32) | start_context,
+      thread_id_, true));
   creation_params_.stack_size = stack_size;
   creation_params_.xapi_thread_startup = xapi_thread_startup;
   creation_params_.start_address = start_address;

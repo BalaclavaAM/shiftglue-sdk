@@ -287,10 +287,13 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);
   if (session_probe::Enabled()) {
-    session_probe::Scalar(session_probe::Kind::kIoWrite, (uint64_t(handle()) << 32) | uint32_t(result), bytes_written);
-    session_probe::Scalar(session_probe::Kind::kIoWrite, buffer_guest_address, byte_offset);
-    session_probe::Scalar(session_probe::Kind::kIoData, handle(),
-        session_probe::Digest(memory()->TranslateVirtual(buffer_guest_address), bytes_written));
+    session_probe::Scalar(session_probe::Kind::kIoWrite, (uint64_t(handle()) << 32) | buffer_guest_address, byte_offset);
+    session_probe::Scalar(session_probe::Kind::kIoData, buffer_length,
+        session_probe::Digest(memory()->TranslateVirtual(buffer_guest_address), buffer_length));
+    const auto packed = session_probe::Scalar(session_probe::Kind::kIoWrite, handle(),
+        (uint64_t(result) << 32) | uint32_t(bytes_written), true);
+    result = X_STATUS(packed >> 32); bytes_written = uint32_t(packed);
+    session_probe::Require(bytes_written <= buffer_length, "capture incomplete: replay write range");
   }
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
