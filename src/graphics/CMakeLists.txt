@@ -128,6 +128,10 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
+option(REXGPU_FH1_ORDERED_CENSUS "Compile the experimental ordered draw census" OFF)
+if(REXGPU_FH1_ORDERED_CENSUS)
+    list(APPEND REXGPU_XENOS_SOURCES fh1_frame_order.cpp)
+endif()
 add_library(rexgpu-fh1 SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-fh1 ALIAS rexgpu-fh1)
 if(REXGLUE_USE_D3D12)
@@ -155,6 +159,9 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
     # gives its users; the plugin does not link rexui, so it must set it too
     # to see the Presenter the runtime built.
     target_compile_definitions(${rexgpu_fh1_target} PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+    if(REXGPU_FH1_ORDERED_CENSUS)
+        target_compile_definitions(${rexgpu_fh1_target} PRIVATE REXGPU_FH1_ORDERED_CENSUS=1)
+    endif()
     rex_target_pch(${rexgpu_fh1_target}
         <mutex>
         <unordered_map>

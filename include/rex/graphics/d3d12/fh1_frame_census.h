@@ -36,6 +36,13 @@ struct Fh1CensusDraw {
 
 class Fh1FrameCensus {
  public:
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  // Optional Vulkan ordered census: selected cache-entry identity per emitted
+  // guest draw, grouped by actual host rendering instance. Process-local IDs.
+  static bool OrderedEnabled();
+  static void ObserveOrderedDraw(uint64_t frame, uint64_t pass, const void* pipeline);
+  static void ObserveOrderedSwap(uint64_t frame, uint64_t output_frame);
+#endif
   static bool Enabled();
   static void ObserveDraw(const RegisterFile& regs, const Fh1CensusDraw& draw);
   static void ObserveOptimizedClear(uint64_t frame, uint32_t mode);

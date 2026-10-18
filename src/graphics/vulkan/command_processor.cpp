@@ -36,6 +36,9 @@
 #include <rex/thread.h>
 #include <rex/system/xthread.h>
 #include <rex/graphics/fh1_frame_replay.h>
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+#include <rex/graphics/d3d12/fh1_frame_census.h>
+#endif
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -3726,6 +3729,10 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   pending_draw_calls_ = 0;
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  if (d3d12::Fh1FrameCensus::OrderedEnabled())
+    d3d12::Fh1FrameCensus::ObserveOrderedSwap(observation_frame_sequence_, presented_output_frames_);
+#endif
   if (frame_dump_) {
     frame_dump_->OnSwap(observation_frame_sequence_, frontbuffer_ptr);
   }
@@ -5112,6 +5119,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  ++ordered_census_pass_;
+#endif
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -5205,6 +5215,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  ++ordered_census_pass_;
+#endif
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
@@ -5242,6 +5255,9 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   current_framebuffer_ = nullptr;
   current_fh1_rendering_id_ = id;
   in_render_pass_ = true;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  ++ordered_census_pass_;
+#endif
 }
 
 system::GraphicsShaderTranslationObserver
@@ -6920,6 +6936,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         1,
                                               0, 0, 0);
   }
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  if (!REXCVAR_GET(fh1_debug_skip_draw_calls) && d3d12::Fh1FrameCensus::OrderedEnabled()) {
+    d3d12::Fh1FrameCensus::ObserveOrderedDraw(
+        observation_frame_sequence_, ordered_census_pass_, pipeline_handle);
+  }
+#endif
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
     fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);

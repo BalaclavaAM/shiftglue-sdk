@@ -1538,6 +1538,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  uint64_t ordered_census_pass_ = 0;
+#endif
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
