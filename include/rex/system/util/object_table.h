@@ -12,6 +12,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/string/key.h>
@@ -100,6 +101,8 @@ class ObjectTable {
   uint32_t table_capacity_ = 0;
   ObjectTableEntry* table_ = nullptr;
   uint32_t last_free_entry_ = 0;
+  // Session probes never recycle a published identity within one capture.
+  std::unordered_set<uint32_t> session_slots_;
   std::unordered_map<string::string_key_case, X_HANDLE> name_table_;
 };
 

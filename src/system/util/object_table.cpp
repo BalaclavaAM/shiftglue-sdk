@@ -50,7 +50,7 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
   uint32_t scan_count = 0;
   while (scan_count < table_capacity_) {
     ObjectTableEntry& entry = table_[slot];
-    if (!entry.object) {
+    if (!entry.object && (!session_probe::Enabled() || !session_slots_.contains(slot))) {
       *out_slot = slot;
       return X_STATUS_SUCCESS;
     }
@@ -97,17 +97,23 @@ bool ObjectTable::Resize(uint32_t new_capacity) {
 }
 
 X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
-  session_probe::KernelOrder order(0);
   X_STATUS result = X_STATUS_SUCCESS;
 
   uint32_t handle = 0;
   {
     auto global_lock = global_critical_region_.Acquire();
-    order.Acquired();
 
     // Find a free slot.
     uint32_t slot = 0;
-    result = FindFreeSlot(&slot);
+    if (session_probe::Active() && !session_probe::Enabled()) {
+      // Lazy guest-memory objects have private handles. Their first caller
+      // may differ between runs, so keep them out of published identities.
+      constexpr uint32_t first_private_slot = 1u << 20;
+      if (table_capacity_ <= first_private_slot && !Resize(first_private_slot * 2))
+        return X_STATUS_NO_MEMORY;
+      for (slot = first_private_slot; slot < table_capacity_ && table_[slot].object; ++slot) {}
+      if (slot == table_capacity_ && !Resize(table_capacity_ * 2)) return X_STATUS_NO_MEMORY;
+    } else result = FindFreeSlot(&slot);
     if (session_probe::Enabled()) {
       const auto packed = session_probe::Scalar(session_probe::Kind::kObjectSlot,
           uint32_t(object->type()), (uint64_t(result) << 32) | slot, true);
@@ -117,13 +123,14 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
         if (slot >= table_capacity_ && !Resize(std::max(slot + 1, 16 * 1024u)))
           session_probe::Require(false, "capture incomplete: handle table resize");
         session_probe::Require(!table_[slot].object,
-            "schedule required: recorded handle slot still occupied");
+            "capture incomplete: recorded handle slot occupied");
       }
     }
 
     // Stash.
     if (XSUCCEEDED(result)) {
       ObjectTableEntry& entry = table_[slot];
+      if (session_probe::Enabled()) session_slots_.insert(slot);
       entry.object = object;
       entry.handle_ref_count = 1;
       handle = XObject::kHandleBase + (slot << 2);
@@ -161,9 +168,7 @@ X_STATUS ObjectTable::DuplicateHandle(X_HANDLE handle, X_HANDLE* out_handle) {
 }
 
 X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
-  session_probe::KernelOrder order((UINT64_C(1) << 32) | handle);
   auto global_lock = global_critical_region_.Acquire();
-  order.Acquired();
 
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
@@ -175,9 +180,7 @@ X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
 }
 
 X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
-  session_probe::KernelOrder order((UINT64_C(2) << 32) | handle);
   auto global_lock = global_critical_region_.Acquire();
-  order.Acquired();
 
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
@@ -195,7 +198,6 @@ X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
 }
 
 X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
-  session_probe::KernelOrder order((UINT64_C(3) << 32) | handle);
   X_STATUS result = X_STATUS_SUCCESS;
 
   handle = TranslateHandle(handle);
@@ -206,7 +208,6 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
   // The global lock first: the entry pointer stays valid only while it is
   // held (Resize moves the table).
   auto global_lock = global_critical_region_.Acquire();
-  order.Acquired();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;

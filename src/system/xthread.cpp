@@ -527,6 +527,13 @@ X_STATUS XThread::Create() {
     tls_slots = tls_header->slot_count;
     tls_extended_size = tls_header->data_size;
   }
+  if (session_probe::Enabled()) {
+    const auto layout = session_probe::Scalar(session_probe::Kind::kThreadTls, thread_id_,
+        (uint64_t(tls_slots) << 32) | tls_extended_size, true);
+    tls_slots = uint32_t(layout >> 32); tls_extended_size = uint32_t(layout);
+    session_probe::Require(tls_slots <= (1u << 18) && tls_extended_size <= (1u << 20),
+                            "capture incomplete: replay TLS extent");
+  }
 
   // Allocate both the slots and the extended data.
   // Some TLS is compiled with the binary (declspec(thread)) vars. The game
@@ -542,11 +549,13 @@ X_STATUS XThread::Create() {
 
   // Zero all of TLS.
   memory()->Fill(tls_static_address_, tls_total_size_, 0);
-  if (tls_extended_size) {
+  if (tls_extended_size && !(session_probe::Enabled() && session_probe::Replaying())) {
     // If game has extended data, copy in the default values.
     assert_not_zero(tls_header->raw_data_address);
     memory()->Copy(tls_static_address_, tls_header->raw_data_address, tls_header->raw_data_size);
   }
+  if (session_probe::Enabled()) session_probe::Bytes(session_probe::Kind::kThreadTlsData,
+      thread_id_, memory()->TranslateVirtual(tls_static_address_), tls_total_size_);
 
   // Allocate thread state block from heap.
   // https://web.archive.org/web/20170704035330/https://www.microsoft.com/msj/archive/S2CE.aspx
@@ -577,6 +586,8 @@ X_STATUS XThread::Create() {
                      stack_limit_, stack_base_);
 
   uint8_t cpu_index = GetFakeCpuNumber(static_cast<uint8_t>(creation_params_.creation_flags >> 24));
+  if (session_probe::Enabled()) cpu_index = uint8_t(session_probe::Scalar(
+      session_probe::Kind::kThreadCpu, thread_id_, cpu_index, true));
 
   // Initialize the KTHREAD object.
   InitializeGuestObject();
@@ -1267,6 +1278,8 @@ uint32_t XThread::SelfSuspend() {
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
+  session_probe::SyncBoundary trace((UINT64_C(0xD) << 60) |
+      (uint64_t(alertable) << 32) | processor_mode, interval);
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
@@ -1282,15 +1295,18 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   }
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
+  if (trace.expected && *trace.expected == X_STATUS_SUCCESS)
+    return trace.Finish(X_STATUS_SUCCESS);
   if (alertable) {
-    auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
+    auto result = rex::thread::AlertableSleep(trace.expected ? std::chrono::milliseconds::max()
+        : std::chrono::milliseconds(timeout_ms));
     CheckTitleTermination();
     switch (result) {
       default:
       case rex::thread::SleepResult::kSuccess:
-        return X_STATUS_SUCCESS;
+        return trace.Finish(X_STATUS_SUCCESS);
       case rex::thread::SleepResult::kAlerted:
-        return X_STATUS_USER_APC;
+        return trace.Finish(X_STATUS_USER_APC);
     }
   } else {
     if (timeout_ms == 0) {
@@ -1305,7 +1321,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     CheckTitleTermination();
   }
 
-  return X_STATUS_SUCCESS;
+  return trace.Finish(X_STATUS_SUCCESS);
 }
 
 struct ThreadSavedState {

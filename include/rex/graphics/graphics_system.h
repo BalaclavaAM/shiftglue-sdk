@@ -137,6 +137,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool provider_supports_presentation_ = false;
 
   uint32_t interrupt_callback_ = 0;
+  std::atomic<uint64_t> session_interrupt_callback_{0};
   uint32_t interrupt_callback_data_ = 0;
 
   std::atomic<bool> vsync_worker_running_;

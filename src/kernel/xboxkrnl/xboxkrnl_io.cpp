@@ -654,7 +654,7 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
   return X_STATUS_NO_SUCH_FILE;
 
   };
-  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  u32 status = trace && session_probe::Replaying() ? X_STATUS_SUCCESS : live();
   if (trace) {
     status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 3, status, true));
     if (XSUCCEEDED(status) && file_info) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
@@ -708,7 +708,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
   return result;
 
   };
-  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  u32 status = trace && session_probe::Replaying() ? X_STATUS_SUCCESS : live();
   if (trace) {
     status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 4, status, true));
     if (io_status_block) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,

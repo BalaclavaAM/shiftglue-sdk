@@ -56,15 +56,11 @@ std::filesystem::path root;
 std::chrono::steady_clock::time_point epoch;
 uint32_t main_native_tid = 0;
 std::atomic<uint64_t> matched_frames{0};
-std::atomic<uint64_t> kernel_ticket{0};
-uint64_t kernel_turn = 0;
-std::mutex kernel_mutex;
-std::condition_variable kernel_wake;
-thread_local uint32_t kernel_depth = 0;
-std::atomic<uint64_t> lock_ticket{0};
-uint64_t lock_turn = 0;
+std::map<uint64_t, uint64_t> lock_tickets, lock_turns;
 std::mutex grant_mutex;
 std::condition_variable grant_wake;
+std::mutex observations_mutex;
+std::map<uint32_t, Record> last_stores;
 
 [[noreturn]] void Fail(const char* reason, const Record& expected = {},
                        const Record& actual = {}) {
@@ -74,6 +70,15 @@ std::condition_variable grant_wake;
                expected.kind, expected.thread, expected.sequence, expected.key,
                expected.value, expected.size, actual.kind, actual.thread,
                actual.sequence, actual.key, actual.value, actual.size);
+  if (actual.kind == uint32_t(Kind::kGuestMemory)) {
+    std::lock_guard lock(observations_mutex);
+    const auto address = uint32_t(actual.value >> 32) + uint32_t(actual.key & 0x7FFFFFFF);
+    if (const auto found = last_stores.find(address); found != last_stores.end()) {
+      const auto& store = found->second;
+      REXLOG_ERROR("CS_SESSION_LAST_STORE addr={:08X} thread={:016X} seq={} site={:016X} value={:X} actual_ns={} reference_read_ns={}",
+                   address, store.thread, store.sequence, store.key, store.value, store.host_ns, expected.host_ns);
+    }
+  }
 #if defined(_WIN32)
   void* frames[24];
   const auto count = CaptureStackBackTrace(0, 24, frames, nullptr);
@@ -135,6 +140,10 @@ Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
       uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now()-epoch).count())};
   if (size > 4096 || (size && !data)) Fail("invalid payload size",{},actual);
+  if (kind == Kind::kGuestMemory && (key & (UINT64_C(1) << 31))) {
+    std::lock_guard lock(observations_mutex);
+    last_stores[uint32_t(value >> 32) + uint32_t(key & 0x7FFFFFFF)] = actual;
+  }
   if (mode == 1) {
     if (std::fwrite(&actual,sizeof(actual),1,stream.file)!=1 ||
         (size && std::fwrite(data,1,size,stream.file)!=size)) Fail("write boundary",{},actual);
@@ -158,42 +167,28 @@ Record Exchange(Kind kind, uint64_t key, uint64_t value, void* data,
 }  // namespace
 
 bool Enabled() { return REXCVAR_GET(cs_session_mode)!=0 && !suppression_depth; }
+bool Active() { return REXCVAR_GET(cs_session_mode)!=0; }
 bool Replaying() { return REXCVAR_GET(cs_session_mode)==2; }
 void Require(bool condition, const char* reason) { if (!condition) Fail(reason); }
 Suppress::Suppress() { ++suppression_depth; }
 Suppress::~Suppress() { --suppression_depth; }
-KernelOrder::KernelOrder(uint64_t value) : key(value), outer(Enabled() && !kernel_depth++) {
-  if (!Enabled()) return;
-  if (outer && Replaying()) {
-    auto ticket = Scalar(Kind::kKernelOrder, key, 0, true);
-    std::unique_lock lock(kernel_mutex);
-    kernel_wake.wait(lock, [ticket]() { return kernel_turn == ticket; });
-  }
-}
-void KernelOrder::Acquired() {
-  if (outer && !Replaying()) Scalar(Kind::kKernelOrder, key, kernel_ticket.fetch_add(1));
-}
 LockGrant::LockGrant(uint64_t value) : key(value), active(Enabled()) {
   if (active && Replaying()) {
     auto ticket = Scalar(Kind::kLockGrant, key, 0, true);
     std::unique_lock lock(grant_mutex);
-    grant_wake.wait(lock, [ticket]() { return lock_turn == ticket; });
+    grant_wake.wait(lock, [this, ticket]() { return lock_turns[key] == ticket; });
   }
 }
 void LockGrant::Acquired() {
   if (!active) return;
-  if (!Replaying()) Scalar(Kind::kLockGrant, key, lock_ticket.fetch_add(1));
-  else {
-    { std::lock_guard lock(grant_mutex); ++lock_turn; }
-    grant_wake.notify_all();
+  if (!Replaying()) {
+    uint64_t ticket;
+    { std::lock_guard lock(grant_mutex); ticket = lock_tickets[key]++; }
+    Scalar(Kind::kLockGrant, key, ticket);
   }
-}
-KernelOrder::~KernelOrder() {
-  if (!Enabled()) return;
-  --kernel_depth;
-  if (outer && Replaying()) {
-    { std::lock_guard lock(kernel_mutex); ++kernel_turn; }
-    kernel_wake.notify_all();
+  else {
+    { std::lock_guard lock(grant_mutex); ++lock_turns[key]; }
+    grant_wake.notify_all();
   }
 }
 uint64_t CurrentTag() { return thread_tag; }

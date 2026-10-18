@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 
+namespace rex::system { class XObject; }
 namespace rex::session_probe {
 enum class Kind : uint32_t {
   kTimebase = 1, kSystemTime, kUptime, kInputResult, kInputState,
@@ -15,8 +16,16 @@ enum class Kind : uint32_t {
   kInputCapsResult, kInputCapsData, kInputKeyResult, kInputKeyData,
   kIoReadRequest, kIoReadData, kSemaphoreRelease, kObjectSlot, kThreadId,
   kKernelOrder, kGuestTickCount, kIoResult, kIoMetadata, kLockGrant, kTryLock,
+  kInterruptDelivery, kCallbackRegistration, kMmioRead,
+  kAllocationRequest, kAllocationResult, kThreadCpu,
+  kThreadTls, kThreadTlsData,
+  kGuestMemory,
+  kHostHook,
+  kAudioPump, kAudioCallback,
 };
 bool Enabled();
+bool Active();
+uint64_t ObjectKey(const system::XObject* object);
 bool Replaying();
 void SetThreadTag(uint64_t tag, uint32_t entry = 0);
 void SetHostRole(uint64_t role);
@@ -32,14 +41,6 @@ void Require(bool condition, const char* reason);
 struct Suppress {
   Suppress();
   ~Suppress();
-};
-// Replay only the kernel table's existing critical sections, not guest code.
-struct KernelOrder {
-  uint64_t key;
-  bool outer;
-  explicit KernelOrder(uint64_t key);
-  void Acquired();
-  ~KernelOrder();
 };
 struct LockGrant {
   uint64_t key;

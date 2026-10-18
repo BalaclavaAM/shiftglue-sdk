@@ -203,7 +203,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
-  session_probe::SyncBoundary trace(handle(), opt_timeout ? *opt_timeout : UINT64_MAX);
+  session_probe::SyncBoundary trace(session_probe::ObjectKey(this), opt_timeout ? *opt_timeout : UINT64_MAX);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -245,7 +245,8 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
 X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
                                 uint32_t processor_mode, uint32_t alertable,
                                 uint64_t* opt_timeout) {
-  session_probe::SyncBoundary trace((uint64_t(signal_object->handle()) << 32) | wait_object->handle(),
+  const uint64_t identities[] = {session_probe::ObjectKey(signal_object), session_probe::ObjectKey(wait_object)};
+  session_probe::SyncBoundary trace(session_probe::Digest(identities, sizeof(identities)),
                                     opt_timeout ? *opt_timeout : UINT64_MAX);
   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
                                       TimeoutTicksToMs(*opt_timeout)))
@@ -281,7 +282,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                uint64_t* opt_timeout) {
   uint64_t key = (uint64_t(wait_type) << 32) | count;
   if (session_probe::Enabled()) {
-    for (uint32_t i = 0; i < count; ++i) key = (key ^ objects[i]->handle()) * UINT64_C(1099511628211);
+    for (uint32_t i = 0; i < count; ++i) key = (key ^ session_probe::ObjectKey(objects[i])) * UINT64_C(1099511628211);
   }
   session_probe::SyncBoundary trace(key, opt_timeout ? *opt_timeout : UINT64_MAX);
   std::vector<rex::thread::WaitHandle*> wait_handles(count);
@@ -438,6 +439,9 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     return object;
   } else {
     // First use, create new.
+    const bool trace = session_probe::Enabled();
+    std::optional<session_probe::Suppress> private_identity;
+    if (trace) private_identity.emplace();
     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
     XObject* object = nullptr;
     switch (as_type) {
@@ -483,9 +487,18 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     // Stash pointer in struct.
     // FIXME: This assumes the object contains a dispatch header (some don't!)
     StashHandle(header, object->handle());
+    if (trace) object->guest_object_ptr_ = uint32_t(reinterpret_cast<uint8_t*>(native_ptr) -
+        kernel_state->memory()->virtual_membase());
 
     return object_ref<XObject>(object);
   }
 }
 
 }  // namespace rex::system
+
+namespace rex::session_probe {
+uint64_t ObjectKey(const system::XObject* object) {
+  const auto address = Enabled() ? object->guest_object() : 0;
+  return address ? (UINT64_C(1) << 63) | address : object->handle();
+}
+}  // namespace rex::session_probe

@@ -17,6 +17,7 @@
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
@@ -26,6 +27,7 @@
 #include <rex/cvar.h>
 
 #include <vector>
+#include <thread>
 
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
@@ -109,6 +111,7 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 }
 
 void AudioSystem::WorkerThreadMain() {
+  if (session_probe::Enabled()) session_probe::SetHostRole(6);
   // Initialize driver and ringbuffer.
   Initialize();
 
@@ -121,8 +124,18 @@ void AudioSystem::WorkerThreadMain() {
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
-    auto result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
-                                       std::chrono::milliseconds(500));
+    std::pair<rex::thread::WaitResult, size_t> result{};
+    if (!(session_probe::Enabled() && session_probe::Replaying()))
+      result = rex::thread::WaitAny(wait_handles_, rex::countof(wait_handles_), true,
+                                     std::chrono::milliseconds(500));
+    if (session_probe::Enabled()) {
+      const auto packed = session_probe::Scalar(session_probe::Kind::kAudioPump, 0,
+          (uint64_t(result.first) << 32) | uint32_t(result.second), true);
+      result = {rex::thread::WaitResult(packed >> 32), uint32_t(packed)};
+      session_probe::Require(result.first != rex::thread::WaitResult::kSuccess ||
+                              result.second <= kMaximumClientCount,
+                              "capture incomplete: audio pump index out of range");
+    }
     if (result.first == rex::thread::WaitResult::kFailed) {
       REXAPU_WARN("AudioWorker: WaitAny failed");
       continue;
@@ -161,6 +174,21 @@ void AudioSystem::WorkerThreadMain() {
         }
       }
 
+      if (session_probe::Enabled()) {
+        const auto expected = session_probe::Scalar(session_probe::Kind::kAudioCallback, index,
+            (uint64_t(client_callback) << 32) | client_callback_arg, true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (expected && expected != ((uint64_t(client_callback) << 32) | client_callback_arg)) {
+          session_probe::Require(std::chrono::steady_clock::now() < deadline,
+                                  "capture incomplete: audio callback registration not reached");
+          std::this_thread::yield();
+          std::lock_guard lock(clients_mutex_);
+          client_callback = clients_[index].callback;
+          client_callback_arg = clients_[index].wrapped_callback_arg;
+          host_source = clients_[index].host_source;
+        }
+        if (!expected) client_callback = 0;
+      }
       if (client_callback && host_source && host_source->BuildFrame(host_frame.data())) {
         // The source built this block itself: no guest callback, no guest pass.
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->host_frame");

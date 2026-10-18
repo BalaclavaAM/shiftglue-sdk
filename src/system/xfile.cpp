@@ -177,7 +177,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
           auto* read_buffer = buffer_physical_heap
               ? memory()->TranslatePhysical(buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
               : memory()->TranslateVirtual(buffer_guest_address);
-          if (!session_probe::Replaying())
+          if (!(tracing && session_probe::Replaying()))
             result = file_->ReadSync(std::span<uint8_t>(read_buffer, buffer_length),
                 size_t(byte_offset), &bytes_read);
           capture_result(read_buffer);

@@ -26,6 +26,8 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
+#include <array>
 #include <rex/perf/counter.h>
 #include <rex/math.h>
 #include <rex/stream.h>
@@ -1533,6 +1535,35 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
 bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
                           uint32_t alignment, uint32_t allocation_type, uint32_t protect,
                           bool top_down, uint32_t* out_address) {
+  if (session_probe::Enabled()) {
+    const std::array<uint32_t, 7> args = {low_address, high_address, size, alignment,
+                                         allocation_type, protect, uint32_t(top_down)};
+    session_probe::Scalar(session_probe::Kind::kAllocationRequest, heap_base_,
+                          session_probe::Digest(args.data(), sizeof(args)));
+    bool success = false;
+    uint32_t address = 0;
+    if (session_probe::Replaying()) {
+      const auto packed = session_probe::Scalar(session_probe::Kind::kAllocationResult,
+                                                heap_base_, 0, true);
+      address = uint32_t(packed); success = bool(packed >> 32);
+      if (success) {
+        session_probe::Require(address >= low_address && uint64_t(address) + size <= uint64_t(high_address) + 1,
+                                "capture incomplete: replay allocation range");
+        session_probe::Suppress internal;
+        session_probe::Require(BaseHeap::AllocFixed(address, rex::round_up(size, page_size_),
+                                                    page_size_, allocation_type, protect),
+                                "capture incomplete: recorded allocation unavailable");
+      }
+    } else {
+      { session_probe::Suppress internal;
+        success = BaseHeap::AllocRange(low_address, high_address, size, alignment,
+                                       allocation_type, protect, top_down, &address); }
+      session_probe::Scalar(session_probe::Kind::kAllocationResult, heap_base_,
+                            (uint64_t(success) << 32) | address);
+    }
+    *out_address = address;
+    return success;
+  }
   *out_address = 0;
 
   alignment = rex::round_up(alignment, page_size_);

@@ -204,7 +204,7 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
   return status;
 
   };
-  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  u32 status = trace && session_probe::Replaying() ? X_STATUS_SUCCESS : live();
   if (trace) {
     status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 1, status, true));
     if (io_status_block_ptr) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
@@ -471,7 +471,7 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
   return status;
 
   };
-  u32 status = session_probe::Replaying() ? X_STATUS_SUCCESS : live();
+  u32 status = trace && session_probe::Replaying() ? X_STATUS_SUCCESS : live();
   if (trace) {
     status = u32(session_probe::Scalar(session_probe::Kind::kIoResult, 2, status, true));
     if (io_status_block_ptr) session_probe::Blob(session_probe::Kind::kIoMetadata, 0,
