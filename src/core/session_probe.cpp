@@ -196,6 +196,8 @@ std::optional<uint32_t> PeekWaitResult(uint64_t key) {
     if (record.size && std::fseek(stream.file,record.size,SEEK_CUR)) Fail("skip wait payload");
   }
   if (std::fsetpos(stream.file,&position)) Fail("restore wait lookahead position");
+  // A thread may still be waiting when the bounded recording ends.
+  if (!found && !std::ferror(stream.file)) return std::nullopt;
   if (!found) Fail("missing wait result");
   return uint32_t(record.value);
 }

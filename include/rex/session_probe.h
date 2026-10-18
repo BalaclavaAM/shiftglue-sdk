@@ -13,7 +13,7 @@ enum class Kind : uint32_t {
   kPerformanceFrequency, kVblankDelivery, kTimestampDelivery, kApcDelivery,
   kHostEpoch,
   kInputCapsResult, kInputCapsData, kInputKeyResult, kInputKeyData,
-  kIoReadRequest, kIoReadData,
+  kIoReadRequest, kIoReadData, kSemaphoreRelease,
 };
 bool Enabled();
 bool Replaying();

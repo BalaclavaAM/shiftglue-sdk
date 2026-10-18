@@ -43,7 +43,7 @@ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_c
   if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSignal, handle(), uint64_t(uint32_t(release_count)) << 32);
   int32_t previous_count = 0;
   bool success = semaphore_->Release(release_count, &previous_count);
-  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSyncResult, handle(),
+  if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kSemaphoreRelease, handle(),
       (uint64_t(success) << 32) | uint32_t(previous_count));
   if (out_previous_count) {
     *out_previous_count = previous_count;
