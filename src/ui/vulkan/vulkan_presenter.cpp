@@ -3015,7 +3015,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                              VK_SUBPASS_CONTENTS_INLINE);
   }
-  if (swapchain_image_clear_needed) {
+  const uint32_t hdr_test_pattern =
+      uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+  const bool hdr_calibration = paint_context_.swapchain_hdr && hdr_test_pattern != 0;
+  if (swapchain_image_clear_needed || hdr_calibration) {
+    // Patterns replace the guest, including its HUD mask. Only the host UI
+    // drawn below may cover them, even on a menu frame whose guest mask is 1.
+    swapchain_image_clear_attachment.clearValue.color.float32[3] = hdr_calibration ? 0.0f : 1.0f;
     VkClearRect swapchain_image_clear_rectangle;
     swapchain_image_clear_rectangle.rect.offset.x = 0;
     swapchain_image_clear_rectangle.rect.offset.y = 0;
@@ -3156,7 +3162,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // Mostly the largest channel: a red brake light (luminance 0.21) expands
     // nearly as a white one; deep colored surfaces stay below the knee.
     hdr_constants.max_channel_weight = 0.75f;
-    hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+    hdr_constants.pattern = hdr_test_pattern;
     // Compare returns before drawing patterns in the shader; calibration must
     // cover both halves without changing the player's compare setting.
     hdr_constants.compare_x =
