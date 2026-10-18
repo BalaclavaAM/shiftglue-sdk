@@ -49,6 +49,10 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+REXCVAR_DEFINE_BOOL(cs_ctx_addresses, false, "Diagnostics",
+                    "Log thread context ranges for the CS-0.2 sampled traffic ceiling")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // Off on Android too until a device measures it (AP-7.0): on the 8-core
 // emulator the raised priority alone (its cores are alike, so nothing is
 // pinned) stalled or derailed fh1-opening-sync in two runs of two.
@@ -608,6 +612,11 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_CREATED();
 
     // Execute user code.
+    if (REXCVAR_GET(cs_ctx_addresses)) {
+      REXLOG_INFO("CS_CTX tid={} guest={:08X} ctx={:X} size={}",
+                  rex::thread::current_thread_system_id(), creation_params_.start_address,
+                  reinterpret_cast<uintptr_t>(thread_state_->context()), sizeof(PPCContext));
+    }
     session_probe::SetThreadTag(thread_id_);
     current_xthread_tls_ = this;
     running_ = true;
