@@ -698,6 +698,14 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   // NL-3.2: nothing written, nothing outdated, and each texture already used
   // and sampled in this submission: the full request would change nothing.
   const bool reload_probe = REXCVAR_GET(fh1_texture_reload_probe);
+  // Include small world textures, but emit each payload only once per probe
+  // window rather than once per draw that samples it.
+  static thread_local bool probe_was_enabled = false;
+  static thread_local std::unordered_map<uint64_t, uint64_t> probed_payloads;
+  if (reload_probe != probe_was_enabled) {
+    probed_payloads.clear();
+    probe_was_enabled = reload_probe;
+  }
   if (skip_unchanged_requests_ && !reload_probe &&
       !(used_texture_mask & ~(texture_bindings_in_sync() & sampled_ready_mask_)) &&
       sampled_ready_submission_ == current_submission_index() &&
@@ -764,15 +772,26 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
-      if (reload_probe && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
+      if (reload_probe) {
         const TextureKey& k = binding_texture->key();
-        REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
-                    "dim {} tiled {} packed {} mip_page {:X} depth {} pitch {} mips {} signed {}",
-                    uintptr_t(binding_texture), uint32_t(k.base_page << 12), uint32_t(k.format),
-                    k.GetWidth(), k.GetHeight(), uint32_t(k.endianness),
-                    binding_texture->outdated_mask(), uint32_t(k.dimension), uint32_t(k.tiled),
-                    uint32_t(k.packed_mips), uint32_t(k.mip_page), k.GetDepthOrArraySize(),
-                    uint32_t(k.pitch), uint32_t(k.mip_max_level), uint32_t(k.signed_separate));
+        const uint64_t generation = binding_texture->payload_generation();
+        auto [entry, inserted] =
+            probed_payloads.try_emplace(binding_texture->allocation_id(), generation);
+        if (inserted || entry->second != generation) {
+          entry->second = generation;
+          auto pages = shared_memory().CountValidPages(uint32_t(k.base_page << 12),
+                                                       binding_texture->GetGuestBaseSize());
+          REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
+                      "dim {} tiled {} packed {} mip_page {:X} depth {} pitch {} mips {} signed {} "
+                      "allocation_id {} generation {} scaled {} valid_pages {} gpu_pages {}",
+                      uintptr_t(binding_texture), uint32_t(k.base_page << 12), uint32_t(k.format),
+                      k.GetWidth(), k.GetHeight(), uint32_t(k.endianness),
+                      binding_texture->outdated_mask(), uint32_t(k.dimension), uint32_t(k.tiled),
+                      uint32_t(k.packed_mips), uint32_t(k.mip_page), k.GetDepthOrArraySize(),
+                      uint32_t(k.pitch), uint32_t(k.mip_max_level), uint32_t(k.signed_separate),
+                      binding_texture->allocation_id(), binding_texture->payload_generation(),
+                      uint32_t(k.scaled_resolve), pages.first, pages.second);
+        }
       }
       VulkanTexture::Usage old_usage =
           binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);

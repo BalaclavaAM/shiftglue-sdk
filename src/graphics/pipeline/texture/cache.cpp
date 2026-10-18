@@ -1116,13 +1116,20 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    const auto layout = key.GetGuestLayout();
+    const uint32_t base_size = layout.base.level_data_extent_bytes;
+    const uint32_t mips_size = layout.mips_total_extent_bytes;
+    const FormatInfo* format = FormatInfo::Get(key.format);
+    const bool compressed = format->block_width > 1 || format->block_height > 1;
+    // A compressed asset can reuse part of an old resolve allocation. One
+    // leftover GPU page must not redirect its CPU base and mips to that buffer.
+    const bool base_scaled =
+        base_size && IsRangeScaledResolved(key.base_page << 12, base_size, compressed);
+    const bool mips_scaled =
+        mips_size && IsRangeScaledResolved(key.mip_page << 12, mips_size, compressed);
+    if ((base_size || mips_size) &&
+        (compressed ? ((!base_size || base_scaled) && (!mips_size || mips_scaled))
+                    : (base_scaled || mips_scaled))) {
       key.scaled_resolve = 1;
     }
   }

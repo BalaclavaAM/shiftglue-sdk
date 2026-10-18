@@ -110,3 +110,54 @@ TEST_CASE("texture binding memo follows resolve ownership with unchanged fetch w
   CHECK(cache.bound(1) == unrelated);
   CHECK(unrelated->payload_generation() == 1);
 }
+
+TEST_CASE("compressed textures do not select a partly owned scaled buffer",
+          "[graphics][texture_cache]") {
+  RegisterFile regs;
+  TestSharedMemory memory;
+  TestTextureCache cache(regs, memory);
+  constexpr uint32_t kBase = 0x400000;
+  constexpr uint32_t kMips = 0x418000;
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.format = xenos::TextureFormat::k_DXT1;
+  fetch.tiled = 1;
+  fetch.packed_mips = 1;
+  fetch.pitch = 24;
+  fetch.size_2d.width = 767;
+  fetch.size_2d.height = 255;
+  fetch.base_address = kBase >> 12;
+  fetch.mip_address = kMips >> 12;
+  fetch.mip_max_level = 9;
+  std::memcpy(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], &fetch, sizeof(fetch));
+  SetFetch(regs, 1, 0x800000);
+  cache.RequestTextures(3);
+  const auto* cpu = cache.bound();
+  const auto* unrelated = cache.bound(1);
+  REQUIRE(cpu);
+  REQUIRE(unrelated);
+  CHECK_FALSE(cpu->key().scaled_resolve);
+  const uint32_t length = kMips - kBase + cpu->GetGuestMipsSize();
+
+  cache.MarkRangeAsResolved(kBase, length);
+  cache.RequestTextures(3);
+  REQUIRE(cache.bound());
+  CHECK(cache.bound()->key().scaled_resolve);
+
+  // Reuse the base for CPU asset data, leaving old GPU ownership in the mips.
+  memory.MemoryInvalidationCallback(kBase, cpu->GetGuestBaseSize(), true);
+  cache.RequestTextures(3);
+  REQUIRE(cache.bound());
+  CHECK_FALSE(cache.bound()->key().scaled_resolve);
+  CHECK(cache.bound() == cpu);
+  CHECK(cache.bound(1) == unrelated);
+  CHECK(unrelated->payload_generation() == 1);
+
+  // The reverse mixture must not select scaled memory either.
+  memory.MemoryInvalidationCallback(kBase, length, true);
+  cache.MarkRangeAsResolved(kBase, cpu->GetGuestBaseSize());
+  cache.RequestTextures(3);
+  REQUIRE(cache.bound());
+  CHECK_FALSE(cache.bound()->key().scaled_resolve);
+}
