@@ -72,19 +72,15 @@ struct NtSystemClock {
 
   // To convert XSystemClock to sys, do clock_cast<WinSystemTime>(tp) first
   // Only available for Host domain (Guest time must be converted via clock_cast)
-  static constexpr std::chrono::system_clock::time_point to_sys(const time_point& tp)
+  static constexpr std::chrono::sys_time<duration> to_sys(const time_point& tp)
     requires(domain_ == Domain::Host)
   {
-    using sys_duration = std::chrono::system_clock::duration;
-    using sys_time = std::chrono::system_clock::time_point;
-
-    auto dp = tp;
-    dp += unix_epoch_delta();
-    auto cdp = std::chrono::time_point_cast<sys_duration>(dp);
-    return sys_time{cdp.time_since_epoch()};
+    // A nanosecond system_clock cannot represent 1601; retain NT precision and range.
+    return std::chrono::sys_time<duration>{tp.time_since_epoch() + unix_epoch_delta()};
   }
 
-  static constexpr time_point from_sys(const std::chrono::system_clock::time_point& tp)
+  template <typename Duration>
+  static constexpr time_point from_sys(const std::chrono::sys_time<Duration>& tp)
     requires(domain_ == Domain::Host)
   {
     auto ctp = std::chrono::time_point_cast<duration>(tp);

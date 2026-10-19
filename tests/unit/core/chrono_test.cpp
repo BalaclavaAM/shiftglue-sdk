@@ -110,6 +110,38 @@ TEST_CASE("from_sys then to_sys round-trips for whole-second values", "[chrono]"
   }
 }
 
+TEST_CASE("system time conversions retain NT range and 100 ns precision", "[chrono]") {
+  using namespace std::chrono;
+  using rex::chrono::hundrednanoseconds;
+
+  // These dates are outside the range of a signed 64-bit nanosecond clock.
+  for (auto date : {year{1601} / January / 1, year{9999} / December / 31}) {
+    CHECK(WinSystemClock::to_sys(WinSystemClock::from_sys(sys_days{date})) == sys_days{date});
+    sys_time<hundrednanoseconds> expected = sys_days{date};
+    expected += hours{23} + minutes{59} + seconds{59} + hundrednanoseconds{9999999};
+    auto nt = WinSystemClock::from_sys(expected);
+    CHECK(WinSystemClock::to_sys(nt) == expected);
+    CHECK(WinSystemClock::from_sys(WinSystemClock::to_sys(nt)) == nt);
+  }
+
+  CHECK(WinSystemClock::to_sys(WinSystemClock::from_file_time(0)).time_since_epoch() ==
+        hundrednanoseconds{-116444736000000000LL});
+  // Both host clock resolutions must convert to the same NT ticks.
+  for (int64_t ticks : {-1LL, 0LL, 1LL, 132538032123450001LL - 116444736000000000LL}) {
+    auto expected = static_cast<uint64_t>(ticks + 116444736000000000LL);
+    CHECK(WinSystemClock::to_file_time(
+              WinSystemClock::from_sys(sys_time<hundrednanoseconds>{hundrednanoseconds{ticks}})) ==
+          expected);
+    CHECK(WinSystemClock::to_file_time(
+              WinSystemClock::from_sys(sys_time<nanoseconds>{nanoseconds{ticks * 100}})) ==
+          expected);
+  }
+  for (auto value : {nanoseconds::min(), nanoseconds::max()}) {
+    auto nt = WinSystemClock::from_sys(sys_time<nanoseconds>{value});
+    CHECK(WinSystemClock::to_sys(nt).time_since_epoch() == duration_cast<hundrednanoseconds>(value));
+  }
+}
+
 // =============================================================================
 // Section 4: Calendar Decomposition (mirrors RtlTimeToTimeFields)
 // =============================================================================
@@ -228,7 +260,7 @@ static uint64_t recompose(int y, unsigned m, unsigned d, int hour, int min, int 
   if (!ymd.ok())
     return 0;
   auto dp = static_cast<std::chrono::sys_days>(ymd);
-  std::chrono::system_clock::time_point time = dp;
+  std::chrono::sys_time<WinSystemClock::duration> time = dp;
   time += std::chrono::hours{hour};
   time += std::chrono::minutes{min};
   time += std::chrono::seconds{sec};
@@ -243,10 +275,12 @@ TEST_CASE("calendar recomposition: known dates produce correct FILETIMEs", "[chr
   CHECK(recompose(2000, 2, 29, 0, 0, 0, 0) == kFtLeapDay);
   CHECK(recompose(2020, 12, 30, 12, 0, 12, 345) == kFtSubDay);
   CHECK(recompose(2021, 1, 1, 0, 0, 0, 0) == kFt2021);
+  CHECK(recompose(9999, 12, 31, 23, 59, 59, 0) == 2650467743990000000ULL);
 }
 
 TEST_CASE("calendar recomposition: decompose then recompose round-trips", "[chrono]") {
-  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFtLeapDay, kFtSubDay, kFt2021}) {
+  for (uint64_t ft : {kFtNtEpoch, kFtUnixEpoch, kFtY2k, kFtLeapDay, kFtSubDay, kFt2021,
+                      uint64_t{2650467743999990000ULL}}) {
     auto tf = decompose(ft);
     auto result =
         recompose(tf.year, tf.month, tf.day, tf.hours, tf.minutes, tf.seconds, tf.milliseconds);
