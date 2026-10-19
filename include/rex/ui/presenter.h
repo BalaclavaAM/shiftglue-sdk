@@ -1042,6 +1042,8 @@ class Presenter {
   PresentationDeadlineScheduler presentation_deadline_scheduler_;
   uint64_t last_presented_refresh_sequence_ = UINT64_MAX;
   bool last_presented_ui_ = false;
+  uint64_t last_seen_refresh_sequence_ = UINT64_MAX;
+  int64_t last_refresh_change_ns_ = 0;
   int64_t last_present_time_ns_ = 0;
 
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;

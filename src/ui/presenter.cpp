@@ -1497,18 +1497,29 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   std::lock_guard<std::mutex> pacing_lock(presentation_pacing_mutex_);
   const uint64_t refresh_sequence =
       guest_output_refresh_sequence_.load(std::memory_order_acquire);
-  // A suspended title still needs UI repaints, and one final paint without
-  // drawers to erase a closed overlay from the last presented image.
-  if (!execute_ui_drawers && !last_presented_ui_ &&
-      REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
-      refresh_sequence == last_presented_refresh_sequence_) {
-    return PaintResult::kNotPresented;
-  }
   using PresentationClock = std::chrono::steady_clock;
   auto now = PresentationClock::now();
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              now.time_since_epoch())
                              .count();
+  if (refresh_sequence != last_seen_refresh_sequence_) {
+    last_seen_refresh_sequence_ = refresh_sequence;
+    last_refresh_change_ns_ = now_ns;
+  }
+  // An unchanged guest frame is not presented again: an overlay redraws with
+  // the next guest frame. Only a suspended or stalled title (no new frame for
+  // 100 ms, as under the frame inspector) gets UI repaints over its last
+  // frame, and a closed overlay one final paint without drawers to erase it.
+  // Presenting every UI tick while the title ran doubled the presents on
+  // high-refresh displays and lagged the game with F3 open.
+  constexpr int64_t kStalledTitleNs = 100'000'000;
+  if (REXCVAR_GET(pinyon_shift_fh1_source_presentation) &&
+      refresh_sequence == last_presented_refresh_sequence_) {
+    const bool erase_overlay = !execute_ui_drawers && last_presented_ui_;
+    const bool repaint_stalled =
+        execute_ui_drawers && now_ns - last_refresh_change_ns_ >= kStalledTitleNs;
+    if (!erase_overlay && !repaint_stalled) return PaintResult::kNotPresented;
+  }
   const auto pacing = presentation_deadline_scheduler_.Plan(
       now_ns, uint32_t(REXCVAR_GET(host_present_fps_limit)));
   if (pacing.missed_deadlines) {
