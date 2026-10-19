@@ -329,6 +329,13 @@ class Fh1NativeExecutor {
     // In readback_buffer_.
     VkDeviceSize offset;
   };
+  struct DeferredReadback {
+    uint32_t address;
+    uint32_t length;
+    // In deferred_readback_buffer_.
+    VkDeviceSize offset;
+    uint64_t submission;
+  };
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
@@ -425,6 +432,11 @@ class Fh1NativeExecutor {
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
+  // Small resolves the CPU reads every frame (the auto exposure's luminance,
+  // #548): copied into a ring and written to guest memory once their
+  // submission has completed, a frame or two late, never waiting for the GPU.
+  void QueueDeferredReadback(uint32_t address, uint32_t length);
+  void ApplyCompletedDeferredReadbacks();
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);
@@ -639,6 +651,12 @@ class Fh1NativeExecutor {
   VkDeviceSize readback_size_ = 0;
   VkDeviceSize readback_used_ = 0;
   const uint8_t* readback_mapped_ = nullptr;
+  static constexpr VkDeviceSize kDeferredReadbackSize = 64 * 1024;
+  std::deque<DeferredReadback> deferred_readbacks_;
+  VkBuffer deferred_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory deferred_readback_memory_ = VK_NULL_HANDLE;
+  const uint8_t* deferred_readback_mapped_ = nullptr;
+  VkDeviceSize deferred_readback_next_ = 0;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.

@@ -588,6 +588,10 @@ void Fh1NativeExecutor::Shutdown() {
   retired_buffers_.clear();
   pending_readbacks_.clear();
   destroy_buffer(readback_buffer_, readback_memory_);
+  deferred_readbacks_.clear();
+  destroy_buffer(deferred_readback_buffer_, deferred_readback_memory_);
+  deferred_readback_mapped_ = nullptr;
+  deferred_readback_next_ = 0;
   readback_mapped_ = nullptr;
   readback_size_ = 0;
   readback_used_ = 0;
@@ -2938,7 +2942,68 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
   Count("resolve_readback_one_off");
 }
 
+void Fh1NativeExecutor::QueueDeferredReadback(uint32_t address, uint32_t length) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (length > kDeferredReadbackSize) return;
+  if (!deferred_readback_buffer_) {
+    void* mapped = nullptr;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, kDeferredReadbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, deferred_readback_buffer_,
+            deferred_readback_memory_) ||
+        dfn.vkMapMemory(device, deferred_readback_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+            VK_SUCCESS) {
+      return Skip("resolve_readback_deferred_buffer");
+    }
+    deferred_readback_mapped_ = static_cast<const uint8_t*>(mapped);
+  }
+  const VkDeviceSize size = (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
+  if (deferred_readback_next_ + size > kDeferredReadbackSize) deferred_readback_next_ = 0;
+  const VkDeviceSize offset = deferred_readback_next_;
+  // The ring is far larger than the copies in flight; if the GPU is that far
+  // behind, this frame's copy is dropped rather than waited for.
+  ApplyCompletedDeferredReadbacks();
+  for (const DeferredReadback& pending : deferred_readbacks_) {
+    if (pending.offset < offset + size && offset < pending.offset + pending.length) {
+      Count("resolve_readback_deferred_dropped");
+      return;
+    }
+  }
+  deferred_readback_next_ = offset + size;
+  config_.memory->Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  const VkBufferCopy region = {address, offset, length};
+  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(
+      config_.memory->buffer(), deferred_readback_buffer_, 1, &region);
+  deferred_readbacks_.push_back(
+      {address, length, offset, command_processor_.GetCurrentSubmission()});
+  Count("resolve_readback_deferred");
+}
+
+void Fh1NativeExecutor::ApplyCompletedDeferredReadbacks() {
+  if (deferred_readbacks_.empty()) return;
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  if (deferred_readbacks_.front().submission > completed) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  VkMappedMemoryRange range = {};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = deferred_readback_memory_;
+  range.size = VK_WHOLE_SIZE;
+  vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+  // In order: a later resolve over the same bytes wins, as on the GPU.
+  while (!deferred_readbacks_.empty() && deferred_readbacks_.front().submission <= completed) {
+    const DeferredReadback& pending = deferred_readbacks_.front();
+    config_.memory->CopyReadbackToGuest(pending.address,
+                                        deferred_readback_mapped_ + pending.offset,
+                                        pending.length);
+    deferred_readbacks_.pop_front();
+  }
+}
+
 void Fh1NativeExecutor::FlushResolveReadbacks() {
+  ApplyCompletedDeferredReadbacks();
   if (pending_readbacks_.empty()) return;
   command_processor_.Fh1AwaitAllQueueOperations();
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
@@ -2956,6 +3021,8 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   }
   pending_readbacks_.clear();
   readback_used_ = 0;
+  // Everything has completed now, the deferred copies included.
+  ApplyCompletedDeferredReadbacks();
   Count("resolve_readback_flush");
 }
 
@@ -3221,7 +3288,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
         extent_length <= kUnscaledCopyMaxLength &&
         plan.info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT &&
         REXCVAR_GET(fh1_readback_small_float_resolves)) {
-      QueueResolveReadback(extent_start, extent_length);
+      QueueDeferredReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
@@ -3337,6 +3404,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   FinishCameraFrame();
   AdvanceJitter();
   if (!initialized_) return;
+  ApplyCompletedDeferredReadbacks();
   ReleaseRetiredImages(false);
   UpdateCoarseShading();
   GpuDrain();
