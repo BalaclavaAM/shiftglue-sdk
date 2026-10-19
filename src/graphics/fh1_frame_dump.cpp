@@ -89,6 +89,13 @@ std::filesystem::path Fh1FrameDump::RequestedPath() {
 void Fh1FrameDump::OnSwap(uint64_t frame, uint32_t frontbuffer_address) {
   if (done_) return;
   if (frame_ == std::numeric_limits<uint64_t>::max()) frame_ = frame + 1;
+  // A request for the current or a past frame (fh1_frame_dump_frame is hot
+  // reloaded) records the next one instead of waiting forever and blocking
+  // every later request.
+  if (!recording_ && frame + 1 > frame_) {
+    REXGPU_WARN("FH1 frame dump: frame {} has passed; recording frame {}", frame_, frame + 1);
+    frame_ = frame + 1;
+  }
   if (!recording_ && frame + 1 == frame_) {
     Begin();
   } else if (recording_ && frame == frame_) {
