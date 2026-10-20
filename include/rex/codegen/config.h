@@ -204,6 +204,12 @@ struct RecompilerConfig {
   /// Also take every Nth leaf function (no calls) of at least four instructions
   /// as a reference function, 0 for none: a broad sample without a hand list.
   uint32_t referenceSampleEvery = 0;
+  /// Region oracle roots: each listed function and every function it reaches
+  /// through direct calls is emitted twice more, as `orr_sub_X` (reference
+  /// options) and `orc_sub_X` (this build's options), with logged stores and
+  /// calls kept inside the region (rex/ppc/oracle.h). A host oracle defines
+  /// the strong `sub_X` of each root.
+  std::vector<uint32_t> oracleRegions;
   std::vector<uint32_t> hostOverriddenFunctions;
   /// Test builds: wrap every direct and indirect guest call in REX_ABI_POISON_PRE
   /// and REX_ABI_POISON_POST, which check that the callee preserved the PowerPC
