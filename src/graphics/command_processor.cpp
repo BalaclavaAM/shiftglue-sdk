@@ -2228,7 +2228,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     return true;
   }
   if (d3d_census_decoder::Active()) {
-    d3d_census_decoder::Packet(packet_offset);
+    d3d_census_decoder::Packet(packet_offset, packet);
   }
   if (packet_recorder_) {
     uint32_t dword_count = 1;
@@ -3458,7 +3458,8 @@ bool CommandProcessor::D3dCensusDraw(memory::RingBuffer* reader, uint32_t count)
         decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
     // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
     // of no tiling pass), the draws the untiled Android path keeps.
-    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy);
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy,
+                             TilingPassOfSelect() <= 0 && copy);
     if (copy && d3d_skip_visible_ >= 3 && d3d_census_decoder::Visible()) {
       static uint64_t visible_copies = 0;
       const uint64_t copies = ++visible_copies;
