@@ -18,6 +18,10 @@
 
 REXCVAR_DECLARE(int32_t, gpu_d3d_program);
 REXCVAR_DECLARE(bool, gpu_draw_cost_model);
+REXCVAR_DECLARE(double, fh1_hud_squeeze);
+REXCVAR_DECLARE(double, fh1_hud_scale);
+REXCVAR_DECLARE(double, fh1_hud_safe_zone);
+REXCVAR_DECLARE(bool, fh1_hud_scale_suspended);
 
 namespace rex::graphics::vulkan {
 
@@ -74,6 +78,30 @@ void VulkanCommandProcessor::DrawProgramResolve() {
   }
   program->last_swap = draw_program_swaps_;
   ++program->runs;
+  // The settings the derivation reads, once a run instead of by draw.
+  const uint32_t resolution_scale = texture_cache_->draw_resolution_scale_x() |
+                                    texture_cache_->draw_resolution_scale_y() << 16;
+  const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  const double hud_scale =
+      REXCVAR_GET(fh1_hud_scale_suspended)
+          ? 1.0
+          : REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone));
+  const bool object_motion = fh1_native_executor_ && fh1_native_executor_->ObjectMotionEnabled();
+  if (program->resolution_scale != resolution_scale || program->hud_squeeze != hud_squeeze ||
+      program->hud_scale != hud_scale || program->object_motion != object_motion) {
+    if (!program->draws.empty()) {
+      for (const ProgramDraw& draw : program->draws) {
+        if (draw.valid && draw.index_version != UINT32_MAX) RetireIndexVersion(draw.index_version);
+      }
+      program->draws.clear();
+      ++draw_program_stats_.miss[kMissSettings];
+    }
+    program->resolution_scale = resolution_scale;
+    program->hud_squeeze = hud_squeeze;
+    program->hud_scale = hud_scale;
+    program->object_motion = object_motion;
+  }
+  draw_program_object_motion_ = object_motion;
   draw_program_ = program;
 }
 
@@ -176,6 +204,7 @@ void VulkanCommandProcessor::DrawProgramRecord(ProgramDraw& d, bool recordable, 
   d.hud_scale = o.hud_scale;
   d.major_mode_explicit = o.major_mode_explicit;
   d.object_slot = o.object_slot;
+  d.hud_draw = fh1_native_executor_ && fh1_native_executor_->IsHudDraw();
   d.vertex_shader = o.vertex_shader;
   d.pixel_shader = o.pixel_shader;
   d.primitive_polygonal = o.primitive_polygonal;

@@ -178,6 +178,7 @@ class Fh1NativeExecutor {
   // each pixel's depth with its slot's matrix.
   static constexpr uint32_t kMaxObjectSlots = 256;
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
+  bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
   // or an object's own (DrawObjectMatrixRegister).

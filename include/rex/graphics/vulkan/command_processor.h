@@ -1574,6 +1574,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_scale = 0.0;
     bool major_mode_explicit = false;
     bool object_slot = false;
+    bool hud_draw = false;
     // Outputs.
     VulkanShader* vertex_shader = nullptr;
     VulkanShader* pixel_shader = nullptr;
@@ -1598,6 +1599,13 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<ProgramDraw> draws;
     uint32_t last_swap = 0;
     uint64_t runs = 0;
+    // The settings its draws were recorded under, checked once a run: a
+    // change drops the draws. The derivation reads them, but they only
+    // change between frames.
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
+    bool object_motion = false;
   };
   // Key: the buffer (address << 32 | dwords) mixed with the state hash and
   // shaders at its start, so each pass that runs the list has its own.
@@ -1607,6 +1615,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   DrawProgram draw_program_timed_;
   // The run's program key, looked up at its first draw (DrawProgramResolve).
   bool draw_program_pending_ = false;
+  // The run's program has scene object slots to check by draw.
+  bool draw_program_object_motion_ = false;
   uint64_t draw_program_pending_key_ = 0;
   struct ProgramCacheEntry {
     uint64_t key = 0;

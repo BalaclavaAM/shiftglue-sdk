@@ -5938,12 +5938,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                  (indexed && (pd.dma_base != regs.values[XE_GPU_REG_VGT_DMA_BASE] ||
                               pd.dma_size != regs.values[XE_GPU_REG_VGT_DMA_SIZE]))) {
         miss = kMissDraw;
-      } else if (pd.resolution_scale != (texture_cache_->draw_resolution_scale_x() |
-                                         texture_cache_->draw_resolution_scale_y() << 16) ||
-                 pd.hud_squeeze != REXCVAR_GET(fh1_hud_squeeze) ||
-                 pd.hud_scale != hud_scale_now() ||
-                 pd.object_slot != (pd.pixel_shader && fh1_native_executor_ &&
-                                    fh1_native_executor_->IsSceneObjectDraw(*pd.vertex_shader))) {
+      } else if (pd.hud_draw != (fh1_native_executor_ && fh1_native_executor_->IsHudDraw()) ||
+                 (draw_program_object_motion_ &&
+                  pd.object_slot != (pd.pixel_shader &&
+                                     fh1_native_executor_->IsSceneObjectDraw(*pd.vertex_shader)))) {
+        // The other settings are checked once a run (DrawProgramResolve).
         miss = kMissSettings;
       } else if (pd.index_version != UINT32_MAX &&
                  (!index_versions_[pd.index_version].alive ||
