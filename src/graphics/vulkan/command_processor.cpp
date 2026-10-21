@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1540,10 +1541,12 @@ bool VulkanCommandProcessor::SetupContext() {
         "D3D12 parity, but unsupported by the selected device");
     return false;
   }
-  if (!device_properties.vertexPipelineStoresAndAtomics) {
+  if (!device_properties.vertexPipelineStoresAndAtomics &&
+      REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
     REXGPU_ERROR(
-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
-        "D3D12 parity, but unsupported by the selected device");
+        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation "
+        "(vulkan_require_vertex_pipeline_stores_and_atomics=true), but unsupported by "
+        "the selected device");
     return false;
   }
   if (!device_properties.geometryShader) {
@@ -6031,13 +6034,27 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
     pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
     memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
-    if (memexport_used_vertex) {
-      if (!device_properties.vertexPipelineStoresAndAtomics) {
-        REXGPU_ERROR(
-            "Vertex shader memexport draw encountered without "
-            "vertexPipelineStoresAndAtomics support");
-        return false;
+    if (memexport_used_vertex && !device_properties.vertexPipelineStoresAndAtomics) {
+      // Only reached with vulkan_require_vertex_pipeline_stores_and_atomics
+      // off. The translator drops the exports (IsMemoryExportSupported), so
+      // draw as a plain vertex shader, logged once per shader to show whether
+      // the title depends on vertex memory export.
+      static std::mutex skipped_memexport_mutex;
+      static std::unordered_set<uint64_t> skipped_memexport_shaders;
+      bool first_skip;
+      {
+        std::lock_guard<std::mutex> lock(skipped_memexport_mutex);
+        first_skip = skipped_memexport_shaders.insert(vertex_shader->ucode_data_hash()).second;
       }
+      if (first_skip) {
+        REXGPU_WARN(
+            "Vertex shader {:016X} uses memory export, skipped without "
+            "vertexPipelineStoresAndAtomics support (experimental; guest memory writes dropped)",
+            vertex_shader->ucode_data_hash());
+      }
+      memexport_used_vertex = false;
+    }
+    if (memexport_used_vertex) {
       draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
     }
 
