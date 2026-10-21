@@ -5914,6 +5914,23 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     return true;
   }
 
+  // Item-2 ceiling (fh1_visibility_oracle_skip): the draw by its shaders,
+  // index range, count and targets.
+  if (fh1_native_executor_ && fh1_native_executor_->VisActive()) {
+    uint64_t key = uint64_t(uintptr_t(active_vertex_shader()));
+    const auto mix = [&key](uint64_t value) {
+      key = (key ^ value) * 0x100000001B3ull;
+      key ^= key >> 29;
+    };
+    mix(uint64_t(uintptr_t(active_pixel_shader())));
+    mix(uint64_t(regs.values[XE_GPU_REG_VGT_DMA_BASE]) << 32 |
+        regs.values[XE_GPU_REG_VGT_DMA_SIZE]);
+    mix(uint64_t(index_count) << 8 | uint32_t(prim_type));
+    mix(uint64_t(regs.values[XE_GPU_REG_RB_COLOR_INFO]) << 32 |
+        regs.values[XE_GPU_REG_RB_DEPTH_INFO]);
+    if (fh1_native_executor_->VisOracleSkip(key)) return true;
+  }
+
   // NA-2.4: a draw inside a pilot list's program (after the copies and the
   // skipped later tiles, which never reach it). It is the recorded draw
   // while its state hash, shaders, draw words and the settings the
@@ -6574,6 +6591,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider = nullptr;
   // Set up the render targets - this may perform dispatches and draws.
   Fh1DrawInfo fh1_draw;
+  reg::RB_DEPTHCONTROL census_depth_control;
   VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
   if (fh1_native_executor_) {
     {
@@ -6596,6 +6614,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         }
       }
     }
+    census_depth_control = normalized_depth_control;
+    if (fh1_native_executor_->VisNoDepth()) normalized_depth_control.z_enable = 0;
     fh1_draw.memexport = memexport_writes_possible;
     fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_draw.rasterization_done = is_rasterization_done;
@@ -7142,6 +7162,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(
         fmt::format("P {:016X}", pixel_shader ? pixel_shader->ucode_data_hash() : 0).c_str());
   }
+  const uint32_t vis_query =
+      fh1_native_executor_
+          ? fh1_native_executor_->VisBegin(fh1_draw, census_depth_control,
+                                           primitive_processing_result.host_draw_vertex_count)
+          : UINT32_MAX;
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
@@ -7204,6 +7229,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 #endif
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
+    fh1_native_executor_->VisEnd(vis_query);
     fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
