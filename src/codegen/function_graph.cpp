@@ -2883,9 +2883,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx, bool allowSpecializati
       const uint32_t opcode = PPC_OP(lastInstruction);
       const bool hasExplicitTransfer =
           (opcode == PPC_OP_B || opcode == PPC_OP_CTR) && !PPC_BL(lastInstruction);
-      if (!hasExplicitTransfer && ctx.oracleMembers) {
+      if (!hasExplicitTransfer && ctx.oracleMembers &&
+          (!ctx.regionRealCalls || ctx.oracleMembers->count(fallthroughTarget->base()))) {
         // A region copy falls through into the next function's copy, or
-        // leaves the region there.
+        // leaves the region there (a native region copy leaves it for real,
+        // below).
         if (ctx.oracleMembers->count(fallthroughTarget->base())) {
           ctx.reference(ctx.oraclePrefix + fallthroughTarget->name());
           emit_println(body, "\tREX_TAIL_CALL({}{});", ctx.oraclePrefix,

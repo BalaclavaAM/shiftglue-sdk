@@ -61,7 +61,8 @@ bool BuilderContext::localizeNonVolatiles() const {
 }
 
 bool BuilderContext::isReferenceCopy() const {
-  return emitCtx.namePrefix == "ref_" || emitCtx.oracleMembers != nullptr;
+  return emitCtx.namePrefix == "ref_" ||
+         (emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls);
 }
 
 // Region oracle copies: the callee inside the region's copies, or "" when the
@@ -397,7 +398,10 @@ std::string BuilderContext::calleeSymbol(const rex::codegen::FunctionNode& fn) c
 
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
-  const bool oracle = emitCtx.oracleMembers != nullptr;
+  // A native region copy calls region functions' copies but makes every
+  // other call for real.
+  const bool oracle = emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls;
+  const bool region = emitCtx.oracleMembers != nullptr;
   auto opaque = [&](std::string_view indent) {
     println("{}REX_ORACLE_OPAQUE(ctx, base, 0x{:08X}u, 0x{:08X}u);", indent, address, base);
   };
@@ -444,22 +448,24 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // A reference copy (NN-5.1) inlines the helpers as they are, so their
       // stack stores go through the logged macros and the copy can be rolled
       // back; a call would write the frame behind the log's back.
-      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+      if ((localizeNonVolatiles() || isReferenceCopy() || emitCtx.oracleMembers) &&
+          isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, "\t", false);
         return;
       }
 
       // A region oracle copy stays inside the region's copies.
       std::string inside;
-      if (oracle) {
+      if (region) {
         inside = oracleCallee(*targetFn);
-        if (inside.empty()) {
+        if (inside.empty() && oracle) {
           opaque("\t");
           return;
         }
-        emitCtx.reference(inside);
+        if (!inside.empty())
+          emitCtx.reference(inside);
       }
-      const std::string& target_symbol = oracle ? inside : callee;
+      const std::string& target_symbol = inside.empty() ? callee : inside;
 
       // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
       // the owner left live, and a share_registers function reads the caller's
@@ -542,7 +548,10 @@ void BuilderContext::emit_function_call(uint32_t address) {
 
 void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view indent) {
   const auto& cfg = config();
-  const bool oracle = emitCtx.oracleMembers != nullptr;
+  // A native region copy calls region functions' copies but makes every
+  // other call for real.
+  const bool oracle = emitCtx.oracleMembers != nullptr && !emitCtx.regionRealCalls;
+  const bool region = emitCtx.oracleMembers != nullptr;
   auto opaque = [&] {
     println("{}REX_ORACLE_OPAQUE(ctx, base, 0x{:08X}u, 0x{:08X}u);", indent, address, base);
   };
@@ -566,7 +575,8 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       const std::string callee = calleeSymbol(*targetFn);
       if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, indent, true))
         return;
-      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+      if ((localizeNonVolatiles() || isReferenceCopy() || emitCtx.oracleMembers) &&
+          isSaveRestoreHelper(name)) {
         inlineSaveRestoreHelper(*targetFn, indent, true);
         return;
       }
@@ -576,15 +586,17 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
         publishLocalNonVolatiles(indent);
       }
-      if (oracle) {
+      if (region) {
         const std::string inside = oracleCallee(*targetFn);
-        if (inside.empty()) {
+        if (inside.empty() && oracle) {
           opaque();
           return;
         }
-        emitCtx.reference(inside);
-        println("{}REX_TAIL_CALL({});", indent, inside);
-        return;
+        if (!inside.empty()) {
+          emitCtx.reference(inside);
+          println("{}REX_TAIL_CALL({});", indent, inside);
+          return;
+        }
       }
       emitCtx.reference(name);
       println("{}REX_TAIL_CALL({});", indent, callee);

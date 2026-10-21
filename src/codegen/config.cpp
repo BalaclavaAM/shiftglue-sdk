@@ -179,6 +179,12 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
         cfg.oracleRegions.push_back(static_cast<uint32_t>(*val));
     }
   }
+  if (auto regions = toml["native_regions"].as_array()) {
+    for (const auto& elem : *regions) {
+      if (auto val = elem.value<int64_t>())
+        cfg.nativeRegions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   if (auto overridden = toml["host_overridden_functions"].as_array()) {
     for (const auto& elem : *overridden) {
       if (auto val = elem.value<int64_t>())

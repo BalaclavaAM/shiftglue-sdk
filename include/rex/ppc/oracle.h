@@ -90,6 +90,18 @@ inline void OracleCrtRun(OracleCrt kind, PPCContext& ctx, uint8_t* base) {
 
 }  // namespace rex::ppc
 
+// Native regions (codegen option native_regions, #750): every region
+// function is emitted again as an always-inline copy that takes the region's
+// local context `ctx`, a stack copy whose address never escapes, so Clang
+// keeps registers in SSA values across calls inside the region. `real` is the
+// caller's context: a call that leaves the region publishes the local context
+// to it, makes the call there and reloads afterwards. The generated
+// `nr_sub_X` copies the context in, runs the region and copies it back.
+#define REX_NR_FN(name)                                                             \
+  static inline __attribute__((always_inline)) void name(                          \
+      PPCContext& __restrict ctx, [[maybe_unused]] uint8_t* base,                  \
+      [[maybe_unused]] PPCContext& __restrict real)
+
 // The generated call is spelled with `ctx, base` so the register-locals sync
 // passes publish the localized registers before it, as before a real call.
 #define REX_ORACLE_OPAQUE(ctx, base, target, site) \
