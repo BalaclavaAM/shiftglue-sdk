@@ -984,9 +984,19 @@ bool CodegenWriter::write(bool force) {
         for (const auto& [from, to] :
              {std::pair<std::string, std::string>{"real = ctx;", publish + "(real, ctx);"},
               std::pair<std::string, std::string>{"ctx = real;", sync + "(ctx, real);"}}) {
-          for (size_t at = synced.find(from); at != std::string::npos;
-               at = synced.find(from, at + to.size()))
+          for (size_t at = synced.find(from); at != std::string::npos;) {
+            // An indirect call declares its own `PPCContext& __restrict ctx
+            // = real;`: that is a binding, not a copy back.
+            static constexpr std::string_view kBinding = "__restrict ";
+            if (at >= kBinding.size() &&
+                std::string_view(synced).substr(at - kBinding.size(), kBinding.size()) ==
+                    kBinding) {
+              at = synced.find(from, at + from.size());
+              continue;
+            }
             synced.replace(at, from.size(), to);
+            at = synced.find(from, at + to.size());
+          }
         }
         // The region is one host function, so its guest memory accesses need
         // not be volatile: the compiler may keep an inlined member's spills
