@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -74,6 +76,32 @@ void SetFetch(RegisterFile& regs, uint32_t index, uint32_t address) {
 }
 
 }  // namespace
+
+TEST_CASE("shared memory watches grow past a pool and recycle cancelled ranges",
+          "[graphics][shared_memory]") {
+  constexpr uint32_t kBase = 0x100000;
+  constexpr size_t kWatches = 16'385;
+  std::vector<uint32_t> callbacks(kWatches, 0);
+  TestSharedMemory memory;
+  const auto callback = [](const std::unique_lock<std::recursive_mutex>&, void* context,
+                           void*, uint64_t index, bool) {
+    ++(*static_cast<std::vector<uint32_t>*>(context))[index];
+  };
+  std::vector<SharedMemory::WatchHandle> watches;
+  for (size_t i = 0; i < kWatches; ++i) {
+    auto watch = memory.WatchMemoryRange(kBase, 4096, callback, &callbacks, nullptr, i);
+    REQUIRE(watch);
+    watches.push_back(watch);
+  }
+  for (size_t i = 0; i < kWatches; i += 2) memory.UnwatchMemoryRange(watches[i]);
+  for (size_t i = 0; i < kWatches; i += 2) {
+    REQUIRE(memory.WatchMemoryRange(kBase, 4096, callback, &callbacks, nullptr, i));
+  }
+  memory.MemoryInvalidationCallback(kBase, 4096, true);
+  CHECK(std::all_of(callbacks.begin(), callbacks.end(), [](uint32_t n) { return n == 1; }));
+  memory.MemoryInvalidationCallback(kBase, 4096, true);
+  CHECK(std::all_of(callbacks.begin(), callbacks.end(), [](uint32_t n) { return n == 1; }));
+}
 
 TEST_CASE("texture binding memo follows resolve ownership with unchanged fetch words",
           "[graphics][texture_cache]") {

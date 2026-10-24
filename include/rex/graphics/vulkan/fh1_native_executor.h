@@ -635,6 +635,8 @@ class Fh1NativeExecutor {
   // Specialized resolves by {image, source kind, msaa, specialization constants}.
   std::map<std::array<uint32_t, 9>, VkPipeline> specialized_resolve_pipelines_;
   uint32_t specialized_transfer_pipelines_ = 0;
+  bool transfer_capacity_logged_ = false;
+  bool resolve_capacity_logged_ = false;
   bool async_specialize_ = false;
   std::unique_ptr<rex::thread::Thread> specialize_thread_;
   std::mutex specialize_mutex_;

@@ -1648,6 +1648,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkBuffer index_arena_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory index_arena_memory_ = VK_NULL_HANDLE;
   bool index_arena_failed_ = false;
+  bool index_arena_capacity_logged_ = false;
   std::map<VkDeviceSize, VkDeviceSize> index_arena_free_;
   struct DrawProgramStats {
     uint64_t runs = 0, programs_made = 0, evicted = 0;

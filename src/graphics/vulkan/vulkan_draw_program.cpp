@@ -14,6 +14,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DECLARE(int32_t, gpu_d3d_program);
@@ -279,6 +280,11 @@ uint32_t VulkanCommandProcessor::AcquireIndexVersion(uint32_t guest_base, uint32
                         [size](const auto& range) { return range.second >= size; });
     if (slot == index_arena_free_.end()) {
       ++s.arena_full;
+      PERF_counter_inc(kGpuIndexArenaFallbacks);
+      if (!index_arena_capacity_logged_) {
+        index_arena_capacity_logged_ = true;
+        REXGPU_WARN("Draw programs: index version arena full (16 MiB); reading guest ranges");
+      }
       return UINT32_MAX;
     }
   }

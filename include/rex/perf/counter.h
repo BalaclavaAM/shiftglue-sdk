@@ -251,6 +251,17 @@ enum class CounterId : uint16_t {
   kD3dCensusSkippedShaderLoads,
   kD3dCensusSkippedConstantPackets,
 
+  // Fixed-capacity cache pressure: occupancy gauges and per-frame fallbacks.
+  kFh1TransferSpecializationEntries,
+  kFh1ResolveSpecializationEntries,
+  kFh1TransferSpecializationFallbacks,
+  kFh1ResolveSpecializationFallbacks,
+  kGpuIndexArenaFallbacks,
+  kGpuSamplerCapacityWaits,
+  kGpuBindlessOverflows,
+  kD3dProgramMarkDrops,
+  kD3dProgramMarkReclaims,
+
   kCount  // sentinel -- must be last
 };
 

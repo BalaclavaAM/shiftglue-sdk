@@ -277,6 +277,15 @@ constexpr const char* kCounterNames[] = {
     "d3d_census_skipped_draws",
     "d3d_census_skipped_shader_loads",
     "d3d_census_skipped_constant_packets",
+    "fh1_transfer_specialization_entries",
+    "fh1_resolve_specialization_entries",
+    "fh1_transfer_specialization_fallbacks",
+    "fh1_resolve_specialization_fallbacks",
+    "gpu_index_arena_fallbacks",
+    "gpu_sampler_capacity_waits",
+    "gpu_bindless_overflows",
+    "d3d_program_mark_drops",
+    "d3d_program_mark_reclaims",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -422,6 +431,15 @@ constexpr bool kIsGauge[] = {
     false,  // kD3dCensusSkippedDraws
     false,  // kD3dCensusSkippedShaderLoads
     false,  // kD3dCensusSkippedConstantPackets
+    true,  // kFh1TransferSpecializationEntries
+    true,  // kFh1ResolveSpecializationEntries
+    false,  // kFh1TransferSpecializationFallbacks
+    false,  // kFh1ResolveSpecializationFallbacks
+    false,  // kGpuIndexArenaFallbacks
+    false,  // kGpuSamplerCapacityWaits
+    false,  // kGpuBindlessOverflows
+    false,  // kD3dProgramMarkDrops
+    false,  // kD3dProgramMarkReclaims
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

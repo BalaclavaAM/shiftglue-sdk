@@ -581,6 +581,7 @@ class VulkanTextureCache final : public TextureCache {
   uint8_t unsupported_format_features_used_[64] = {};
 
   uint32_t sampler_max_count_;
+  bool sampler_capacity_logged_ = false;
 
   xenos::AnisoFilter max_anisotropy_;
 

@@ -23,6 +23,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+#include <rex/perf/counter.h>
 #include <rex/thread.h>
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
@@ -1271,17 +1272,26 @@ void Fh1NativeExecutor::SpecializeTransfer(TransferPipelineKey& key,
     // Like resolves, a few dozen kinds; past the cap, generic.
     if (specialized_transfer_pipelines_ < 256 || transfer_pipelines_.count(specialized)) {
       key = specialized;
+      return;
+    }
+  } else {
+    CollectSpecialized();
+    auto it = transfer_pipelines_.find(specialized);
+    if (it != transfer_pipelines_.end()) {
+      // Null while the worker builds it, or if it failed: generic.
+      if (it->second) key = specialized;
+      return;
+    }
+  }
+  if (specialized_transfer_pipelines_ >= 256) {
+    PERF_counter_inc(kFh1TransferSpecializationFallbacks);
+    if (!transfer_capacity_logged_) {
+      transfer_capacity_logged_ = true;
+      REXGPU_WARN("FH1 transfer specialization cache full (256 entries); "
+                  "using generic pipelines");
     }
     return;
   }
-  CollectSpecialized();
-  auto it = transfer_pipelines_.find(specialized);
-  if (it != transfer_pipelines_.end()) {
-    // Null while the worker builds it, or if it failed: generic.
-    if (it->second) key = specialized;
-    return;
-  }
-  if (specialized_transfer_pipelines_ >= 256) return;
   VkShaderModule vertex_module, fragment_module;
   if (!GetTransferModules(specialized, vertex_module, fragment_module)) return;
   ++specialized_transfer_pipelines_;
@@ -1315,7 +1325,15 @@ VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t
   auto it = specialized_resolve_pipelines_.find(key);
   if (it != specialized_resolve_pipelines_.end()) return it->second;
   // Every kind the title resolves takes a few dozen; past the cap, generic.
-  if (specialized_resolve_pipelines_.size() >= 256) return VK_NULL_HANDLE;
+  if (specialized_resolve_pipelines_.size() >= 256) {
+    PERF_counter_inc(kFh1ResolveSpecializationFallbacks);
+    if (!resolve_capacity_logged_) {
+      resolve_capacity_logged_ = true;
+      REXGPU_WARN("FH1 resolve specialization cache full (256 entries); "
+                  "using generic pipelines");
+    }
+    return VK_NULL_HANDLE;
+  }
   const SpirvShader& shader =
       image ? kImageShaders[source_kind][msaa] : kComputeShaders[false][source_kind][msaa];
   const VkShaderModule module =
@@ -3533,6 +3551,8 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
     }
   }
   frame_ = frame;
+  PERF_counter_set(kFh1TransferSpecializationEntries, specialized_transfer_pipelines_);
+  PERF_counter_set(kFh1ResolveSpecializationEntries, specialized_resolve_pipelines_.size());
   if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
 }
 

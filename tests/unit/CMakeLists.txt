@@ -22,6 +22,7 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    system/d3d_program_test.cpp
     input/input_assignment_test.cpp
     input/joystick_mapping_test.cpp
     input/wheel_test.cpp

@@ -838,6 +838,7 @@ uint32_t VulkanTextureCache::AllocateBindlessSlot(uint32_t array) {
   if (bindless_.next[array] < bindless_.capacity[array]) {
     return bindless_.next[array]++;
   }
+  PERF_counter_inc(kGpuBindlessOverflows);
   if (!bindless_.overflows++) {
     REXGPU_ERROR("VulkanTextureCache: Bindless array {} is full ({} slots); views drawn as null",
                  array, bindless_.capacity[array]);
@@ -1288,6 +1289,12 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
     }
     if (sampler_used_first_->second.last_usage_submission >
         command_processor_.GetCompletedSubmission()) {
+      PERF_counter_inc(kGpuSamplerCapacityWaits);
+      if (!sampler_capacity_logged_) {
+        sampler_capacity_logged_ = true;
+        REXGPU_WARN("VulkanTextureCache: all {} samplers in flight; waiting to recycle",
+                    sampler_max_count_);
+      }
       has_overflown_out = true;
       return VK_NULL_HANDLE;
     }
