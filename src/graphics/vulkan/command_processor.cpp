@@ -6870,6 +6870,11 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  if (fh1_native_executor_) {
+    const uint32_t factor = fh1_native_executor_->draw_coordinate_scale();
+    draw_resolution_scale_x *= factor;
+    draw_resolution_scale_y *= factor;
+  }
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -6894,7 +6899,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // only for HUD draws over this frame's scene (fh1_native_executor).
   const double hud_scale = hud_scale_now();
   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
-  if (program_hit) {
+  if (program_hit && program_draw->resolution_scale == viewport_resolution_scale) {
     viewport_info = program_draw->viewport;
   } else {
     draw_program_stats_.derived_viewport += program_draw != nullptr;
@@ -9353,6 +9358,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   const RegisterFile& regs = *register_file_;
   uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
   uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  if (fh1_native_executor_) {
+    const uint32_t factor = fh1_native_executor_->draw_coordinate_scale();
+    draw_resolution_scale_x *= factor;
+    draw_resolution_scale_y *= factor;
+  }
 
   // Window parameters.
   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
@@ -9651,6 +9661,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   const RegisterFile& regs = *register_file_;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
   uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  if (fh1_native_executor_) {
+    const uint32_t factor = fh1_native_executor_->draw_coordinate_scale();
+    draw_resolution_scale_x *= factor;
+    draw_resolution_scale_y *= factor;
+  }
 
   // Everything below derives from render state block registers (covered by
   // the render state epoch), the two per-draw registers read here and the

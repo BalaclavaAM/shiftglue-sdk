@@ -88,10 +88,12 @@ class Fh1NativeExecutor {
   // The host sample count of surfaces the guest renders with this many
   // samples (fh1_msaa_single_sample, fh1_msaa_2x).
   xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
+    if (shared_depth_alias_draw_) return xenos::MsaaSamples::k1X;
     if (guest == xenos::MsaaSamples::k1X || single_sample_msaa_) return xenos::MsaaSamples::k1X;
     return two_sample_msaa_ && guest == xenos::MsaaSamples::k4X ? xenos::MsaaSamples::k2X
                                                                  : guest;
   }
+  uint32_t draw_coordinate_scale() const { return shared_depth_alias_draw_ ? 2u : 1u; }
 
   // Before the targets are bound for a draw: derives the surfaces the draw
   // writes and takes their EDRAM tiles, transferring the previous owners'
@@ -729,6 +731,8 @@ class Fh1NativeExecutor {
   uint32_t recent_prepare_next_ = 0;
 
   uint64_t frame_ = 0;
+  bool shared_depth_alias_enabled_ = false;
+  bool shared_depth_alias_draw_ = false;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
   bool two_sample_msaa_ = false;

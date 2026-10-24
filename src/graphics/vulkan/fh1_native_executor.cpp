@@ -79,6 +79,9 @@ REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
                      "Frames between the FH1 native executor's periodic stats and GPU profile "
                      "logs (Vulkan); shorter windows separate heavy stretches of play")
     .range(1, 100000);
+REXCVAR_DEFINE_BOOL(fh1_shared_depth_alias, true, "GPU",
+                    "Share the base-0 half-pitch 4x depth image when draw inputs allow it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_visibility_census, 0, "GPU",
                      "Diagnostics: every N frames, an occlusion query around each draw, logging "
                      "by rendering how many draws pass no samples (FH1 native executor, Vulkan); "
@@ -2010,14 +2013,24 @@ bool Fh1NativeExecutor::ClaimDepthOverwriteTiles(const SurfaceKey& key, uint32_t
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
   const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  for (const auto& rect : depth_overwrite_.rects()) {
+  const auto image_rect = [this](Fh1DepthOverwrite::Rect rect) {
+    // The interpreter's rectangles are in guest pixels, before alias scaling.
+    if (shared_depth_alias_draw_) {
+      for (auto& coordinate : rect.inner) coordinate *= 2;
+      for (auto& coordinate : rect.outer) coordinate *= 2;
+    }
+    return rect;
+  };
+  for (const auto& guest_rect : depth_overwrite_.rects()) {
+    const auto rect = image_rect(guest_rect);
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
     const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
     if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
       return false;
     }
   }
-  for (const auto& rect : depth_overwrite_.rects()) {
+  for (const auto& guest_rect : depth_overwrite_.rects()) {
+    const auto rect = image_rect(guest_rect);
     ClaimOverwrittenDepthTiles(key, rect.inner, stencil_overwritten);
     const uint32_t column_first = uint32_t(rect.outer[0]) / tile_width;
     const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
@@ -2094,8 +2107,45 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
 
 void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
+  const bool enabled = REXCVAR_GET(fh1_shared_depth_alias);
+  if (enabled != shared_depth_alias_enabled_) {
+    shared_depth_alias_enabled_ = enabled;
+    for (auto& memo : prepare_memos_) memo = {};
+    for (auto& recent : recent_prepares_) recent = {};
+  }
+  shared_depth_alias_draw_ = false;
+  const auto depth_control = draw.normalized_depth_control;
+  const bool reads_depth = depth_control.z_enable &&
+      depth_control.zfunc != xenos::CompareFunction::kAlways &&
+      depth_control.zfunc != xenos::CompareFunction::kNever;
+  const auto window = register_file_.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const bool untile_shifted = untile_height_ &&
+      (window.window_x_offset || window.window_y_offset);
+  if (enabled && !single_sample_msaa_ && !two_sample_msaa_ && !untile_shifted &&
+      !draw.memexport && !draw.occlusion_query_active && !reads_depth &&
+      (register_file_[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) == 0xFFFF &&
+      (!draw.pixel_shader || !draw.pixel_shader->writes_depth()) && draw.rasterization_done &&
+      (draw.normalized_depth_control.z_enable || draw.normalized_depth_control.stencil_enable)) {
+    const auto surface = register_file_.Get<reg::RB_SURFACE_INFO>();
+    const auto depth = register_file_.Get<reg::RB_DEPTH_INFO>();
+    shared_depth_alias_draw_ = surface.msaa_samples == xenos::MsaaSamples::k4X &&
+        Fh1PitchTiles(surface.surface_pitch, uint32_t(surface.msaa_samples)) == 16 &&
+        depth.depth_base == 0 && depth.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
+    if (shared_depth_alias_draw_ && draw.pixel_shader) {
+      uint32_t position;
+      const uint32_t interpolators = draw.pixel_shader->GetInterpolatorInputMask(
+          register_file_.Get<reg::SQ_PROGRAM_CNTL>(),
+          register_file_.Get<reg::SQ_CONTEXT_MISC>(), position);
+      const auto color = register_file_.Get<reg::RB_COLORCONTROL>();
+      // Position generation and texture derivatives still use the shader's global scale.
+      shared_depth_alias_draw_ = !interpolators && position == UINT32_MAX &&
+          !draw.pixel_shader->uses_texture_fetch_instruction_results() &&
+          !draw.pixel_shader->kills_pixels() && !color.alpha_test_enable &&
+          !color.alpha_to_mask_enable;
+    }
+  }
   // The extent estimate reads vertices when clipping is off.
-  const bool memo_allowed = draw.state_epoch && !draw.memexport &&
+  const bool memo_allowed = draw.state_epoch && !draw.memexport && !shared_depth_alias_draw_ &&
                             !register_file_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
   PrepareMemo& memo =
       prepare_memos_[draw.state_is_hash ? (draw.state_epoch >> 40) & (std::size(prepare_memos_) - 1)
@@ -2165,8 +2215,17 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
       }
     }
   }
+  shared_depth_alias_draw_ &= bool(used_bits & 1);
   pending_used_bits_ = used_bits;
   if (!used_bits) return;
+
+  if (shared_depth_alias_draw_) {
+    // The 4x samples occupy the same 2x2 EDRAM words as the 1x pixels.
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (used_bits & (1u << i)) keys[i].msaa = uint32_t(xenos::MsaaSamples::k1X);
+    }
+    Count("shared_depth_alias_draw");
+  }
 
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
   auto length_for_height = [&](uint32_t height) {
@@ -2210,7 +2269,8 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], height_used)) {
+    if ((used_bits & (1u << i)) &&
+        !GetOrCreateSurface(keys[i], height_used * draw_coordinate_scale())) {
       used_bits &= ~(1u << i);
     }
   }
@@ -2273,7 +2333,7 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
   const uint32_t used_bits = pending_used_bits_;
   const SurfaceKey* keys = pending_keys_;
   const uint64_t rendering_id = DrawRenderingId(used_bits);
-  key_out.msaa_samples = single_sample_msaa_
+  key_out.msaa_samples = single_sample_msaa_ || shared_depth_alias_draw_
                              ? xenos::MsaaSamples::k1X
                              : register_file_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
   if (two_sample_msaa_ && key_out.msaa_samples == xenos::MsaaSamples::k4X) {
@@ -3369,8 +3429,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   // ownership of the cleared tiles.
   const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  auto clear = [&](const SurfaceKey& key, uint32_t value, uint32_t value_lo) {
-    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u));
+  auto clear = [&](SurfaceKey key, uint32_t value, uint32_t value_lo) {
+    const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    const bool shared = REXCVAR_GET(fh1_shared_depth_alias) &&
+        !single_sample_msaa_ && !two_sample_msaa_ &&
+        (!untile_height_ || (!window.window_x_offset && !window.window_y_offset)) && key.is_depth &&
+        key.base_tiles == 0 && key.pitch_tiles == 16 &&
+        key.msaa == uint32_t(xenos::MsaaSamples::k4X) &&
+        key.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8);
+    if (shared) key.msaa = uint32_t(xenos::MsaaSamples::k1X);
+    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u) * (shared ? 2u : 1u));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
@@ -3410,6 +3478,9 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     FlushTransfers();
     Rect clear_rect = rect;
+    if (shared) {
+      clear_rect = {rect.left * 2, rect.top * 2, rect.right * 2, rect.bottom * 2};
+    }
     if (untile_band) {
       clear_rect.top += int32_t(untile_band);
       clear_rect.bottom += int32_t(untile_band);
