@@ -47,10 +47,18 @@ foreach(_entry IN LISTS _rexglue_ffx_api_files)
             continue()
         endif()
     endif()
+    # No EXPECTED_HASH: with it a failed download (a TLS error behind a proxy
+    # or antivirus, no network) is a fatal "cannot compute hash" CMake error
+    # that stops the whole configure (#833). Check the hash by hand so a
+    # failure only leaves the FSR 2/3 provider out, as the warning says.
     file(DOWNLOAD "${_rexglue_ffx_api_url}/${_file}" "${_path}"
-        EXPECTED_HASH SHA256=${_hash} STATUS _status TLS_VERIFY ON)
+        STATUS _status TLS_VERIFY ON)
     list(GET _status 0 _code)
-    if(NOT _code EQUAL 0)
+    set(_actual "")
+    if(_code EQUAL 0)
+        file(SHA256 "${_path}" _actual)
+    endif()
+    if(NOT _actual STREQUAL _hash)
         file(REMOVE "${_path}")
         message(WARNING
             "Could not download the FidelityFX API header ${_file} (${_status}); "
