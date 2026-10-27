@@ -380,3 +380,80 @@ TEST_CASE("BitStream BitsRemaining decreases", "[stream][bitstream]") {
   stream.Read(32);
   CHECK(stream.BitsRemaining() == 16);
 }
+
+// =============================================================================
+// BitStream::Copy
+// =============================================================================
+
+namespace {
+
+bool SourceBit(const std::array<uint8_t, 8>& src, size_t pos) {
+  return (src[pos >> 3] >> (7 - (pos & 7))) & 1;
+}
+
+bool DestBit(const std::array<uint8_t, 16>& dst, size_t pos) {
+  return (dst[pos >> 3] >> (7 - (pos & 7))) & 1;
+}
+
+}  // namespace
+
+TEST_CASE("BitStream Copy matches a bit-by-bit copy for every offset and length",
+          "[stream][bitstream][copy]") {
+  const std::array<uint8_t, 8> src = {0xA5, 0x3C, 0xF0, 0x0F, 0x96, 0x69, 0xC3, 0x5A};
+  for (size_t offset = 0; offset < 24; ++offset) {
+    for (size_t bits = 0; bits <= 40; ++bits) {
+      std::array<uint8_t, 8> source = src;
+      std::array<uint8_t, 16> dest{};
+      dest.fill(0);
+      BitStream stream(source.data(), source.size() * 8);
+      stream.SetOffset(offset);
+
+      const size_t align = stream.Copy(dest.data(), bits);
+
+      INFO("offset " << offset << " bits " << bits);
+      CHECK(align == (offset & 7));
+      CHECK(stream.BitsRemaining() == source.size() * 8 - offset - bits);
+      for (size_t i = 0; i < bits; ++i) {
+        CHECK(DestBit(dest, align + i) == SourceBit(src, offset + i));
+      }
+      // Nothing outside the copied range may be written.
+      for (size_t i = 0; i < dest.size() * 8; ++i) {
+        if (i < align || i >= align + bits) {
+          CHECK_FALSE(DestBit(dest, i));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("BitStream Copy of fewer bits than the head holds does not overrun",
+          "[stream][bitstream][copy]") {
+  // Regression: with a bit offset inside a byte and a count smaller than the
+  // bits left in that byte, the unsigned remainder underflowed and the
+  // byte-copy branch ran with a huge length (XMA crash report #827).
+  std::array<uint8_t, 4> source = {0xFF, 0xFF, 0xFF, 0xFF};
+  // Exactly-sized destination: any write past it is caught by the sanitizer
+  // or by the canary below.
+  std::array<uint8_t, 3> dest = {0, 0, 0xEE};
+  BitStream stream(source.data(), source.size() * 8);
+  stream.SetOffset(3);
+
+  CHECK(stream.Copy(dest.data(), 2) == 3);
+  CHECK(dest[0] == 0x18);  // bits 3..4 set, MSB-first
+  CHECK(dest[1] == 0);
+  CHECK(dest[2] == 0xEE);
+  CHECK(stream.BitsRemaining() == 32 - 5);
+}
+
+TEST_CASE("BitStream Copy clamps to the end of the stream", "[stream][bitstream][copy]") {
+  std::array<uint8_t, 2> source = {0xFF, 0xFF};
+  std::array<uint8_t, 4> dest = {0, 0, 0, 0xEE};
+  BitStream stream(source.data(), 12);
+  stream.SetOffset(4);
+
+  CHECK(stream.Copy(dest.data(), 1000) == 4);
+  CHECK(stream.BitsRemaining() == 0);
+  CHECK(dest[0] == 0x0F);
+  CHECK(dest[1] == 0xF0);  // the last 4 bits, MSB aligned
+  CHECK(dest[3] == 0xEE);
+}

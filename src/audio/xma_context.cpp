@@ -175,7 +175,9 @@ XmaPacketHandle ResolvePacket(const XMA_CONTEXT_DATA& data, uint32_t starting_bu
 }
 
 bool XmaContext::IsValidFrameSize(uint32_t frame_size) {
-  return frame_size != 0 && frame_size != xma::kMaxFrameLength;
+  // The size counts the 15-bit frame header, so anything shorter cannot be a
+  // frame; sizes of 1..14 reached BitStream::Copy and crashed it (#827).
+  return frame_size >= kBitsPerFrameHeader && frame_size != xma::kMaxFrameLength;
 }
 
 XmaContext::XmaContext() : work_completion_event_(rex::thread::Event::CreateAutoResetEvent(false)) {

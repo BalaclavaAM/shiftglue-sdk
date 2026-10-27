@@ -549,7 +549,9 @@ TEST_CASE("XMA payload assembly spans up to four packets", "[audio][xma]") {
 
 TEST_CASE("XMA frame size rejects zero and the sentinel", "[audio][xma]") {
   CHECK_FALSE(XmaContext::IsValidFrameSize(0));
-  CHECK(XmaContext::IsValidFrameSize(1));
+  CHECK_FALSE(XmaContext::IsValidFrameSize(1));
+  CHECK_FALSE(XmaContext::IsValidFrameSize(14));
+  CHECK(XmaContext::IsValidFrameSize(15));
   CHECK(XmaContext::IsValidFrameSize(0x7FFE));
   CHECK_FALSE(XmaContext::IsValidFrameSize(0x7FFF));
 }
