@@ -161,7 +161,8 @@ REXCVAR_DEFINE_BOOL(gpu_state_hash_memos, true, "GPU/Vulkan",
                     "draw in the same state rather than only the previous draw's");
 REXCVAR_DEFINE_BOOL(vulkan_push_texture_descriptors, true, "GPU/Vulkan",
                     "Push pixel shader texture descriptors (VK_KHR_push_descriptor) instead of "
-                    "allocating and writing a descriptor set per change");
+                    "allocating and writing a descriptor set per change; descriptor sets are "
+                    "always used on Qualcomm and Mesa ANV (Intel open-source) drivers");
 REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_worker, true, "GPU/Vulkan",
                     "With vulkan_async_submission, publish and paint each frame on the "
                     "submission worker after the frame's submission instead of waiting for the "
@@ -1379,10 +1380,23 @@ bool VulkanCommandProcessor::SetupContext() {
   // (the shadow mask samples its shadow map as a null texture, so the sky
   // turns white and the paint and foliage lose their shading) while the
   // same descriptors written into a set work: sets there.
-  push_pixel_texture_descriptors_ =
-      REXCVAR_GET(vulkan_push_texture_descriptors) &&
-      vulkan_device->extensions().ext_KHR_push_descriptor &&
-      device_properties.vendorID != uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm);
+  // Mesa ANV (Intel Arc B580, Mesa 26.2.5, issue #813) copies the whole
+  // pushed set in anv_push_descriptor_set_init on every
+  // vkCmdPushDescriptorSet: 76 % of the submission thread's cycles were that
+  // memmove. Disabling pushes took 30-50 fps to 55-60 fps at 3x.
+  // Descriptor sets are used there.
+  const bool push_disabled_by_driver =
+      device_properties.vendorID == uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm) ||
+      device_properties.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+  push_pixel_texture_descriptors_ = REXCVAR_GET(vulkan_push_texture_descriptors) &&
+                                    vulkan_device->extensions().ext_KHR_push_descriptor &&
+                                    !push_disabled_by_driver;
+  REXGPU_INFO("Pixel texture descriptors: {} (vulkan_push_texture_descriptors={}, "
+              "VK_KHR_push_descriptor={}, driver ID {}, off by driver: {})",
+              push_pixel_texture_descriptors_ ? "pushed" : "descriptor sets",
+              REXCVAR_GET(vulkan_push_texture_descriptors),
+              vulkan_device->extensions().ext_KHR_push_descriptor,
+              uint32_t(device_properties.driverID), push_disabled_by_driver);
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
   if (device_properties.tessellationShader) {
     guest_shader_pipeline_stages_ |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
