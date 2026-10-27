@@ -915,6 +915,20 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal,
                                                         surface.image, surface.memory)) {
     Skip("surface_create");
+    // A failed surface is retried by every draw that needs it, so log the
+    // first few and then one in 1024. Without this the only trace was the
+    // skips counter in the periodic stats line.
+    static uint32_t create_failures = 0;
+    if (create_failures < 8 || (create_failures & 1023) == 0) {
+      REXGPU_ERROR(
+          "FH1 native executor: could not allocate a {}x{} surface image (format {}, {} samples, "
+          "{}) with {} surfaces ({} MB) alive; draws using it lose that target "
+          "(failure {})",
+          surface.width * scale_, surface.image_height * scale_, uint32_t(surface.format),
+          surface.samples, key.is_depth ? "depth" : "color", surfaces_.size(), surface_bytes_ >> 20,
+          create_failures + 1);
+    }
+    ++create_failures;
     return false;
   }
   auto create_view = [&](VkFormat format, VkImageAspectFlags aspect, VkImageView& view_out) {
@@ -987,6 +1001,14 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   grown.pending_clears.clear();
   if (!CreateSurfaceImage(grown)) {
     Skip("surface_grow");
+    static uint32_t grow_failures = 0;
+    if (grow_failures < 8 || (grow_failures & 1023) == 0) {
+      REXGPU_ERROR(
+          "FH1 native executor: could not grow a surface from {} to {} rows with {} surfaces "
+          "({} MB) alive; the surface keeps its old height (failure {})",
+          old_rows, new_rows, surfaces_.size(), surface_bytes_ >> 20, grow_failures + 1);
+    }
+    ++grow_failures;
     return;
   }
   // Copy the old rows in; the rows past them are cleared to zero below, as a
